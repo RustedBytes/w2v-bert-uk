@@ -18,12 +18,16 @@ jobs:
         include:
           - name: linux-x86_64
             os: ubuntu-22.04
+            python-interpreter: python3.10
           - name: macos-arm64
             os: macos-latest
+            python-interpreter: python
           - name: macos-x86_64
             os: macos-15-intel
+            python-interpreter: python
           - name: windows-x86_64
             os: windows-latest
+            python-interpreter: python
 
     steps:
       - name: Checkout
@@ -41,7 +45,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: build
-          args: --release --features python --out dist --interpreter python
+          args: --release --features python --out dist --interpreter ${{ matrix.python-interpreter }}
           manylinux: auto
 
       - name: Install wheel
