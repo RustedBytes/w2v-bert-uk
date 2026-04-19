@@ -283,7 +283,7 @@ fn build_config(
 }
 
 #[pymodule]
-fn w2v_uk_rs(module: &Bound<'_, PyModule>) -> PyResult<()> {
+fn w2v_bert_uk(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(initialize_ort, module)?)?;
     module.add_function(wrap_pyfunction!(transcribe_file, module)?)?;
     module.add_class::<Transcriber>()?;

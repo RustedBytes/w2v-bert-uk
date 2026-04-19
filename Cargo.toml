@@ -1,11 +1,11 @@
 [package]
-name = "w2v-uk-rs"
+name = "w2v-bert-uk"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-only"
 
 [lib]
-name = "w2v_uk_rs"
+name = "w2v_bert_uk"
 crate-type = ["rlib", "cdylib"]
 
 [features]

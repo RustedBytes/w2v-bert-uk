@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
-use w2v_uk_rs::{
+use w2v_bert_uk::{
     AcousticModelConfig, CandidateProcessingConfig, CtcDecoderConfig, DecoderConfig, EncoderConfig,
     LmConfig, RuntimeConfig, TextDecoderConfig, TimingReport, TranscriptionConfig,
     TranscriptionResult, W2vBertEncoderConfig,

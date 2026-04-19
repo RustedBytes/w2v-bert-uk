@@ -1623,7 +1623,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "w2v-uk-rs"
+name = "w2v-bert-uk"
 version = "0.1.0"
 dependencies = [
  "anyhow",

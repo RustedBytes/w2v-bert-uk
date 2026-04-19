@@ -52,7 +52,7 @@ jobs:
 
       - name: Import smoke test
         run: |
-          python -c "import w2v_uk_rs; assert hasattr(w2v_uk_rs, 'Transcriber'); assert hasattr(w2v_uk_rs, 'transcribe_file')"
+          python -c "import w2v_bert_uk; assert hasattr(w2v_bert_uk, 'Transcriber'); assert hasattr(w2v_bert_uk, 'transcribe_file')"
 
       - name: Upload wheel
         uses: actions/upload-artifact@v4

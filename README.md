@@ -1,4 +1,4 @@
-# w2v-uk-rs
+# w2v-bert-uk
 
 Rust CLI for transcribing audio with a W2V-BERT frontend, an ONNX CTC acoustic model, SentencePiece decoding, and optional KenLM reranking.
 
@@ -82,7 +82,7 @@ cargo run --release -- example_1.wav \
 For Rust callers, `TranscriptionConfig` is split by processing stage:
 
 ```rust
-use w2v_uk_rs::{
+use w2v_bert_uk::{
     AcousticModelConfig, CtcDecoderConfig, DecoderConfig, EncoderConfig,
     RuntimeConfig, TextDecoderConfig, TranscriptionConfig, W2vBertEncoderConfig,
     audio::AudioDecodeConfig,
@@ -144,17 +144,17 @@ uvx maturin develop --release --features "python cuda"
 CoreML is for macOS. CUDA requires a compatible NVIDIA CUDA runtime. If you use `uv run`, rebuild the environment after changing Rust/PyO3 signatures:
 
 ```bash
-uv cache clean w2v-uk-rs
-uv sync --reinstall-package w2v-uk-rs
+uv cache clean w2v-bert-uk
+uv sync --reinstall-package w2v-bert-uk
 ```
 
 Python API:
 
 ```python
-import w2v_uk_rs
+import w2v_bert_uk
 
 # Convenience one-shot call. This initializes the model for this call.
-text = w2v_uk_rs.transcribe_file(
+text = w2v_bert_uk.transcribe_file(
     "example_1.wav",
     model="model_optimized.onnx",
     tokenizer="tokenizer.model",
@@ -184,7 +184,7 @@ text = w2v_uk_rs.transcribe_file(
 
 # Reusable transcriber. The ONNX model session and tokenizer are initialized
 # once and reused for each audio file.
-transcriber = w2v_uk_rs.Transcriber(
+transcriber = w2v_bert_uk.Transcriber(
     model="model_optimized.onnx",
     tokenizer="tokenizer.model",
     beam_width=32,
