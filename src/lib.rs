@@ -222,7 +222,7 @@ pub struct Transcriber {
     tokenizer: SentencePieceTokenizer,
     ctc: CtcDecoderConfig,
     text: TextDecoderConfig,
-    language_model: Option<LmConfig>,
+    language_model: Option<LmDecoder>,
     next_session_elapsed: Option<Duration>,
 }
 
@@ -233,6 +233,11 @@ impl Transcriber {
         let model = CtcModel::load(&config.model.path, &config.model.session)?;
         let next_session_elapsed = Some(model.session_elapsed());
         let tokenizer = load_sentencepiece_tokenizer(&config.decoder.text.tokenizer_path)?;
+        let language_model = config
+            .decoder
+            .language_model
+            .map(LmDecoder::new)
+            .transpose()?;
 
         Ok(Self {
             audio: config.audio,
@@ -241,7 +246,7 @@ impl Transcriber {
             tokenizer,
             ctc: config.decoder.ctc,
             text: config.decoder.text,
-            language_model: config.decoder.language_model,
+            language_model,
             next_session_elapsed,
         })
     }
@@ -302,6 +307,35 @@ impl Transcriber {
 struct DecodedCandidate {
     text: String,
     ctc_log_prob: f32,
+}
+
+struct LmDecoder {
+    model: KenlmModel,
+    config: LmConfig,
+}
+
+impl LmDecoder {
+    fn new(config: LmConfig) -> Result<Self> {
+        if config.log_language_model {
+            eprintln!(
+                "KenLM: {} weight={:.3} word_bonus={:.3}",
+                config.path.display(),
+                config.weight,
+                config.word_bonus
+            );
+        }
+
+        let model = KenlmModel::with_config(
+            &config.path,
+            KenlmConfig {
+                show_progress: false,
+                ..KenlmConfig::default()
+            },
+        )
+        .with_context(|| format!("failed to load KenLM model {}", config.path.display()))?;
+
+        Ok(Self { model, config })
+    }
 }
 
 #[derive(Clone)]
@@ -404,7 +438,7 @@ fn decode_model_output(
     model: ModelOutput,
     tokenizer: &SentencePieceTokenizer,
     text_config: &TextDecoderConfig,
-    lm_config: &Option<LmConfig>,
+    language_model: &Option<LmDecoder>,
     audio_duration_seconds: f64,
     feature_rows: usize,
     feature_cols: usize,
@@ -425,8 +459,8 @@ fn decode_model_output(
     let text_decode_elapsed = text_decode_start.elapsed();
 
     let lm_start = Instant::now();
-    let ranked = if let Some(config) = lm_config {
-        rerank_with_kenlm(decoded_candidates, config)?
+    let ranked = if let Some(language_model) = language_model {
+        rerank_with_kenlm(decoded_candidates, language_model)?
     } else {
         decoded_candidates
             .into_iter()
@@ -460,25 +494,9 @@ fn decode_model_output(
 
 fn rerank_with_kenlm(
     candidates: Vec<DecodedCandidate>,
-    config: &LmConfig,
+    language_model: &LmDecoder,
 ) -> Result<Vec<ScoredCandidate>> {
-    if config.log_language_model {
-        eprintln!(
-            "KenLM: {} weight={:.3} word_bonus={:.3}",
-            config.path.display(),
-            config.weight,
-            config.word_bonus
-        );
-    }
-
-    let lm = KenlmModel::with_config(
-        &config.path,
-        KenlmConfig {
-            show_progress: false,
-            ..KenlmConfig::default()
-        },
-    )
-    .with_context(|| format!("failed to load KenLM model {}", config.path.display()))?;
+    let config = &language_model.config;
 
     let mut deduped = HashMap::<String, f32>::new();
     for candidate in candidates {
@@ -495,7 +513,8 @@ fn rerank_with_kenlm(
 
     let mut ranked = Vec::with_capacity(deduped.len());
     for (text, ctc_log_prob) in deduped {
-        let lm_log_prob = lm
+        let lm_log_prob = language_model
+            .model
             .score(&text, config.bos, config.eos)
             .with_context(|| format!("failed to score candidate with KenLM: {text}"))?
             * std::f32::consts::LN_10;

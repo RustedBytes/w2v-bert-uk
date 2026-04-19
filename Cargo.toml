@@ -1,6 +1,6 @@
 [package]
 name = "w2v-bert-uk"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Rust and Python transcription pipeline for Ukrainian W2V-BERT ONNX CTC models"
