@@ -50,8 +50,8 @@ CoreML requires macOS. CUDA requires an ONNX Runtime CUDA build and compatible N
 By default, the matching ONNX Runtime binaries are downloaded at build time. To load an external ONNX Runtime dynamic library instead, build with `ort-dynamic` and set `ORT_DYLIB_PATH` or pass `--ort-dylib`:
 
 ```bash
-ORT_DYLIB_PATH=/path/to/libonnxruntime.dylib cargo run --release --features ort-dynamic -- example_1.wav
-cargo run --release --features ort-dynamic -- example_1.wav --ort-dylib /path/to/libonnxruntime.dylib
+ORT_DYLIB_PATH=/path/to/libonnxruntime.dylib cargo run --release --no-default-features --features ort-dynamic -- example_1.wav
+cargo run --release --no-default-features --features ort-dynamic -- example_1.wav --ort-dylib /path/to/libonnxruntime.dylib
 ```
 
 Print help:
@@ -223,6 +223,8 @@ The GitHub Actions workflow in `.github/workflows/python-bindings.yml` builds Py
 - `ubuntu-22.04` as `linux-x86_64`
 - `macos-latest` as `macos-arm64`
 - `windows-latest` as `windows-x86_64`
+
+The Linux wheel is built with `ort-dynamic` because the current bundled ONNX Runtime Linux binary requires newer glibc symbols than common Python runners provide. Use `ORT_DYLIB_PATH` or `ort_dylib_path` to point it at a compatible ONNX Runtime shared library at runtime.
 
 Each job installs the wheel and runs an import smoke test before uploading the wheel artifact. Tag creation also uploads the wheels to the matching GitHub Release.
 
