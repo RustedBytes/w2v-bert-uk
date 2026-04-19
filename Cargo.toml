@@ -21,7 +21,7 @@ asr-features = { version = "0.1.1", features = ["frontend"] }
 clap = { version = "4.6.1", features = ["derive"] }
 half = { version = "2.1", default-features = false }
 kenlm-rs = { version = "0.1.0" }
-ort = { version = "2.0.0-rc.12", default-features = false, features = ["api-24", "copy-dylibs", "download-binaries", "half", "ndarray", "std", "tls-native"] }
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["api-24", "copy-dylibs", "download-binaries", "half", "ndarray", "std", "tls-rustls"] }
 prost = "0.14"
 pyo3 = { version = "0.27.1", optional = true, features = ["abi3-py310"] }
 rayon = "1.11"
