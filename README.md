@@ -156,6 +156,8 @@ uv sync --reinstall-package w2v-bert-uk
 Python API:
 
 ```python
+from pathlib import Path
+
 import w2v_bert_uk
 
 # fp16 and fp32 ONNX acoustic models are both supported. The extension detects
@@ -200,6 +202,15 @@ print(report["transcript"])
 print(report["candidates"][0]["total_score"])
 print(report["timings"]["model_inference_seconds"])
 
+audio_bytes = Path("example_1.wav").read_bytes()
+text_from_bytes = w2v_bert_uk.transcribe_bytes(
+    audio_bytes,
+    format_hint="wav",
+    model="model_optimized.onnx",
+    tokenizer="tokenizer.model",
+    lm=None,
+)
+
 # Reusable transcriber. The ONNX model session and tokenizer are initialized
 # once and reused for each audio file.
 transcriber = w2v_bert_uk.Transcriber(
@@ -218,6 +229,7 @@ transcriber = w2v_bert_uk.Transcriber(
 first = transcriber.transcribe_file("example_1.wav")
 second = transcriber.transcribe_file("example_2.wav")
 first_report = transcriber.transcribe_file_with_report("example_1.wav")
+first_from_bytes = transcriber.transcribe_bytes(audio_bytes, format_hint="wav")
 ```
 
 ## Examples

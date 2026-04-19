@@ -7,7 +7,10 @@ use asr_features::{W2vBertFrontendConfig, w2v_bert_frontend_config};
 use kenlm::{Config as KenlmConfig, Model as KenlmModel};
 use splintr::SentencePieceTokenizer;
 
-use crate::audio::{AudioDecodeConfig, AudioFeatures, audio_file_to_w2v_bert_features_with_config};
+use crate::audio::{
+    AudioDecodeConfig, AudioFeatures, audio_bytes_to_w2v_bert_features_with_config,
+    audio_file_to_w2v_bert_features_with_config,
+};
 use crate::model::{CtcModel, ModelConfig, ModelOutput};
 use crate::tokenizer::load_sentencepiece_tokenizer;
 
@@ -252,6 +255,20 @@ impl Transcriber {
         self.transcribe_features(audio)
     }
 
+    pub fn transcribe_audio_bytes(
+        &mut self,
+        audio_bytes: impl Into<Vec<u8>>,
+        format_hint: Option<&str>,
+    ) -> Result<TranscriptionResult> {
+        let audio = audio_bytes_to_w2v_bert_features_with_config(
+            audio_bytes,
+            format_hint,
+            &self.audio,
+            &self.frontend,
+        )?;
+        self.transcribe_features(audio)
+    }
+
     pub fn transcribe_features(&mut self, audio: AudioFeatures) -> Result<TranscriptionResult> {
         let audio_duration_seconds = audio.duration_seconds();
         let feature_rows = audio.features.rows;
@@ -364,6 +381,15 @@ pub fn transcribe_audio_file(
 ) -> Result<TranscriptionResult> {
     let mut transcriber = Transcriber::new(config.clone())?;
     transcriber.transcribe_audio_file(audio_path)
+}
+
+pub fn transcribe_audio_bytes(
+    audio_bytes: impl Into<Vec<u8>>,
+    format_hint: Option<&str>,
+    config: &TranscriptionConfig,
+) -> Result<TranscriptionResult> {
+    let mut transcriber = Transcriber::new(config.clone())?;
+    transcriber.transcribe_audio_bytes(audio_bytes, format_hint)
 }
 
 pub fn transcribe_features(

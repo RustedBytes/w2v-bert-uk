@@ -1,4 +1,5 @@
 use std::fs::File;
+use std::io::Cursor;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -10,7 +11,7 @@ use symphonia::core::audio::{AudioBufferRef, SampleBuffer};
 use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;
-use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
+use symphonia::core::io::{MediaSource, MediaSourceStream, MediaSourceStreamOptions};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 use symphonia::default::{get_codecs, get_probe};
@@ -59,6 +60,39 @@ pub fn audio_file_to_w2v_bert_features_with_config(
 ) -> Result<AudioFeatures> {
     let decode_start = Instant::now();
     let (samples, sample_rate) = decode_audio_file_to_mono_f32(path.as_ref(), decode_config)?;
+    samples_to_w2v_bert_features(samples, sample_rate, decode_start, frontend_config)
+}
+
+pub fn audio_bytes_to_w2v_bert_features(
+    audio_bytes: impl Into<Vec<u8>>,
+    format_hint: Option<&str>,
+) -> Result<AudioFeatures> {
+    audio_bytes_to_w2v_bert_features_with_config(
+        audio_bytes,
+        format_hint,
+        &AudioDecodeConfig::default(),
+        &w2v_bert_frontend_config(None, None, None, None, None, None),
+    )
+}
+
+pub fn audio_bytes_to_w2v_bert_features_with_config(
+    audio_bytes: impl Into<Vec<u8>>,
+    format_hint: Option<&str>,
+    decode_config: &AudioDecodeConfig,
+    frontend_config: &asr_features::W2vBertFrontendConfig,
+) -> Result<AudioFeatures> {
+    let decode_start = Instant::now();
+    let (samples, sample_rate) =
+        decode_audio_bytes_to_mono_f32(audio_bytes.into(), format_hint, decode_config)?;
+    samples_to_w2v_bert_features(samples, sample_rate, decode_start, frontend_config)
+}
+
+fn samples_to_w2v_bert_features(
+    samples: Vec<f32>,
+    sample_rate: u32,
+    decode_start: Instant,
+    frontend_config: &asr_features::W2vBertFrontendConfig,
+) -> Result<AudioFeatures> {
     let decode_elapsed = decode_start.elapsed();
     let sample_count = samples.len();
 
@@ -81,12 +115,49 @@ fn decode_audio_file_to_mono_f32(
 ) -> Result<(Vec<f32>, u32)> {
     let file = File::open(path)
         .with_context(|| format!("failed to open audio file {}", path.display()))?;
-    let media_source = MediaSourceStream::new(Box::new(file), MediaSourceStreamOptions::default());
-
     let mut hint = Hint::new();
     if let Some(extension) = path.extension().and_then(|value| value.to_str()) {
         hint.with_extension(extension);
     }
+
+    decode_audio_source_to_mono_f32(
+        Box::new(file),
+        hint,
+        config,
+        format!("audio file {}", path.display()),
+    )
+}
+
+fn decode_audio_bytes_to_mono_f32(
+    audio_bytes: Vec<u8>,
+    format_hint: Option<&str>,
+    config: &AudioDecodeConfig,
+) -> Result<(Vec<f32>, u32)> {
+    if audio_bytes.is_empty() {
+        bail!("audio byte buffer is empty");
+    }
+
+    let mut hint = Hint::new();
+    if let Some(format_hint) = format_hint {
+        hint.with_extension(format_hint);
+    }
+
+    decode_audio_source_to_mono_f32(
+        Box::new(Cursor::new(audio_bytes)),
+        hint,
+        config,
+        "audio byte buffer",
+    )
+}
+
+fn decode_audio_source_to_mono_f32(
+    source: Box<dyn MediaSource>,
+    hint: Hint,
+    config: &AudioDecodeConfig,
+    source_label: impl AsRef<str>,
+) -> Result<(Vec<f32>, u32)> {
+    let source_label = source_label.as_ref();
+    let media_source = MediaSourceStream::new(source, MediaSourceStreamOptions::default());
 
     let probed = get_probe()
         .format(
@@ -95,7 +166,7 @@ fn decode_audio_file_to_mono_f32(
             &FormatOptions::default(),
             &MetadataOptions::default(),
         )
-        .with_context(|| format!("failed to probe audio file {}", path.display()))?;
+        .with_context(|| format!("failed to probe {source_label}"))?;
     let mut format = probed.format;
 
     let track = format
@@ -160,5 +231,58 @@ fn append_mono_samples(decoded: AudioBufferRef<'_>, output: &mut Vec<f32>, sampl
     for frame in sample_buffer.samples().chunks(channels) {
         let sum: f32 = frame.iter().copied().sum();
         output.push(sum / channels as f32);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_wav_bytes() {
+        let samples = [0_i16, 16_384, -16_384, 0];
+        let wav = mono_pcm_wav_bytes(16_000, &samples);
+
+        let (decoded, sample_rate) =
+            decode_audio_bytes_to_mono_f32(wav, Some("wav"), &AudioDecodeConfig::default())
+                .expect("WAV bytes should decode");
+
+        assert_eq!(sample_rate, 16_000);
+        assert_eq!(decoded.len(), samples.len());
+        assert!((decoded[1] - 0.5).abs() < 0.001);
+        assert!((decoded[2] + 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn rejects_empty_audio_bytes() {
+        let error =
+            decode_audio_bytes_to_mono_f32(Vec::new(), Some("wav"), &AudioDecodeConfig::default())
+                .expect_err("empty bytes should fail");
+
+        assert!(error.to_string().contains("audio byte buffer is empty"));
+    }
+
+    fn mono_pcm_wav_bytes(sample_rate: u32, samples: &[i16]) -> Vec<u8> {
+        let data_len = (samples.len() * 2) as u32;
+        let mut bytes = Vec::with_capacity(44 + data_len as usize);
+
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(b"fmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&sample_rate.to_le_bytes());
+        bytes.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+        bytes.extend_from_slice(&2_u16.to_le_bytes());
+        bytes.extend_from_slice(&16_u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        for sample in samples {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+
+        bytes
     }
 }
