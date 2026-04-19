@@ -1,5 +1,7 @@
 # w2v-bert-uk
 
+[![Crates.io Version](https://img.shields.io/crates/v/w2v-bert-uk)](https://crates.io/crates/w2v-bert-uk)
+
 Rust CLI for transcribing audio with a W2V-BERT frontend, an ONNX CTC acoustic model, SentencePiece decoding, and optional KenLM reranking.
 
 ## Requirements
