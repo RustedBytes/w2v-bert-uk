@@ -18,8 +18,7 @@ pub mod model;
 mod python;
 pub mod tokenizer;
 
-#[derive(Clone, Debug)]
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 pub struct TranscriptionConfig {
     pub runtime: RuntimeConfig,
     pub audio: AudioDecodeConfig,
@@ -27,7 +26,6 @@ pub struct TranscriptionConfig {
     pub model: AcousticModelConfig,
     pub decoder: DecoderConfig,
 }
-
 
 #[derive(Clone, Debug, Default)]
 pub struct RuntimeConfig {

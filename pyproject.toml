@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "w2v-bert-uk"
-version = "0.1.0"
+version = "0.1.2"
 description = "Python bindings for the w2v-bert-uk transcription pipeline"
 requires-python = ">=3.10"
 license = "GPL-3.0-only"

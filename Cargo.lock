@@ -1343,7 +1343,7 @@ dependencies = [
 
 [[package]]
 name = "w2v-bert-uk"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "asr-features",

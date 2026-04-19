@@ -23,9 +23,25 @@ struct BeamUpdate {
     non_blank: f32,
 }
 
-pub fn threaded_ctc_beam_search_decode_n_best(
+pub(crate) trait CtcLogit: Copy + Send + Sync {
+    fn to_f32(self) -> f32;
+}
+
+impl CtcLogit for f16 {
+    fn to_f32(self) -> f32 {
+        f16::to_f32(self)
+    }
+}
+
+impl CtcLogit for f32 {
+    fn to_f32(self) -> f32 {
+        self
+    }
+}
+
+pub(crate) fn threaded_ctc_beam_search_decode_n_best<T: CtcLogit>(
     shape: &[i64],
-    logits: &[f16],
+    logits: &[T],
     blank_id: u32,
     beam_width: usize,
     n_best: usize,
@@ -157,20 +173,20 @@ fn beam_updates(
     updates
 }
 
-fn log_softmax_frame(frame: &[f16]) -> Vec<f32> {
+fn log_softmax_frame<T: CtcLogit>(frame: &[T]) -> Vec<f32> {
     let max = frame
         .iter()
-        .map(|value| value.to_f32())
+        .map(|&value| value.to_f32())
         .fold(f32::NEG_INFINITY, f32::max);
     let sum_exp = frame
         .iter()
-        .map(|value| (value.to_f32() - max).exp())
+        .map(|&value| (value.to_f32() - max).exp())
         .sum::<f32>();
     let log_sum_exp = max + sum_exp.ln();
 
     frame
         .iter()
-        .map(|value| value.to_f32() - log_sum_exp)
+        .map(|&value| value.to_f32() - log_sum_exp)
         .collect()
 }
 

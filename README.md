@@ -4,6 +4,9 @@
 
 Rust CLI for transcribing audio with a W2V-BERT frontend, an ONNX CTC acoustic model, SentencePiece decoding, and optional KenLM reranking.
 
+The ONNX acoustic model may use either fp16 or fp32 tensors. Input and output
+precision are detected from the model metadata at load time.
+
 ## Requirements
 
 - Rust 1.94 or newer
@@ -155,6 +158,9 @@ Python API:
 ```python
 import w2v_bert_uk
 
+# fp16 and fp32 ONNX acoustic models are both supported. The extension detects
+# the model tensor precision when it loads the ONNX session.
+
 # Convenience one-shot call. This initializes the model for this call.
 text = w2v_bert_uk.transcribe_file(
     "example_1.wav",
@@ -184,6 +190,16 @@ text = w2v_bert_uk.transcribe_file(
     lm_eos=True,
 )
 
+report = w2v_bert_uk.transcribe_file_with_report(
+    "example_1.wav",
+    model="model_optimized.onnx",
+    tokenizer="tokenizer.model",
+    lm=None,
+)
+print(report["transcript"])
+print(report["candidates"][0]["total_score"])
+print(report["timings"]["model_inference_seconds"])
+
 # Reusable transcriber. The ONNX model session and tokenizer are initialized
 # once and reused for each audio file.
 transcriber = w2v_bert_uk.Transcriber(
@@ -201,6 +217,7 @@ transcriber = w2v_bert_uk.Transcriber(
 
 first = transcriber.transcribe_file("example_1.wav")
 second = transcriber.transcribe_file("example_2.wav")
+first_report = transcriber.transcribe_file_with_report("example_1.wav")
 ```
 
 ## Examples

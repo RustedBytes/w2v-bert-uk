@@ -8,7 +8,7 @@ use half::f16;
 use ort::ep;
 use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
-use ort::value::Tensor;
+use ort::value::{Tensor, TensorElementType, ValueType};
 
 use crate::ctc::{CtcCandidate, threaded_ctc_beam_search_decode_n_best};
 
@@ -59,7 +59,15 @@ pub struct ModelOutput {
 pub struct CtcModel {
     session: Session,
     input_name: String,
+    input_precision: ModelFloatPrecision,
+    output_precision: ModelFloatPrecision,
     session_elapsed: Duration,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ModelFloatPrecision {
+    F16,
+    F32,
 }
 
 impl CtcModel {
@@ -93,16 +101,23 @@ impl CtcModel {
         })?;
         let session_elapsed = session_start.elapsed();
 
-        let input_name = session
+        let input = session
             .inputs()
             .first()
-            .ok_or_else(|| anyhow!("ONNX model has no inputs"))?
-            .name()
-            .to_string();
+            .ok_or_else(|| anyhow!("ONNX model has no inputs"))?;
+        let input_name = input.name().to_string();
+        let input_precision = model_float_precision(input.dtype(), "input")?;
+        let output_precision = session
+            .outputs()
+            .first()
+            .ok_or_else(|| anyhow!("ONNX model has no outputs"))
+            .and_then(|output| model_float_precision(output.dtype(), "output"))?;
 
         Ok(Self {
             session,
             input_name,
+            input_precision,
+            output_precision,
             session_elapsed,
         })
     }
@@ -138,35 +153,60 @@ impl CtcModel {
         let input_start = Instant::now();
         let rows = features.rows;
         let cols = features.cols;
-        let values = features
-            .values
-            .into_iter()
-            .map(f16::from_f32)
-            .collect::<Vec<_>>();
-        let input = Tensor::from_array(([1usize, rows, cols], values))
-            .map_err(|error| anyhow!("failed to create ONNX input tensor: {error}"))?;
-        let input_elapsed = input_start.elapsed();
+        let values = features.values;
+        let input_elapsed;
+        let inference_start;
+        let outputs = match self.input_precision {
+            ModelFloatPrecision::F16 => {
+                let values = values.into_iter().map(f16::from_f32).collect::<Vec<_>>();
+                let input = Tensor::from_array(([1usize, rows, cols], values))
+                    .map_err(|error| anyhow!("failed to create f16 ONNX input tensor: {error}"))?;
+                input_elapsed = input_start.elapsed();
 
-        let inference_start = Instant::now();
-        let outputs = self
-            .session
-            .run(ort::inputs! {
-                self.input_name.as_str() => input,
-            })
-            .map_err(|error| anyhow!("failed to run ONNX inference: {error}"))?;
+                inference_start = Instant::now();
+                self.session
+                    .run(ort::inputs! {
+                        self.input_name.as_str() => input,
+                    })
+                    .map_err(|error| anyhow!("failed to run ONNX inference: {error}"))?
+            }
+            ModelFloatPrecision::F32 => {
+                let input = Tensor::from_array(([1usize, rows, cols], values))
+                    .map_err(|error| anyhow!("failed to create f32 ONNX input tensor: {error}"))?;
+                input_elapsed = input_start.elapsed();
+
+                inference_start = Instant::now();
+                self.session
+                    .run(ort::inputs! {
+                        self.input_name.as_str() => input,
+                    })
+                    .map_err(|error| anyhow!("failed to run ONNX inference: {error}"))?
+            }
+        };
         let inference_elapsed = inference_start.elapsed();
 
         let first_output = outputs
             .values()
             .next()
             .ok_or_else(|| anyhow!("ONNX model returned no outputs"))?;
-        let (shape, logits) = first_output
-            .try_extract_tensor::<f16>()
-            .map_err(|error| anyhow!("failed to read ONNX output tensor as f16 logits: {error}"))?;
 
         let ctc_start = Instant::now();
-        let candidates =
-            threaded_ctc_beam_search_decode_n_best(shape, logits, blank_id, beam_width, n_best)?;
+        let candidates = match self.output_precision {
+            ModelFloatPrecision::F16 => {
+                let (shape, logits) =
+                    first_output.try_extract_tensor::<f16>().map_err(|error| {
+                        anyhow!("failed to read ONNX output tensor as f16 logits: {error}")
+                    })?;
+                threaded_ctc_beam_search_decode_n_best(shape, logits, blank_id, beam_width, n_best)?
+            }
+            ModelFloatPrecision::F32 => {
+                let (shape, logits) =
+                    first_output.try_extract_tensor::<f32>().map_err(|error| {
+                        anyhow!("failed to read ONNX output tensor as f32 logits: {error}")
+                    })?;
+                threaded_ctc_beam_search_decode_n_best(shape, logits, blank_id, beam_width, n_best)?
+            }
+        };
 
         Ok(ModelOutput {
             candidates,
@@ -175,6 +215,22 @@ impl CtcModel {
             inference_elapsed,
             ctc_elapsed: ctc_start.elapsed(),
         })
+    }
+}
+
+fn model_float_precision(dtype: &ValueType, label: &str) -> Result<ModelFloatPrecision> {
+    let ValueType::Tensor { ty, .. } = dtype else {
+        return Err(anyhow!(
+            "ONNX model {label} must be a tensor, got {dtype:?}"
+        ));
+    };
+
+    match ty {
+        TensorElementType::Float16 => Ok(ModelFloatPrecision::F16),
+        TensorElementType::Float32 => Ok(ModelFloatPrecision::F32),
+        ty => Err(anyhow!(
+            "ONNX model {label} tensor must use f16 or f32, got {ty}"
+        )),
     }
 }
 
