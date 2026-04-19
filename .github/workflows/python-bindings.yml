@@ -43,7 +43,7 @@ jobs:
         with:
           command: build
           args: --release --features python --out dist --interpreter ${{ matrix.python-interpreter }}
-          manylinux: 2_28
+          manylinux: 2014
 
       - name: Install wheel
         shell: bash
