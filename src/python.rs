@@ -10,7 +10,7 @@ use crate::{
     LmConfig, RuntimeConfig, ScoredCandidate, TextDecoderConfig, TimingReport,
     Transcriber as RustTranscriber, TranscriptionConfig, TranscriptionResult, W2vBertEncoderConfig,
     audio::AudioDecodeConfig,
-    init_ort,
+    init_ort, preload_cuda_dylibs as preload_cuda_dylibs_impl,
     model::{ModelConfig, ModelOptimizationLevel},
     transcribe_audio_bytes, transcribe_audio_file,
 };
@@ -19,6 +19,15 @@ use crate::{
 #[pyo3(signature = (ort_dylib_path = None))]
 fn initialize_ort(ort_dylib_path: Option<PathBuf>) -> PyResult<bool> {
     init_ort(ort_dylib_path.as_deref()).map_err(to_py_error)
+}
+
+#[pyfunction]
+#[pyo3(signature = (cuda_lib_dir = None, cudnn_lib_dir = None))]
+fn preload_cuda_dylibs(
+    cuda_lib_dir: Option<PathBuf>,
+    cudnn_lib_dir: Option<PathBuf>,
+) -> PyResult<()> {
+    preload_cuda_dylibs_impl(cuda_lib_dir.as_deref(), cudnn_lib_dir.as_deref()).map_err(to_py_error)
 }
 
 #[pyfunction]
@@ -590,6 +599,7 @@ fn build_config(
 #[pymodule]
 fn w2v_bert_uk(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(initialize_ort, module)?)?;
+    module.add_function(wrap_pyfunction!(preload_cuda_dylibs, module)?)?;
     module.add_function(wrap_pyfunction!(transcribe_file, module)?)?;
     module.add_function(wrap_pyfunction!(transcribe_bytes, module)?)?;
     module.add_function(wrap_pyfunction!(transcribe_file_with_report, module)?)?;

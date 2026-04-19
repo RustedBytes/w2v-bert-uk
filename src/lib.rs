@@ -409,6 +409,25 @@ pub fn init_ort(ort_dylib_path: Option<&Path>) -> Result<bool> {
     Ok(committed)
 }
 
+#[cfg(feature = "cuda")]
+pub fn preload_cuda_dylibs(
+    cuda_lib_dir: Option<&Path>,
+    cudnn_lib_dir: Option<&Path>,
+) -> Result<()> {
+    ort::ep::cuda::preload_dylibs(cuda_lib_dir, cudnn_lib_dir)
+        .map_err(|error| anyhow!("failed to preload CUDA/cuDNN libraries: {error}"))
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn preload_cuda_dylibs(
+    _cuda_lib_dir: Option<&Path>,
+    _cudnn_lib_dir: Option<&Path>,
+) -> Result<()> {
+    Err(anyhow!(
+        "CUDA library preloading requires building with the cuda feature"
+    ))
+}
+
 pub fn transcribe_audio_file(
     audio_path: impl AsRef<Path>,
     config: &TranscriptionConfig,
