@@ -1,0 +1,33 @@
+# Rust build output
+/target/
+
+# ONNX Runtime/CoreML compiled model cache
+/target/coreml-cache/
+
+# Local model and tokenizer artifacts
+/model_optimized.onnx
+/tokenizer.model
+/lm.binary
+/*.onnx
+/*.model
+/*.binary
+
+# Local audio samples and generated transcripts
+/*.wav
+/*.mp3
+/*.flac
+/*.ogg
+/*.m4a
+/*.txt
+
+# macOS/editor noise
+.DS_Store
+*.swp
+*.swo
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+dist/
