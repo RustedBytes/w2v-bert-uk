@@ -222,7 +222,6 @@ The GitHub Actions workflow in `.github/workflows/python-bindings.yml` builds Py
 
 - `ubuntu-22.04` as `linux-x86_64`
 - `macos-latest` as `macos-arm64`
-- `macos-15-intel` as `macos-x86_64`
 - `windows-latest` as `windows-x86_64`
 
 Each job installs the wheel and runs an import smoke test before uploading the wheel artifact. Tag creation also uploads the wheels to the matching GitHub Release.
