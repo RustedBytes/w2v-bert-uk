@@ -267,7 +267,16 @@ fn configured_execution_providers() -> Vec<ep::ExecutionProviderDispatch> {
     let mut providers = Vec::new();
 
     #[cfg(feature = "cuda")]
-    providers.push(ep::CUDA::default().with_device_id(0).build().error_on_failure());
+    providers.push(
+        ep::CUDA::default()
+            .with_device_id(0)
+            .with_tf32(true)
+            .with_conv_max_workspace(true)
+            .with_conv1d_pad_to_nc1d(true)
+            .with_fuse_conv_bias(true)
+            .build()
+            .error_on_failure(),
+    );
 
     #[cfg(feature = "coreml")]
     providers.push(
