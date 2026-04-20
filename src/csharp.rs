@@ -16,8 +16,8 @@ use crate::{
     preload_cuda_dylibs as preload_cuda_dylibs_impl, transcribe_audio_bytes, transcribe_audio_file,
 };
 
-const W2V_BERT_UK_OK: i32 = 0;
-const W2V_BERT_UK_ERROR: i32 = -1;
+pub const W2V_BERT_UK_OK: i32 = 0;
+pub const W2V_BERT_UK_ERROR: i32 = -1;
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };

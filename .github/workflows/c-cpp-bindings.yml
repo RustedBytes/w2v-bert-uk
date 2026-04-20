@@ -1,0 +1,116 @@
+name: C and C++ bindings
+
+on:
+  workflow_dispatch:
+  create:
+
+permissions:
+  contents: write
+
+jobs:
+  build-extensions:
+    name: Build C/C++ native extension (${{ matrix.name }})
+    if: github.event_name != 'create' || github.event.ref_type == 'tag'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64-gnu
+            os: ubuntu-22.04
+            native-library: target/release/libw2v_bert_uk.so
+          - name: macos-arm64
+            os: macos-latest
+            native-library: target/release/libw2v_bert_uk.dylib
+          - name: windows-x64-msvc
+            os: windows-latest
+            native-library: target/release/w2v_bert_uk.dll
+            import-library: target/release/w2v_bert_uk.dll.lib
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up MSVC shell
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build C/C++ native extension
+        run: cargo build --release --no-default-features --features c,cpp,ort-dynamic --lib
+
+      - name: Compile C/C++ header smoke tests
+        if: runner.os != 'Windows'
+        run: |
+          cc -Ic -c examples/transcribe.c -o c-smoke.o
+          c++ -Icpp -std=c++17 -c examples/transcribe.cpp -o cpp-smoke.o
+
+      - name: Compile C/C++ header smoke tests
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          cl /nologo /Ic /c examples\transcribe.c /Fo:c-smoke.obj
+          cl /nologo /EHsc /Icpp /c examples\transcribe.cpp /Fo:cpp-smoke.obj
+
+      - name: Package C/C++ native extension
+        shell: pwsh
+        run: |
+          $nativeLibrary = "${{ matrix.native-library }}"
+          if (!(Test-Path $nativeLibrary)) {
+            throw "Native library was not produced: $nativeLibrary"
+          }
+          if (!(Test-Path "c/w2v_bert_uk.h")) {
+            throw "Generated C header was not produced"
+          }
+          if (!(Test-Path "cpp/w2v_bert_uk.hpp")) {
+            throw "Generated C++ header was not produced"
+          }
+
+          New-Item -ItemType Directory -Force -Path package/native | Out-Null
+          New-Item -ItemType Directory -Force -Path package/c | Out-Null
+          New-Item -ItemType Directory -Force -Path package/cpp | Out-Null
+          New-Item -ItemType Directory -Force -Path package/examples | Out-Null
+          Copy-Item $nativeLibrary package/native/
+          $importLibrary = "${{ matrix.import-library }}"
+          if ($importLibrary -and (Test-Path $importLibrary)) {
+            Copy-Item $importLibrary package/native/
+          }
+          Copy-Item c/w2v_bert_uk.h package/c/
+          Copy-Item cpp/w2v_bert_uk.hpp package/cpp/
+          Copy-Item examples/transcribe.c package/examples/
+          Copy-Item examples/transcribe.cpp package/examples/
+          Compress-Archive -Path package/* -DestinationPath "c-cpp-${{ matrix.name }}.zip" -Force
+
+      - name: Upload C/C++ native extension
+        uses: actions/upload-artifact@v4
+        with:
+          name: c-cpp-${{ matrix.name }}
+          path: c-cpp-${{ matrix.name }}.zip
+          if-no-files-found: error
+
+  publish-release:
+    name: Upload C/C++ native extensions to release
+    needs: build-extensions
+    if: >-
+      always() &&
+      !cancelled() &&
+      !failure() &&
+      (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'create' && github.event.ref_type == 'tag'))
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Download C/C++ native extensions
+        uses: actions/download-artifact@v4
+        with:
+          pattern: c-cpp-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Upload C/C++ native extensions to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'create' && github.event.ref || github.ref_name }}
+          files: artifacts/c-cpp-*.zip
+          fail_on_unmatched_files: true

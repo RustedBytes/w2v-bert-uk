@@ -312,6 +312,16 @@ cargo build --release --no-default-features --features csharp,ort-dynamic --lib
 # enabling unsafe code and making the native library discoverable at runtime.
 ```
 
+C and C++:
+
+```bash
+cargo build --release --no-default-features --features c,cpp,ort-dynamic --lib
+cc -Ic -c examples/transcribe.c -o c-smoke.o
+c++ -Icpp -std=c++17 -c examples/transcribe.cpp -o cpp-smoke.o
+# Link your application against the generated native library and make ONNX
+# Runtime discoverable at runtime when using ort-dynamic.
+```
+
 ## Wheels
 
 The GitHub Actions workflow in `.github/workflows/python-bindings.yml` builds Python wheels on:
@@ -341,6 +351,16 @@ The GitHub Actions workflow in `.github/workflows/nodejs-bindings.yml` builds No
 - `windows-latest` as `windows-x64-msvc`
 
 Each job loads the extension in Node.js 16 before uploading the platform artifact. Tag creation also uploads the extensions to the matching GitHub Release.
+
+## C and C++ Extensions
+
+The GitHub Actions workflow in `.github/workflows/c-cpp-bindings.yml` builds the shared native library and generated `cbindgen` headers on:
+
+- `ubuntu-22.04` as `linux-x64-gnu`
+- `macos-latest` as `macos-arm64`
+- `windows-latest` as `windows-x64-msvc`
+
+Each job compiles C and C++ header smoke tests before uploading a zip with the native library, generated headers, and examples. Tag creation also uploads the zip files to the matching GitHub Release.
 
 ## Output
 

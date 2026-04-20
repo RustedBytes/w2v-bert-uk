@@ -15,8 +15,10 @@ crate-type = ["rlib", "cdylib"]
 
 [features]
 default = ["ort-bundled"]
+c = []
 coreml = ["ort/coreml"]
 cuda = ["ort/cuda", "ort/preload-dylibs"]
+cpp = []
 csharp = []
 java = ["dep:jni"]
 nodejs = ["dep:napi", "dep:napi-derive", "napi/napi8"]
@@ -43,6 +45,7 @@ swift-bridge = { version = "0.1.59", optional = true }
 symphonia = { version = "0.5", default-features = false, features = ["aac", "flac", "isomp4", "mp3", "ogg", "pcm", "vorbis", "wav"] }
 
 [build-dependencies]
+cbindgen = "0.29.2"
 csbindgen = "1.9.7"
 napi-build = "2.2.4"
 pyo3-build-config = "0.27.1"
