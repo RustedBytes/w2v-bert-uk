@@ -1,0 +1,22 @@
+[package]
+name = "w2v-bert-uk-php"
+version = "0.1.4"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "PHP extension bindings for w2v-bert-uk"
+repository = "https://github.com/RustedBytes/w2v-bert-uk"
+
+[lib]
+name = "w2v_bert_uk"
+crate-type = ["cdylib"]
+
+[features]
+default = ["ort-dynamic"]
+coreml = ["w2v-bert-uk/coreml"]
+cuda = ["w2v-bert-uk/cuda"]
+ort-bundled = ["w2v-bert-uk/ort-bundled"]
+ort-dynamic = ["w2v-bert-uk/ort-dynamic"]
+
+[dependencies]
+ext-php-rs = { version = "=0.15.10", features = ["anyhow"] }
+w2v-bert-uk = { path = "..", default-features = false }

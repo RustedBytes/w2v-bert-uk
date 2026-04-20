@@ -1,0 +1,100 @@
+name: PHP bindings
+
+on:
+  workflow_dispatch:
+  create:
+
+permissions:
+  contents: write
+
+jobs:
+  build-extensions:
+    name: Build PHP extension (${{ matrix.name }})
+    if: github.event_name != 'create' || github.event.ref_type == 'tag'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64-gnu
+            os: ubuntu-22.04
+            native-library: target/release/libw2v_bert_uk.so
+            extension-file: w2v_bert_uk.so
+          - name: macos-arm64
+            os: macos-latest
+            native-library: target/release/libw2v_bert_uk.dylib
+            extension-file: w2v_bert_uk.so
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build PHP extension
+        run: cargo build --release --manifest-path php/Cargo.toml --target-dir target --no-default-features --features ort-dynamic --lib
+
+      - name: Package PHP extension
+        shell: pwsh
+        run: |
+          $nativeLibrary = "${{ matrix.native-library }}"
+          if (!(Test-Path $nativeLibrary)) {
+            throw "PHP extension was not produced: $nativeLibrary"
+          }
+
+          New-Item -ItemType Directory -Force -Path package | Out-Null
+          Copy-Item $nativeLibrary "package/${{ matrix.extension-file }}"
+
+          Get-ChildItem target/release -File |
+            Where-Object {
+              $_.Name -like "onnxruntime*" -or
+              $_.Name -like "libonnxruntime*" -or
+              $_.Name -like "onnxruntime_providers*"
+            } |
+            ForEach-Object { Copy-Item $_.FullName package/ }
+
+          Copy-Item examples/transcribe.php package/
+          Compress-Archive -Path package/* -DestinationPath "php-${{ matrix.name }}.zip" -Force
+
+      - name: Import smoke test
+        shell: bash
+        run: |
+          php -d extension=package/${{ matrix.extension-file }} -r 'if (!function_exists("w2v_bert_uk_transcribe_file")) { throw new Exception("transcribe function missing"); } if (!class_exists("W2vBertUk\\Transcriber")) { throw new Exception("Transcriber missing"); }'
+
+      - name: Upload PHP extension
+        uses: actions/upload-artifact@v4
+        with:
+          name: php-${{ matrix.name }}
+          path: php-${{ matrix.name }}.zip
+          if-no-files-found: error
+
+  publish-release:
+    name: Upload PHP extensions to release
+    needs: build-extensions
+    if: >-
+      always() &&
+      !cancelled() &&
+      !failure() &&
+      (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'create' && github.event.ref_type == 'tag'))
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Download PHP extensions
+        uses: actions/download-artifact@v4
+        with:
+          pattern: php-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Upload PHP extensions to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'create' && github.event.ref || github.ref_name }}
+          files: artifacts/php-*.zip
+          fail_on_unmatched_files: true
