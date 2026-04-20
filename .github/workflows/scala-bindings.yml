@@ -1,0 +1,106 @@
+name: Scala bindings
+
+on:
+  workflow_dispatch:
+  create:
+
+permissions:
+  contents: write
+
+jobs:
+  build-extensions:
+    name: Build Scala native extension (${{ matrix.name }})
+    if: github.event_name != 'create' || github.event.ref_type == 'tag'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64-gnu
+            os: ubuntu-22.04
+            native-library: target/release/libw2v_bert_uk.so
+          - name: macos-arm64
+            os: macos-latest
+            native-library: target/release/libw2v_bert_uk.dylib
+          - name: windows-x64-msvc
+            os: windows-latest
+            native-library: target/release/w2v_bert_uk.dll
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Scala
+        uses: coursier/setup-action@v1
+        with:
+          apps: scalac:2.13.16
+
+      - name: Build Scala native extension
+        run: cargo build --release --no-default-features --features scala,ort-dynamic --lib
+
+      - name: Compile Scala bindings
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path scala/classes | Out-Null
+          scalac -d scala/classes scala/io/github/rustedbytes/w2vbertuk/W2vBertUk.scala examples/Transcribe.scala
+
+      - name: Package Scala native extension
+        shell: pwsh
+        run: |
+          $nativeLibrary = "${{ matrix.native-library }}"
+          if (!(Test-Path $nativeLibrary)) {
+            throw "Native library was not produced: $nativeLibrary"
+          }
+          if (!(Test-Path 'scala/classes/io/github/rustedbytes/w2vbertuk/W2vBertUk$.class')) {
+            throw "Scala bindings were not compiled"
+          }
+
+          New-Item -ItemType Directory -Force -Path package/native | Out-Null
+          New-Item -ItemType Directory -Force -Path package/scala | Out-Null
+          New-Item -ItemType Directory -Force -Path package/examples | Out-Null
+          Copy-Item $nativeLibrary package/native/
+          Copy-Item scala/io package/scala/io -Recurse
+          Copy-Item scala/classes package/scala/classes -Recurse
+          Copy-Item examples/Transcribe.scala package/examples/
+          Compress-Archive -Path package/* -DestinationPath "scala-${{ matrix.name }}.zip" -Force
+
+      - name: Upload Scala native extension
+        uses: actions/upload-artifact@v4
+        with:
+          name: scala-${{ matrix.name }}
+          path: scala-${{ matrix.name }}.zip
+          if-no-files-found: error
+
+  publish-release:
+    name: Upload Scala native extensions to release
+    needs: build-extensions
+    if: >-
+      always() &&
+      !cancelled() &&
+      !failure() &&
+      (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'create' && github.event.ref_type == 'tag'))
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Download Scala native extensions
+        uses: actions/download-artifact@v4
+        with:
+          pattern: scala-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Upload Scala native extensions to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'create' && github.event.ref || github.ref_name }}
+          files: artifacts/scala-*.zip
+          fail_on_unmatched_files: true

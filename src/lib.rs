@@ -33,6 +33,8 @@ mod nodejs;
 mod python;
 #[cfg(feature = "ruby")]
 mod ruby;
+#[cfg(feature = "scala")]
+mod scala;
 #[cfg(feature = "swift")]
 mod swift;
 pub mod tokenizer;

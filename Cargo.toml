@@ -28,6 +28,7 @@ ort-bundled = ["ort/copy-dylibs", "ort/download-binaries", "ort/tls-rustls"]
 ort-dynamic = ["ort/load-dynamic"]
 python = ["dep:pyo3", "pyo3/extension-module"]
 ruby = ["dep:magnus", "dep:rb-sys-build"]
+scala = ["dep:jni"]
 swift = ["dep:swift-bridge"]
 
 [dependencies]
