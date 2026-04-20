@@ -289,6 +289,29 @@ uvx maturin develop --release --features python
 uv run python examples/transcribe.py
 ```
 
+Node.js:
+
+```bash
+npm run build:nodejs -- --platform artifacts
+node examples/transcribe.js
+```
+
+Swift:
+
+```bash
+cargo build --release --no-default-features --features swift,ort-dynamic --lib
+# Compile examples/transcribe.swift together with swift/generated/*.swift and
+# swift/generated/w2v-bert-uk/*.swift, and link it against the native library.
+```
+
+C#:
+
+```bash
+cargo build --release --no-default-features --features csharp,ort-dynamic --lib
+# Compile examples/Transcribe.cs together with csharp/NativeMethods.g.cs,
+# enabling unsafe code and making the native library discoverable at runtime.
+```
+
 ## Wheels
 
 The GitHub Actions workflow in `.github/workflows/python-bindings.yml` builds Python wheels on:
