@@ -24,7 +24,7 @@ jobs:
             os: macos-latest
             native-library: target/release/libw2v_bert_uk.dylib
             build-args: --release --no-default-features --features ruby,ort-dynamic --lib
-          - name: windows-x64-gnu
+          - name: windows-x64-msvc
             os: windows-latest
             native-library: target/x86_64-pc-windows-gnu/release/w2v_bert_uk.dll
             build-args: --target x86_64-pc-windows-gnu --release --no-default-features --features ruby,ort-dynamic --lib
