@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use magnus::{
-    Error, RArray, RHash, RString, Ruby, TryConvert, Value, exception, function, method, prelude::*,
+    Error, RArray, RHash, RString, Ruby, TryConvert, Value, function, method, prelude::*,
 };
 
 use crate::{
@@ -227,8 +227,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
 }
 
 fn transcription_result_to_ruby(result: TranscriptionResult) -> Result<RHash, Error> {
-    let ruby =
-        Ruby::get().map_err(|error| Error::new(exception::runtime_error(), error.to_string()))?;
+    let ruby = Ruby::get().map_err(|error| Error::new(runtime_error(), error.to_string()))?;
     let hash = ruby.hash_new();
     hash.aset("transcript", result.transcript)?;
     hash.aset("timings", timings_to_ruby(&ruby, &result.timings)?)?;
@@ -349,7 +348,7 @@ fn expect_arg_count(args: &[Value], min: usize, max: usize, name: &str) -> Resul
         Ok(())
     } else {
         Err(Error::new(
-            exception::arg_error(),
+            arg_error(),
             format!("{name} expects {min}..{max} arguments, got {}", args.len()),
         ))
     }
@@ -367,7 +366,7 @@ fn parse_optimization_level(value: &str) -> Result<ModelOptimizationLevel, Error
         "level3" => Ok(ModelOptimizationLevel::Level3),
         "all" => Ok(ModelOptimizationLevel::All),
         other => Err(Error::new(
-            exception::arg_error(),
+            arg_error(),
             format!(
                 "invalid ort_optimization {other:?}; expected disable, level1, level2, level3, or all"
             ),
@@ -376,5 +375,17 @@ fn parse_optimization_level(value: &str) -> Result<ModelOptimizationLevel, Error
 }
 
 fn to_ruby_error(error: anyhow::Error) -> Error {
-    Error::new(exception::runtime_error(), error.to_string())
+    Error::new(runtime_error(), error.to_string())
+}
+
+fn arg_error() -> magnus::exception::ExceptionClass {
+    Ruby::get()
+        .expect("Ruby VM is not available")
+        .exception_arg_error()
+}
+
+fn runtime_error() -> magnus::exception::ExceptionClass {
+    Ruby::get()
+        .expect("Ruby VM is not available")
+        .exception_runtime_error()
 }

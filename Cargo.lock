@@ -2294,6 +2294,7 @@ dependencies = [
  "pyo3",
  "pyo3-build-config",
  "rayon",
+ "rb-sys-build",
  "splintr",
  "swift-bridge",
  "swift-bridge-build",

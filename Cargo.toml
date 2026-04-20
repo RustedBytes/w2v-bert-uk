@@ -54,6 +54,7 @@ cbindgen = "0.29.2"
 csbindgen = "1.9.7"
 napi-build = "2.2.4"
 pyo3-build-config = "0.27.1"
+rb-sys-build = "0.9.126"
 swift-bridge-build = "0.1.59"
 
 [profile.release]

@@ -52,8 +52,39 @@ fn main() {
         pyo3_build_config::add_extension_module_link_args();
     }
 
+    if std::env::var_os("CARGO_FEATURE_RUBY").is_some() {
+        add_ruby_extension_link_args();
+    }
+
     if std::env::var_os("CARGO_FEATURE_SWIFT").is_some() {
         swift_bridge_build::parse_bridges(vec!["src/swift.rs"])
             .write_all_concatenated("swift/generated", env!("CARGO_PKG_NAME"));
     }
+}
+
+fn add_ruby_extension_link_args() {
+    println!("cargo:rerun-if-env-changed=RUBY");
+    println!("cargo:rerun-if-env-changed=RUBY_ROOT");
+    println!("cargo:rerun-if-env-changed=RUBY_STATIC");
+    println!("cargo:rerun-if-env-changed=RUBY_VERSION");
+
+    let mut rbconfig = rb_sys_build::rb_config();
+
+    if cfg!(target_os = "macos") {
+        rbconfig.push_dldflags("-Wl,-undefined,dynamic_lookup");
+    }
+
+    if cfg!(windows) {
+        let ruby_static = std::env::var("RUBY_STATIC")
+            .map(|value| value == "true" || value == "1")
+            .unwrap_or_else(|_| {
+                rbconfig
+                    .get("ENABLE_SHARED")
+                    .map(|value| value == "no")
+                    .unwrap_or(false)
+            });
+        rbconfig.link_ruby(ruby_static);
+    }
+
+    rbconfig.print_cargo_args();
 }
