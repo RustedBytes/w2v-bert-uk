@@ -1,0 +1,78 @@
+name: Node.js bindings
+
+on:
+  workflow_dispatch:
+  create:
+
+permissions:
+  contents: write
+
+jobs:
+  build-extensions:
+    name: Build Node.js extension (${{ matrix.name }})
+    if: github.event_name != 'create' || github.event.ref_type == 'tag'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64-gnu
+            os: ubuntu-22.04
+          - name: macos-arm64
+            os: macos-latest
+          - name: windows-x64-msvc
+            os: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "16"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Node build tooling
+        run: npm ci --no-audit --no-fund
+
+      - name: Build Node.js extension
+        run: npm run build:nodejs -- --platform artifacts
+
+      - name: Import smoke test
+        run: |
+          node -e "const addon = require('./artifacts'); for (const name of ['Transcriber','initializeOrt','transcribeFile','transcribeBytes']) { if (!(name in addon)) throw new Error(name + ' missing') }"
+
+      - name: Upload Node.js extension
+        uses: actions/upload-artifact@v4
+        with:
+          name: nodejs-${{ matrix.name }}
+          path: artifacts/*.node
+          if-no-files-found: error
+
+  publish-release:
+    name: Upload Node.js extensions to release
+    needs: build-extensions
+    if: >-
+      always() &&
+      !cancelled() &&
+      !failure() &&
+      (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'create' && github.event.ref_type == 'tag'))
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Download Node.js extensions
+        uses: actions/download-artifact@v4
+        with:
+          pattern: nodejs-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Upload Node.js extensions to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'create' && github.event.ref || github.ref_name }}
+          files: artifacts/*.node
+          fail_on_unmatched_files: true

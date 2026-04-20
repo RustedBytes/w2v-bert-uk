@@ -1,0 +1,17 @@
+{
+  "name": "w2v-bert-uk",
+  "version": "0.1.4",
+  "private": true,
+  "napi": {
+    "name": "w2v_bert_uk"
+  },
+  "scripts": {
+    "build:nodejs": "node scripts/build-nodejs.js"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.4"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}

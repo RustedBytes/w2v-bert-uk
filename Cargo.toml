@@ -17,6 +17,7 @@ crate-type = ["rlib", "cdylib"]
 default = ["ort-bundled"]
 coreml = ["ort/coreml"]
 cuda = ["ort/cuda", "ort/preload-dylibs"]
+nodejs = ["dep:napi", "dep:napi-derive", "napi/napi8"]
 ort-bundled = ["ort/copy-dylibs", "ort/download-binaries", "ort/tls-rustls"]
 ort-dynamic = ["ort/load-dynamic"]
 python = ["dep:pyo3", "pyo3/extension-module"]
@@ -27,6 +28,8 @@ asr-features = { version = "0.1.1", features = ["frontend"] }
 clap = { version = "4.6.1", features = ["derive"] }
 half = { version = "2.1", default-features = false }
 kenlm-rs = { version = "0.1.0" }
+napi = { version = "2.16.17", optional = true, default-features = false, features = ["napi4"] }
+napi-derive = { version = "2.16.13", optional = true }
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["api-24", "half", "ndarray", "std"] }
 prost = "0.14"
 pyo3 = { version = "0.27.1", optional = true, features = ["abi3-py310"] }
@@ -35,6 +38,7 @@ splintr = "0.9.1"
 symphonia = { version = "0.5", default-features = false, features = ["aac", "flac", "isomp4", "mp3", "ogg", "pcm", "vorbis", "wav"] }
 
 [build-dependencies]
+napi-build = "2.2.4"
 pyo3-build-config = "0.27.1"
 
 [profile.release]

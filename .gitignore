@@ -30,4 +30,6 @@ __pycache__/
 *.pyo
 *.pyd
 
+node_modules/
 dist/
+artifacts/

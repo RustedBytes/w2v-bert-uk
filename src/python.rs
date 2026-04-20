@@ -10,9 +10,9 @@ use crate::{
     LmConfig, RuntimeConfig, ScoredCandidate, TextDecoderConfig, TimingReport,
     Transcriber as RustTranscriber, TranscriptionConfig, TranscriptionResult, W2vBertEncoderConfig,
     audio::AudioDecodeConfig,
-    init_ort, preload_cuda_dylibs as preload_cuda_dylibs_impl,
+    init_ort,
     model::{ModelConfig, ModelOptimizationLevel},
-    transcribe_audio_bytes, transcribe_audio_file,
+    preload_cuda_dylibs as preload_cuda_dylibs_impl, transcribe_audio_bytes, transcribe_audio_file,
 };
 
 #[pyfunction]

@@ -17,6 +17,8 @@ use crate::tokenizer::load_sentencepiece_tokenizer;
 pub mod audio;
 pub mod ctc;
 pub mod model;
+#[cfg(feature = "nodejs")]
+mod nodejs;
 #[cfg(feature = "python")]
 mod python;
 pub mod tokenizer;

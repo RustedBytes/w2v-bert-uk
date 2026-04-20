@@ -232,6 +232,48 @@ first_report = transcriber.transcribe_file_with_report("example_1.wav")
 first_from_bytes = transcriber.transcribe_bytes(audio_bytes, format_hint="wav")
 ```
 
+## Node.js
+
+The crate can be built as a Node.js 16+ native extension through Node-API and napi-rs:
+
+```bash
+npm install
+npm run build:nodejs -- --platform artifacts
+```
+
+The generated extension can be loaded from the output directory:
+
+```js
+const w2vBertUk = require("./artifacts");
+
+const text = w2vBertUk.transcribeFile("example_1.wav", {
+  model: "model_optimized.onnx",
+  tokenizer: "tokenizer.model",
+  lm: null,
+  beamWidth: 32,
+  ortOptimization: "disable",
+  fallbackSampleRate: 16000,
+  skipDecodeErrors: true,
+});
+
+const report = w2vBertUk.transcribeFileWithReport("example_1.wav", {
+  model: "model_optimized.onnx",
+  tokenizer: "tokenizer.model",
+  lm: null,
+});
+
+const transcriber = new w2vBertUk.Transcriber({
+  model: "model_optimized.onnx",
+  tokenizer: "tokenizer.model",
+  lm: "news-titles.arpa",
+});
+
+const reused = transcriber.transcribeFile("example_2.wav");
+console.log(text, report.timings.modelInferenceSeconds, reused);
+```
+
+The Node.js build uses `ort-dynamic`, so set `ORT_DYLIB_PATH` before loading the extension when ONNX Runtime is not discoverable by the system loader.
+
 ## Examples
 
 Rust:
@@ -266,6 +308,16 @@ uvx maturin build --release --features python
 uvx maturin build --release --features "python coreml"
 uvx maturin build --release --features "python cuda"
 ```
+
+## Node.js Extensions
+
+The GitHub Actions workflow in `.github/workflows/nodejs-bindings.yml` builds Node.js `.node` extensions on:
+
+- `ubuntu-22.04` as `linux-x64-gnu`
+- `macos-latest` as `macos-arm64`
+- `windows-latest` as `windows-x64-msvc`
+
+Each job loads the extension in Node.js 16 before uploading the platform artifact. Tag creation also uploads the extensions to the matching GitHub Release.
 
 ## Output
 
