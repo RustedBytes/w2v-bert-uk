@@ -1,0 +1,109 @@
+name: Ruby bindings
+
+on:
+  workflow_dispatch:
+  create:
+
+permissions:
+  contents: write
+
+jobs:
+  build-extensions:
+    name: Build Ruby extension (${{ matrix.name }})
+    if: github.event_name != 'create' || github.event.ref_type == 'tag'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64-gnu
+            os: ubuntu-22.04
+            native-library: target/release/libw2v_bert_uk.so
+            build-args: --release --no-default-features --features ruby,ort-dynamic --lib
+          - name: macos-arm64
+            os: macos-latest
+            native-library: target/release/libw2v_bert_uk.dylib
+            build-args: --release --no-default-features --features ruby,ort-dynamic --lib
+          - name: windows-x64-msvc
+            os: windows-latest
+            native-library: target/release/w2v_bert_uk.dll
+            build-args: --release --no-default-features --features ruby,ort-dynamic --lib
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up MSVC shell
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build Ruby extension
+        run: cargo build ${{ matrix.build-args }}
+
+      - name: Package Ruby extension
+        shell: pwsh
+        run: |
+          $nativeLibrary = "${{ matrix.native-library }}"
+          if (!(Test-Path $nativeLibrary)) {
+            throw "Ruby extension was not produced: $nativeLibrary"
+          }
+
+          $extensionSuffix = ruby -rrbconfig -e "print RbConfig::CONFIG['DLEXT']"
+          New-Item -ItemType Directory -Force -Path package | Out-Null
+          Copy-Item $nativeLibrary "package/w2v_bert_uk.$extensionSuffix"
+
+          Get-ChildItem target/release -File |
+            Where-Object {
+              $_.Name -like "onnxruntime*" -or
+              $_.Name -like "libonnxruntime*" -or
+              $_.Name -like "onnxruntime_providers*"
+            } |
+            ForEach-Object { Copy-Item $_.FullName package/ }
+
+          Copy-Item examples/transcribe.rb package/
+          Compress-Archive -Path package/* -DestinationPath "ruby-${{ matrix.name }}.zip" -Force
+
+      - name: Import smoke test
+        shell: bash
+        run: |
+          ruby -I package -e "require 'w2v_bert_uk'; raise 'Transcriber missing' unless W2vBertUk.const_defined?(:Transcriber); raise 'transcribe_file missing' unless W2vBertUk.respond_to?(:transcribe_file)"
+
+      - name: Upload Ruby extension
+        uses: actions/upload-artifact@v4
+        with:
+          name: ruby-${{ matrix.name }}
+          path: ruby-${{ matrix.name }}.zip
+          if-no-files-found: error
+
+  publish-release:
+    name: Upload Ruby extensions to release
+    needs: build-extensions
+    if: >-
+      always() &&
+      !cancelled() &&
+      !failure() &&
+      (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'create' && github.event.ref_type == 'tag'))
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Download Ruby extensions
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ruby-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Upload Ruby extensions to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'create' && github.event.ref || github.ref_name }}
+          files: artifacts/ruby-*.zip
+          fail_on_unmatched_files: true

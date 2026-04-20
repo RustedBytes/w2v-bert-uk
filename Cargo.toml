@@ -25,6 +25,7 @@ nodejs = ["dep:napi", "dep:napi-derive", "napi/napi8"]
 ort-bundled = ["ort/copy-dylibs", "ort/download-binaries", "ort/tls-rustls"]
 ort-dynamic = ["ort/load-dynamic"]
 python = ["dep:pyo3", "pyo3/extension-module"]
+ruby = ["dep:magnus"]
 swift = ["dep:swift-bridge"]
 
 [dependencies]
@@ -34,6 +35,7 @@ clap = { version = "4.6.1", features = ["derive"] }
 half = { version = "2.1", default-features = false }
 kenlm-rs = { version = "0.1.0" }
 jni = { version = "0.22.4", optional = true }
+magnus = { version = "0.8.2", optional = true }
 napi = { version = "2.16.17", optional = true, default-features = false, features = ["napi4"] }
 napi-derive = { version = "2.16.13", optional = true }
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["api-24", "half", "ndarray", "std"] }

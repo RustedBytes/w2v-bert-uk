@@ -26,6 +26,8 @@ pub mod model;
 mod nodejs;
 #[cfg(feature = "python")]
 mod python;
+#[cfg(feature = "ruby")]
+mod ruby;
 #[cfg(feature = "swift")]
 mod swift;
 pub mod tokenizer;
