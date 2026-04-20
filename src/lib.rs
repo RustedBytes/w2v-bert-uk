@@ -15,7 +15,7 @@ use crate::model::{CtcModel, ModelConfig, ModelOutput};
 use crate::tokenizer::load_sentencepiece_tokenizer;
 
 pub mod audio;
-#[cfg(any(feature = "c", feature = "cpp", feature = "csharp"))]
+#[cfg(any(feature = "c", feature = "cpp", feature = "csharp", feature = "go"))]
 #[path = "csharp.rs"]
 mod c_abi;
 pub mod ctc;

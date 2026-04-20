@@ -1,10 +1,12 @@
 fn main() {
     println!("cargo:rerun-if-changed=src/csharp.rs");
+    println!("cargo:rerun-if-changed=go/w2v_bert_uk.go");
     println!("cargo:rerun-if-changed=src/java.rs");
     println!("cargo:rerun-if-changed=src/swift.rs");
 
     if std::env::var_os("CARGO_FEATURE_C").is_some()
         || std::env::var_os("CARGO_FEATURE_CPP").is_some()
+        || std::env::var_os("CARGO_FEATURE_GO").is_some()
     {
         std::fs::create_dir_all("c").expect("failed to create c bindings directory");
         std::fs::create_dir_all("cpp").expect("failed to create C++ bindings directory");

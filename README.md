@@ -232,6 +232,52 @@ first_report = transcriber.transcribe_file_with_report("example_1.wav")
 first_from_bytes = transcriber.transcribe_bytes(audio_bytes, format_hint="wav")
 ```
 
+## Go
+
+The crate can be built as a Go cgo package by enabling the `go` feature. The
+Go package uses the generated C ABI from `cbindgen`, so the native library,
+`c/w2v_bert_uk.h`, and the `go/` package must be kept together:
+
+```bash
+cargo build --release --no-default-features --features go,ort-dynamic --lib
+mkdir -p native
+cp target/release/libw2v_bert_uk.so native/
+go test ./go
+go run ./examples/transcribe.go example_1.wav
+```
+
+Go API:
+
+```go
+package main
+
+import (
+	"fmt"
+	"log"
+
+	w2vbertuk "github.com/RustedBytes/w2v-bert-uk/go"
+)
+
+func main() {
+	transcriber, err := w2vbertuk.NewTranscriber(w2vbertuk.Options{
+		Model:     "model_optimized.onnx",
+		Tokenizer: "tokenizer.model",
+		LM:        "news-titles.arpa",
+		BeamWidth: 32,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer transcriber.Close()
+
+	text, err := transcriber.TranscribeFile("example_1.wav")
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(text)
+}
+```
+
 ## Node.js
 
 The crate can be built as a Node.js 16+ native extension through Node-API and napi-rs:
