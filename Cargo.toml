@@ -22,6 +22,7 @@ cpp = []
 csharp = []
 go = []
 java = ["dep:jni"]
+kotlin = ["dep:uniffi"]
 nodejs = ["dep:napi", "dep:napi-derive", "napi/napi8"]
 ort-bundled = ["ort/copy-dylibs", "ort/download-binaries", "ort/tls-rustls"]
 ort-dynamic = ["ort/load-dynamic"]
@@ -46,6 +47,7 @@ rayon = "1.11"
 splintr = "0.9.1"
 swift-bridge = { version = "0.1.59", optional = true }
 symphonia = { version = "0.5", default-features = false, features = ["aac", "flac", "isomp4", "mp3", "ogg", "pcm", "vorbis", "wav"] }
+uniffi = { version = "0.31.1", optional = true }
 
 [build-dependencies]
 cbindgen = "0.29.2"

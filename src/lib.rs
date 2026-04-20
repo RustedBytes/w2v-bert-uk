@@ -14,6 +14,9 @@ use crate::audio::{
 use crate::model::{CtcModel, ModelConfig, ModelOutput};
 use crate::tokenizer::load_sentencepiece_tokenizer;
 
+#[cfg(feature = "kotlin")]
+uniffi::setup_scaffolding!();
+
 pub mod audio;
 #[cfg(any(feature = "c", feature = "cpp", feature = "csharp", feature = "go"))]
 #[path = "csharp.rs"]
@@ -21,6 +24,8 @@ mod c_abi;
 pub mod ctc;
 #[cfg(feature = "java")]
 mod java;
+#[cfg(feature = "kotlin")]
+mod kotlin;
 pub mod model;
 #[cfg(feature = "nodejs")]
 mod nodejs;

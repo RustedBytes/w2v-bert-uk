@@ -232,6 +232,36 @@ first_report = transcriber.transcribe_file_with_report("example_1.wav")
 first_from_bytes = transcriber.transcribe_bytes(audio_bytes, format_hint="wav")
 ```
 
+## Kotlin
+
+Kotlin/JVM bindings are generated with UniFFI:
+
+```bash
+CARGO_PROFILE_RELEASE_STRIP=false cargo build --release --no-default-features --features kotlin,ort-dynamic --lib
+cargo install uniffi --version 0.31.1 --locked --features cli --root target/uniffi-tools
+target/uniffi-tools/bin/uniffi-bindgen generate target/release/libw2v_bert_uk.so --language kotlin --out-dir kotlin/generated --no-format
+```
+
+The generated Kotlin uses JNA to load `w2v_bert_uk`, so make the native library and ONNX Runtime discoverable at runtime.
+
+Kotlin API:
+
+```kotlin
+import io.github.rustedbytes.w2vbertuk.KotlinTranscriber
+import io.github.rustedbytes.w2vbertuk.defaultOptions
+
+val options = defaultOptions().copy(
+    model = "model_optimized.onnx",
+    tokenizer = "tokenizer.model",
+    lm = "news-titles.arpa",
+)
+
+KotlinTranscriber(options).use { transcriber ->
+    val text = transcriber.transcribeFile("example_1.wav")
+    println(text)
+}
+```
+
 ## Go
 
 The crate can be built as a Go cgo package by enabling the `go` feature. The
@@ -342,6 +372,15 @@ npm run build:nodejs -- --platform artifacts
 node examples/transcribe.js
 ```
 
+Kotlin:
+
+```bash
+CARGO_PROFILE_RELEASE_STRIP=false cargo build --release --no-default-features --features kotlin,ort-dynamic --lib
+target/uniffi-tools/bin/uniffi-bindgen generate target/release/libw2v_bert_uk.so --language kotlin --out-dir kotlin/generated --no-format
+# Compile examples/Transcribe.kt together with kotlin/generated/**/*.kt and
+# include JNA on the Kotlin/JVM classpath.
+```
+
 Swift:
 
 ```bash
@@ -397,6 +436,16 @@ The GitHub Actions workflow in `.github/workflows/nodejs-bindings.yml` builds No
 - `windows-latest` as `windows-x64-msvc`
 
 Each job loads the extension in Node.js 16 before uploading the platform artifact. Tag creation also uploads the extensions to the matching GitHub Release.
+
+## Kotlin Extensions
+
+The GitHub Actions workflow in `.github/workflows/kotlin-bindings.yml` builds the shared native library and UniFFI-generated Kotlin/JVM bindings on:
+
+- `ubuntu-22.04` as `linux-x64-gnu`
+- `macos-latest` as `macos-arm64`
+- `windows-latest` as `windows-x64-msvc`
+
+Each job builds with `ort-dynamic`, generates Kotlin from the native library, and uploads a zip with the native library, generated Kotlin sources, UniFFI config, and example. Tag creation also uploads the zip files to the matching GitHub Release.
 
 ## C and C++ Extensions
 

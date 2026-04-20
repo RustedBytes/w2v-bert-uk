@@ -2,6 +2,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/csharp.rs");
     println!("cargo:rerun-if-changed=go/w2v_bert_uk.go");
     println!("cargo:rerun-if-changed=src/java.rs");
+    println!("cargo:rerun-if-changed=src/kotlin.rs");
     println!("cargo:rerun-if-changed=src/swift.rs");
 
     if std::env::var_os("CARGO_FEATURE_C").is_some()
