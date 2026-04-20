@@ -15,6 +15,8 @@ use crate::model::{CtcModel, ModelConfig, ModelOutput};
 use crate::tokenizer::load_sentencepiece_tokenizer;
 
 pub mod audio;
+#[cfg(feature = "csharp")]
+mod csharp;
 pub mod ctc;
 pub mod model;
 #[cfg(feature = "nodejs")]

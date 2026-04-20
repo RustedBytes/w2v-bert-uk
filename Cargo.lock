@@ -303,6 +303,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "csbindgen"
+version = "1.9.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "710604f525e7b68070458083252602c2bf2afe255dfe019e83bd57bdfa50bdb4"
+dependencies = [
+ "regex",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "ctor"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1481,6 +1491,7 @@ dependencies = [
  "anyhow",
  "asr-features",
  "clap",
+ "csbindgen",
  "half",
  "kenlm-rs",
  "napi",

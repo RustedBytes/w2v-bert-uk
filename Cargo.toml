@@ -17,6 +17,7 @@ crate-type = ["rlib", "cdylib"]
 default = ["ort-bundled"]
 coreml = ["ort/coreml"]
 cuda = ["ort/cuda", "ort/preload-dylibs"]
+csharp = []
 nodejs = ["dep:napi", "dep:napi-derive", "napi/napi8"]
 ort-bundled = ["ort/copy-dylibs", "ort/download-binaries", "ort/tls-rustls"]
 ort-dynamic = ["ort/load-dynamic"]
@@ -38,6 +39,7 @@ splintr = "0.9.1"
 symphonia = { version = "0.5", default-features = false, features = ["aac", "flac", "isomp4", "mp3", "ogg", "pcm", "vorbis", "wav"] }
 
 [build-dependencies]
+csbindgen = "1.9.7"
 napi-build = "2.2.4"
 pyo3-build-config = "0.27.1"
 

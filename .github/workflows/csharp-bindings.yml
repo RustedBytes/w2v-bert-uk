@@ -1,0 +1,85 @@
+name: C# bindings
+
+on:
+  workflow_dispatch:
+  create:
+
+permissions:
+  contents: write
+
+jobs:
+  build-extensions:
+    name: Build C# native extension (${{ matrix.name }})
+    if: github.event_name != 'create' || github.event.ref_type == 'tag'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64-gnu
+            os: ubuntu-22.04
+            native-library: target/release/libw2v_bert_uk.so
+          - name: macos-arm64
+            os: macos-latest
+            native-library: target/release/libw2v_bert_uk.dylib
+          - name: windows-x64-msvc
+            os: windows-latest
+            native-library: target/release/w2v_bert_uk.dll
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build C# native extension
+        run: cargo build --release --no-default-features --features csharp,ort-dynamic --lib
+
+      - name: Package C# native extension
+        shell: pwsh
+        run: |
+          $nativeLibrary = "${{ matrix.native-library }}"
+          if (!(Test-Path $nativeLibrary)) {
+            throw "Native library was not produced: $nativeLibrary"
+          }
+          if (!(Test-Path "csharp/NativeMethods.g.cs")) {
+            throw "Generated C# bindings were not produced"
+          }
+
+          New-Item -ItemType Directory -Force -Path package | Out-Null
+          Copy-Item $nativeLibrary package/
+          Copy-Item csharp/NativeMethods.g.cs package/
+          Compress-Archive -Path package/* -DestinationPath "csharp-${{ matrix.name }}.zip" -Force
+
+      - name: Upload C# native extension
+        uses: actions/upload-artifact@v4
+        with:
+          name: csharp-${{ matrix.name }}
+          path: csharp-${{ matrix.name }}.zip
+          if-no-files-found: error
+
+  publish-release:
+    name: Upload C# native extensions to release
+    needs: build-extensions
+    if: >-
+      always() &&
+      !cancelled() &&
+      !failure() &&
+      (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'create' && github.event.ref_type == 'tag'))
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Download C# native extensions
+        uses: actions/download-artifact@v4
+        with:
+          pattern: csharp-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Upload C# native extensions to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'create' && github.event.ref || github.ref_name }}
+          files: artifacts/csharp-*.zip
+          fail_on_unmatched_files: true
