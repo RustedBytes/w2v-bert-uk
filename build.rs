@@ -52,8 +52,11 @@ fn main() {
         pyo3_build_config::add_extension_module_link_args();
     }
 
-    if std::env::var_os("CARGO_FEATURE_RUBY").is_some() {
-        add_ruby_extension_link_args();
+    #[cfg(feature = "ruby")]
+    {
+        if std::env::var_os("CARGO_FEATURE_RUBY").is_some() {
+            add_ruby_extension_link_args();
+        }
     }
 
     if std::env::var_os("CARGO_FEATURE_SWIFT").is_some() {
@@ -62,6 +65,7 @@ fn main() {
     }
 }
 
+#[cfg(feature = "ruby")]
 fn add_ruby_extension_link_args() {
     println!("cargo:rerun-if-env-changed=RUBY");
     println!("cargo:rerun-if-env-changed=RUBY_ROOT");

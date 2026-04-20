@@ -27,7 +27,7 @@ nodejs = ["dep:napi", "dep:napi-derive", "napi/napi8"]
 ort-bundled = ["ort/copy-dylibs", "ort/download-binaries", "ort/tls-rustls"]
 ort-dynamic = ["ort/load-dynamic"]
 python = ["dep:pyo3", "pyo3/extension-module"]
-ruby = ["dep:magnus"]
+ruby = ["dep:magnus", "dep:rb-sys-build"]
 swift = ["dep:swift-bridge"]
 
 [dependencies]
@@ -54,7 +54,7 @@ cbindgen = "0.29.2"
 csbindgen = "1.9.7"
 napi-build = "2.2.4"
 pyo3-build-config = "0.27.1"
-rb-sys-build = "0.9.126"
+rb-sys-build = { version = "0.9.126", optional = true }
 swift-bridge-build = "0.1.59"
 
 [profile.release]
