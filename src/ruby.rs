@@ -51,7 +51,7 @@ impl Transcriber {
     fn transcribe_bytes(&self, args: &[Value]) -> Result<String, Error> {
         expect_arg_count(args, 1, 2, "transcribe_bytes")?;
         let audio_bytes = bytes_from_value(args[0])?;
-        let format_hint = optional_arg(args, 1)?;
+        let format_hint: Option<String> = optional_arg(args, 1)?;
         self.0
             .borrow_mut()
             .transcribe_audio_bytes(audio_bytes, format_hint.as_deref())
@@ -62,7 +62,7 @@ impl Transcriber {
     fn transcribe_bytes_with_report(&self, args: &[Value]) -> Result<RHash, Error> {
         expect_arg_count(args, 1, 2, "transcribe_bytes_with_report")?;
         let audio_bytes = bytes_from_value(args[0])?;
-        let format_hint = optional_arg(args, 1)?;
+        let format_hint: Option<String> = optional_arg(args, 1)?;
         let result = self
             .0
             .borrow_mut()
@@ -74,14 +74,14 @@ impl Transcriber {
 
 fn initialize_ort(args: &[Value]) -> Result<bool, Error> {
     expect_arg_count(args, 0, 1, "initialize_ort")?;
-    let ort_dylib_path = optional_arg(args, 0)?;
+    let ort_dylib_path: Option<PathBuf> = optional_arg(args, 0)?;
     init_ort(ort_dylib_path.as_deref()).map_err(to_ruby_error)
 }
 
 fn preload_cuda_dylibs(args: &[Value]) -> Result<(), Error> {
     expect_arg_count(args, 0, 2, "preload_cuda_dylibs")?;
-    let cuda_lib_dir = optional_arg(args, 0)?;
-    let cudnn_lib_dir = optional_arg(args, 1)?;
+    let cuda_lib_dir: Option<PathBuf> = optional_arg(args, 0)?;
+    let cudnn_lib_dir: Option<PathBuf> = optional_arg(args, 1)?;
     preload_cuda_dylibs_impl(cuda_lib_dir.as_deref(), cudnn_lib_dir.as_deref())
         .map_err(to_ruby_error)
 }
