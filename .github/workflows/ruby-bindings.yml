@@ -24,10 +24,6 @@ jobs:
             os: macos-latest
             native-library: target/release/libw2v_bert_uk.dylib
             build-args: --release --no-default-features --features ruby,ort-dynamic --lib
-          - name: windows-x64-msvc
-            os: windows-latest
-            native-library: target/x86_64-pc-windows-gnu/release/w2v_bert_uk.dll
-            build-args: --target x86_64-pc-windows-gnu --release --no-default-features --features ruby,ort-dynamic --lib
 
     steps:
       - name: Checkout
@@ -40,50 +36,6 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Set up MSVC shell
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
-
-      - name: Set up Windows Ruby build environment
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          rustup target add x86_64-pc-windows-gnu
-
-          $msvcLinker = Get-Command link.exe -All |
-            Where-Object { $_.Source -match '\\VC\\Tools\\MSVC\\' } |
-            Select-Object -First 1
-
-          if (!$msvcLinker) {
-            where.exe link.exe
-            throw "MSVC link.exe was not found on PATH"
-          }
-
-          $rubyBindir = ruby -rrbconfig -e "print RbConfig::CONFIG['bindir']"
-          $msysRoot = Resolve-Path (Join-Path $rubyBindir '..\msys64')
-          $ucrtBin = Join-Path $msysRoot 'ucrt64\bin'
-          $ucrtInclude = Join-Path $msysRoot 'ucrt64\include'
-
-          if (!(Test-Path $ucrtBin) -or !(Test-Path $ucrtInclude)) {
-            throw "Ruby MSYS2 UCRT toolchain was not found under $msysRoot"
-          }
-
-          $gnuLinker = Join-Path $ucrtBin 'x86_64-w64-mingw32-gcc.exe'
-          if (!(Test-Path $gnuLinker)) {
-            $gnuLinker = Join-Path $ucrtBin 'gcc.exe'
-          }
-          if (!(Test-Path $gnuLinker)) {
-            throw "Ruby MSYS2 UCRT GCC was not found under $ucrtBin"
-          }
-
-          $gnuLinkerArg = $gnuLinker.Replace('\', '/')
-          $ucrtIncludeArg = $ucrtInclude.Replace('\', '/')
-
-          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$($msvcLinker.Source)" >> $env:GITHUB_ENV
-          "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=$gnuLinkerArg" >> $env:GITHUB_ENV
-          $ucrtBin >> $env:GITHUB_PATH
-          "BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu=--target=x86_64-w64-mingw32 -I$ucrtIncludeArg -mmmx -mno-sse -mno-avx" >> $env:GITHUB_ENV
 
       - name: Build Ruby extension
         run: cargo build ${{ matrix.build-args }}
