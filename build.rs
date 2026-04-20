@@ -1,5 +1,6 @@
 fn main() {
     println!("cargo:rerun-if-changed=src/csharp.rs");
+    println!("cargo:rerun-if-changed=src/java.rs");
     println!("cargo:rerun-if-changed=src/swift.rs");
 
     if std::env::var_os("CARGO_FEATURE_CSHARP").is_some() {

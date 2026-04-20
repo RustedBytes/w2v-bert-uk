@@ -18,6 +18,8 @@ pub mod audio;
 #[cfg(feature = "csharp")]
 mod csharp;
 pub mod ctc;
+#[cfg(feature = "java")]
+mod java;
 pub mod model;
 #[cfg(feature = "nodejs")]
 mod nodejs;

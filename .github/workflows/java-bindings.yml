@@ -1,0 +1,98 @@
+name: Java bindings
+
+on:
+  workflow_dispatch:
+  create:
+
+permissions:
+  contents: write
+
+jobs:
+  build-extensions:
+    name: Build Java native extension (${{ matrix.name }})
+    if: github.event_name != 'create' || github.event.ref_type == 'tag'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64-gnu
+            os: ubuntu-22.04
+            native-library: target/release/libw2v_bert_uk.so
+          - name: macos-arm64
+            os: macos-latest
+            native-library: target/release/libw2v_bert_uk.dylib
+          - name: windows-x64-msvc
+            os: windows-latest
+            native-library: target/release/w2v_bert_uk.dll
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Build Java native extension
+        run: cargo build --release --no-default-features --features java,ort-dynamic --lib
+
+      - name: Compile Java bindings
+        run: javac -d java/classes java/io/github/rustedbytes/w2vbertuk/W2vBertUk.java examples/Transcribe.java
+
+      - name: Package Java native extension
+        shell: pwsh
+        run: |
+          $nativeLibrary = "${{ matrix.native-library }}"
+          if (!(Test-Path $nativeLibrary)) {
+            throw "Native library was not produced: $nativeLibrary"
+          }
+          if (!(Test-Path "java/classes/io/github/rustedbytes/w2vbertuk/W2vBertUk.class")) {
+            throw "Java bindings were not compiled"
+          }
+
+          New-Item -ItemType Directory -Force -Path package/native | Out-Null
+          New-Item -ItemType Directory -Force -Path package/java | Out-Null
+          New-Item -ItemType Directory -Force -Path package/examples | Out-Null
+          Copy-Item $nativeLibrary package/native/
+          Copy-Item java/io package/java/io -Recurse
+          Copy-Item java/classes package/java/classes -Recurse
+          Copy-Item examples/Transcribe.java package/examples/
+          Compress-Archive -Path package/* -DestinationPath "java-${{ matrix.name }}.zip" -Force
+
+      - name: Upload Java native extension
+        uses: actions/upload-artifact@v4
+        with:
+          name: java-${{ matrix.name }}
+          path: java-${{ matrix.name }}.zip
+          if-no-files-found: error
+
+  publish-release:
+    name: Upload Java native extensions to release
+    needs: build-extensions
+    if: >-
+      always() &&
+      !cancelled() &&
+      !failure() &&
+      (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'create' && github.event.ref_type == 'tag'))
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Download Java native extensions
+        uses: actions/download-artifact@v4
+        with:
+          pattern: java-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Upload Java native extensions to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'create' && github.event.ref || github.ref_name }}
+          files: artifacts/java-*.zip
+          fail_on_unmatched_files: true
