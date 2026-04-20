@@ -34,6 +34,13 @@ jobs:
         with:
           php-version: "8.3"
 
+      - name: Set up libclang
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-15 libclang-15-dev
+          echo "LIBCLANG_PATH=/usr/lib/llvm-15/lib" >> "$GITHUB_ENV"
+
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
