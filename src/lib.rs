@@ -23,6 +23,8 @@ pub mod model;
 mod nodejs;
 #[cfg(feature = "python")]
 mod python;
+#[cfg(feature = "swift")]
+mod swift;
 pub mod tokenizer;
 
 #[derive(Clone, Debug, Default)]

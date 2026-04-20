@@ -1,5 +1,6 @@
 fn main() {
     println!("cargo:rerun-if-changed=src/csharp.rs");
+    println!("cargo:rerun-if-changed=src/swift.rs");
 
     if std::env::var_os("CARGO_FEATURE_CSHARP").is_some() {
         csbindgen::Builder::default()
@@ -18,5 +19,10 @@ fn main() {
 
     if std::env::var_os("CARGO_FEATURE_PYTHON").is_some() {
         pyo3_build_config::add_extension_module_link_args();
+    }
+
+    if std::env::var_os("CARGO_FEATURE_SWIFT").is_some() {
+        swift_bridge_build::parse_bridges(vec!["src/swift.rs"])
+            .write_all_concatenated("swift/generated", env!("CARGO_PKG_NAME"));
     }
 }
