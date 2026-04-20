@@ -45,6 +45,22 @@ jobs:
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
 
+      - name: Prefer MSVC linker
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $linker = Get-Command link.exe -All |
+            Where-Object { $_.Source -match '\\VC\\Tools\\MSVC\\' } |
+            Select-Object -First 1
+
+          if (!$linker) {
+            where.exe link.exe
+            throw "MSVC link.exe was not found on PATH"
+          }
+
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$($linker.Source)" >> $env:GITHUB_ENV
+          Write-Host "Using MSVC linker: $($linker.Source)"
+
       - name: Build Ruby extension
         run: cargo build ${{ matrix.build-args }}
 
