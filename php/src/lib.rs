@@ -57,7 +57,7 @@ impl Transcriber {
         Ok(self
             .inner
             .transcribe_audio_bytes(
-                audio_bytes.iter().copied().collect(),
+                audio_bytes.iter().copied().collect::<Vec<u8>>(),
                 format_hint.as_deref(),
             )?
             .transcript)
@@ -69,7 +69,7 @@ impl Transcriber {
         format_hint: Option<String>,
     ) -> PhpResult<ZBox<ZendHashTable>> {
         let result = self.inner.transcribe_audio_bytes(
-            audio_bytes.iter().copied().collect(),
+            audio_bytes.iter().copied().collect::<Vec<u8>>(),
             format_hint.as_deref(),
         )?;
         transcription_result_to_php(result)
@@ -121,7 +121,7 @@ pub fn transcribe_bytes(
 ) -> PhpResult<String> {
     let config = build_config(options)?;
     Ok(transcribe_audio_bytes(
-        audio_bytes.iter().copied().collect(),
+        audio_bytes.iter().copied().collect::<Vec<u8>>(),
         format_hint.as_deref(),
         &config,
     )?
@@ -137,7 +137,7 @@ pub fn transcribe_bytes_with_report(
 ) -> PhpResult<ZBox<ZendHashTable>> {
     let config = build_config(options)?;
     let result = transcribe_audio_bytes(
-        audio_bytes.iter().copied().collect(),
+        audio_bytes.iter().copied().collect::<Vec<u8>>(),
         format_hint.as_deref(),
         &config,
     )?;
@@ -164,11 +164,6 @@ fn build_config(options: Option<&ZendHashTable>) -> PhpResult<TranscriptionConfi
             })
         })
         .transpose()?;
-    let candidate_processing = CandidateProcessingConfig {
-        normalize_spaces,
-        drop_empty_candidates,
-    };
-
     Ok(TranscriptionConfig {
         runtime: RuntimeConfig {
             ort_dylib_path: option_path(options, "ort_dylib_path")?,
