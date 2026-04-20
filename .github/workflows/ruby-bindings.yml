@@ -83,7 +83,7 @@ jobs:
           "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$($msvcLinker.Source)" >> $env:GITHUB_ENV
           "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=$gnuLinkerArg" >> $env:GITHUB_ENV
           $ucrtBin >> $env:GITHUB_PATH
-          "BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu=--target=x86_64-w64-windows-gnu -I$ucrtIncludeArg" >> $env:GITHUB_ENV
+          "BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu=--target=x86_64-w64-mingw32 -I$ucrtIncludeArg -mmmx -mno-sse -mno-avx" >> $env:GITHUB_ENV
 
       - name: Build Ruby extension
         run: cargo build ${{ matrix.build-args }}
