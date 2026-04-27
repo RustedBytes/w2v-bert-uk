@@ -169,6 +169,8 @@ Burn's built-in matmul, convolution, softmax, and elementwise kernels:
 | `SequenceMask` / `PaddingMask` / `AttentionMask` | Squeezeformer, Zipformer, W2V-BERT, Paraformer | mask construction from lengths |
 | `Glu` | Zipformer, W2V-BERT convolution modules | fused gated linear unit |
 | `PairwiseDownsample` | Zipformer | learned softmax pairwise downsample with mask normalization |
+| `ResidualAddMaskTime` | Zipformer, W2V-BERT, Squeezeformer | fused residual/update add plus length masking |
+| `AttentionMask4d` | Zipformer, W2V-BERT | direct expanded attention mask construction |
 
 Build with the feature when experimenting with direct CubeCL kernels:
 

@@ -45,6 +45,10 @@ pub enum AsrKernelTarget {
     Glu,
     /// Zipformer learned pairwise downsample for `[batch, time, channels]`.
     PairwiseDownsample,
+    /// Fused residual/update add followed by `[batch, time]` masking.
+    ResidualAddMaskTime,
+    /// Build a `[batch, heads, query_time, key_time]` attention mask directly.
+    AttentionMask4d,
 }
 
 /// Static analysis of the current ASR architectures and where custom CubeCL
@@ -60,6 +64,8 @@ pub const ASR_KERNEL_TARGETS: &[AsrKernelTarget] = &[
     AsrKernelTarget::AttentionMask,
     AsrKernelTarget::Glu,
     AsrKernelTarget::PairwiseDownsample,
+    AsrKernelTarget::ResidualAddMaskTime,
+    AsrKernelTarget::AttentionMask4d,
 ];
 
 /// Fused Zipformer Swoosh-L activation for non-fusion CubeCL backends.
@@ -167,6 +173,26 @@ where
     let primitive = into_float_cube(input);
     let lengths = lengths.into_primitive();
     let output = mask_time_cube(primitive, lengths, MaskLayout::BatchTimeChannels);
+    BurnTensor::from_primitive(TensorPrimitive::Float(output))
+}
+
+/// Fused `(residual + update) * sequence_mask(lengths)` for
+/// `[batch, time, channels]` tensors.
+pub fn residual_add_mask_time<R, F, I, BT>(
+    residual: BurnTensor<AsrCubeBackend<R, F, I, BT>, 3>,
+    update: BurnTensor<AsrCubeBackend<R, F, I, BT>, 3>,
+    lengths: BurnTensor<AsrCubeBackend<R, F, I, BT>, 1, BurnInt>,
+) -> BurnTensor<AsrCubeBackend<R, F, I, BT>, 3>
+where
+    R: CubeRuntime,
+    F: FloatElement,
+    I: IntElement,
+    BT: BoolElement,
+{
+    let residual = into_float_cube(residual);
+    let update = into_float_cube(update);
+    let lengths = lengths.into_primitive();
+    let output = residual_add_mask_time_cube(residual, update, lengths);
     BurnTensor::from_primitive(TensorPrimitive::Float(output))
 }
 
@@ -303,6 +329,24 @@ where
     BT: BoolElement,
 {
     let output = attention_mask_cube::<R, F, I, BT>(lengths.into_primitive(), query_len, key_len);
+    BurnTensor::from_primitive(output)
+}
+
+/// Build a `[batch, heads, query_len, key_len]` attention mask directly.
+pub fn attention_mask_4d_with_lengths<R, F, I, BT>(
+    lengths: BurnTensor<AsrCubeBackend<R, F, I, BT>, 1, BurnInt>,
+    heads: usize,
+    query_len: usize,
+    key_len: usize,
+) -> BurnTensor<AsrCubeBackend<R, F, I, BT>, 4, BurnBool>
+where
+    R: CubeRuntime,
+    F: FloatElement,
+    I: IntElement,
+    BT: BoolElement,
+{
+    let output =
+        attention_mask_4d_cube::<R, F, I, BT>(lengths.into_primitive(), heads, query_len, key_len);
     BurnTensor::from_primitive(output)
 }
 
@@ -524,6 +568,52 @@ fn mask_time_cube<R: CubeRuntime>(
     output
 }
 
+fn residual_add_mask_time_cube<R: CubeRuntime>(
+    residual: CubeTensor<R>,
+    update: CubeTensor<R>,
+    lengths: CubeTensor<R>,
+) -> CubeTensor<R> {
+    let shape = residual.shape();
+    assert_eq!(
+        update.shape().dims::<3>(),
+        shape.dims::<3>(),
+        "residual_add_mask_time tensors must have matching shapes"
+    );
+    let [batch, time, channels] = shape.dims();
+    assert_eq!(
+        lengths.shape().dims::<1>()[0],
+        batch,
+        "mask lengths must match input batch size"
+    );
+
+    let output = empty_device_dtype(
+        residual.client.clone(),
+        residual.device.clone(),
+        shape,
+        residual.dtype,
+    );
+    let num_elems = output.meta.num_elements();
+    let cube_dim = CubeDim::new(&output.client, num_elems);
+    let cube_count = calculate_cube_count_elemwise(&output.client, num_elems, cube_dim);
+    let dtype = output.dtype;
+    let int_dtype = lengths.dtype;
+
+    residual_add_mask_time_kernel::launch(
+        &output.client,
+        cube_count,
+        cube_dim,
+        residual.into_tensor_arg(),
+        update.into_tensor_arg(),
+        lengths.into_tensor_arg(),
+        output.clone().into_tensor_arg(),
+        MaskTimeArgsLaunch::new(batch, time, channels),
+        dtype.into(),
+        int_dtype.into(),
+    );
+
+    output
+}
+
 fn bool_output<R, F, I, BT>(lengths: &CubeTensor<R>, shape: Shape) -> CubeTensor<R>
 where
     R: CubeRuntime,
@@ -601,6 +691,41 @@ where
         lengths.into_tensor_arg(),
         output.clone().into_tensor_arg(),
         AttentionMaskArgsLaunch::new(batch, query_len, key_len),
+        int_dtype.into(),
+        bool_dtype.into(),
+    );
+
+    output
+}
+
+fn attention_mask_4d_cube<R, F, I, BT>(
+    lengths: CubeTensor<R>,
+    heads: usize,
+    query_len: usize,
+    key_len: usize,
+) -> CubeTensor<R>
+where
+    R: CubeRuntime,
+    F: FloatElement,
+    I: IntElement,
+    BT: BoolElement,
+{
+    let [batch] = lengths.shape().dims::<1>();
+    let output_shape = Shape::new([batch, heads, query_len, key_len]);
+    let output = bool_output::<R, F, I, BT>(&lengths, output_shape);
+    let num_elems = output.meta.num_elements();
+    let cube_dim = CubeDim::new(&output.client, num_elems);
+    let cube_count = calculate_cube_count_elemwise(&output.client, num_elems, cube_dim);
+    let int_dtype = lengths.dtype;
+    let bool_dtype = output.dtype;
+
+    attention_mask_4d_kernel::launch(
+        &output.client,
+        cube_count,
+        cube_dim,
+        lengths.into_tensor_arg(),
+        output.clone().into_tensor_arg(),
+        AttentionMask4dArgsLaunch::new(batch, heads, query_len, key_len),
         int_dtype.into(),
         bool_dtype.into(),
     );
@@ -775,6 +900,18 @@ struct AttentionMaskArgs {
 }
 
 #[derive(CubeLaunch, CubeType)]
+struct AttentionMask4dArgs {
+    #[cube(comptime)]
+    batch: usize,
+    #[cube(comptime)]
+    heads: usize,
+    #[cube(comptime)]
+    query_len: usize,
+    #[cube(comptime)]
+    key_len: usize,
+}
+
+#[derive(CubeLaunch, CubeType)]
 struct GluArgs {
     #[cube(comptime)]
     batch: usize,
@@ -893,6 +1030,37 @@ fn attention_mask_kernel<I: Int, O: Numeric>(
 }
 
 #[cube(launch)]
+fn attention_mask_4d_kernel<I: Int, O: Numeric>(
+    lengths: &Tensor<I>,
+    output: &mut Tensor<O>,
+    args: &AttentionMask4dArgs,
+    #[define(I)] _int_dtype: StorageType,
+    #[define(O)] _bool_dtype: StorageType,
+) {
+    let pos = ABSOLUTE_POS;
+    if pos >= output.len() {
+        terminate!();
+    }
+
+    let batch = comptime![args.batch];
+    let heads = comptime![args.heads];
+    let query_len = comptime![args.query_len];
+    let key_len = comptime![args.key_len];
+
+    let key_index = pos % key_len;
+    let query_index = (pos / key_len) % query_len;
+    let _head_index = (pos / (query_len * key_len)) % heads;
+    let batch_index = pos / (heads * query_len * key_len);
+
+    if batch_index >= batch {
+        terminate!();
+    }
+
+    let length = usize::cast_from(lengths[batch_index]);
+    output[pos] = O::cast_from(query_index < length && key_index < length);
+}
+
+#[cube(launch)]
 fn mask_time_kernel<E: Float, I: Int>(
     input: &Tensor<E>,
     lengths: &Tensor<I>,
@@ -921,6 +1089,41 @@ fn mask_time_kernel<E: Float, I: Int>(
     let length = usize::cast_from(lengths[batch_index]);
     if channel_index < channels && time_index < length {
         output[pos] = input[pos];
+    } else {
+        output[pos] = E::new(0.0);
+    }
+}
+
+#[cube(launch)]
+fn residual_add_mask_time_kernel<E: Float, I: Int>(
+    residual: &Tensor<E>,
+    update: &Tensor<E>,
+    lengths: &Tensor<I>,
+    output: &mut Tensor<E>,
+    args: &MaskTimeArgs,
+    #[define(E)] _dtype: StorageType,
+    #[define(I)] _int_dtype: StorageType,
+) {
+    let pos = ABSOLUTE_POS;
+    if pos >= output.len() {
+        terminate!();
+    }
+
+    let batch = comptime![args.batch];
+    let time = comptime![args.dim1];
+    let channels = comptime![args.dim2];
+
+    let channel_index = pos % channels;
+    let time_index = (pos / channels) % time;
+    let batch_index = pos / (time * channels);
+
+    if batch_index >= batch {
+        terminate!();
+    }
+
+    let length = usize::cast_from(lengths[batch_index]);
+    if channel_index < channels && time_index < length {
+        output[pos] = residual[pos] + update[pos];
     } else {
         output[pos] = E::new(0.0);
     }

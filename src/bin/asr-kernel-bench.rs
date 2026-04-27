@@ -246,6 +246,23 @@ mod bench {
                 },
                 $device,
             )?);
+            cases.push(run_comparison_case::<$backend_type, _, _>(
+                "residual_add_mask_time",
+                $args.iters,
+                $args.warmup,
+                $args.batch * $args.seq_len * $args.channels,
+                || {
+                    let _ = standard_mask_time(activation.clone() + activation.clone(), &lengths);
+                },
+                || {
+                    let _ = cubecl_kernels::residual_add_mask_time(
+                        activation.clone(),
+                        activation.clone(),
+                        lengths_tensor.clone(),
+                    );
+                },
+                $device,
+            )?);
 
             let channel_time = Tensor::<$backend_type, 3>::ones(
                 [$args.batch, $args.channels, $args.seq_len],
@@ -340,6 +357,30 @@ mod bench {
                 || {
                     let _ = cubecl_kernels::attention_mask_with_lengths(
                         lengths_tensor.clone(),
+                        $args.seq_len,
+                        $args.seq_len,
+                    );
+                },
+                $device,
+            )?);
+            cases.push(run_comparison_case::<$backend_type, _, _>(
+                "attention_mask_4d",
+                $args.iters,
+                $args.warmup,
+                $args.batch * $args.heads * $args.seq_len * $args.seq_len,
+                || {
+                    let _ = standard_attention_mask_4d::<$backend_type>(
+                        &lengths,
+                        $args.heads,
+                        $args.seq_len,
+                        $args.seq_len,
+                        $device,
+                    );
+                },
+                || {
+                    let _ = cubecl_kernels::attention_mask_4d_with_lengths(
+                        lengths_tensor.clone(),
+                        $args.heads,
                         $args.seq_len,
                         $args.seq_len,
                     );
@@ -511,6 +552,29 @@ mod bench {
             .unsqueeze_dim::<3>(1)
             .repeat_dim(1, max_len)
             .bool_and(mask.unsqueeze_dim::<3>(2).repeat_dim(2, max_len))
+    }
+
+    fn standard_attention_mask_4d<B: Backend>(
+        lengths: &[usize],
+        heads: usize,
+        query_len: usize,
+        key_len: usize,
+        device: &B::Device,
+    ) -> Tensor<B, 4, Bool> {
+        let mut values = Vec::with_capacity(lengths.len() * heads * query_len * key_len);
+        for length in lengths {
+            for _ in 0..heads {
+                for query in 0..query_len {
+                    for key in 0..key_len {
+                        values.push(query < *length && key < *length);
+                    }
+                }
+            }
+        }
+        Tensor::from_data(
+            TensorData::new(values, [lengths.len(), heads, query_len, key_len]),
+            device,
+        )
     }
 
     fn standard_mask_time<B: Backend>(input: Tensor<B, 3>, lengths: &[usize]) -> Tensor<B, 3> {

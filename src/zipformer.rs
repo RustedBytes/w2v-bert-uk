@@ -391,7 +391,7 @@ impl<B: Backend> MultiHeadAttentionWeights<B> {
         &self,
         input: Tensor<B, 3>,
         pos_emb: Tensor<B, 2>,
-        mask: Tensor<B, 2, Bool>,
+        lengths: &[usize],
     ) -> Tensor<B, 4> {
         let [batch_size, seq_len, _] = input.dims();
         let q = self
@@ -419,29 +419,20 @@ impl<B: Backend> MultiHeadAttentionWeights<B> {
         let pos_scores = relative_shift(p_query.matmul(rel.swap_dims(2, 3)), seq_len);
         let mut scores = content_scores + pos_scores;
 
-        let expanded_key_mask = mask
-            .clone()
-            .unsqueeze_dim::<3>(1)
-            .unsqueeze_dim::<4>(2)
-            .repeat_dim(1, self.num_heads)
-            .repeat_dim(2, seq_len);
+        let attn_mask =
+            attention_mask_4d::<B>(lengths, self.num_heads, seq_len, seq_len, &scores.device());
         let negative = Tensor::full(
             [batch_size, self.num_heads, seq_len, seq_len],
             -1.0e4,
             &scores.device(),
         );
-        scores = scores.mask_where(expanded_key_mask.bool_not(), negative);
+        scores = scores.mask_where(attn_mask.clone().bool_not(), negative);
         let mut attn = softmax(scores, 3);
-        let expanded_query_mask = mask
-            .unsqueeze_dim::<3>(1)
-            .unsqueeze_dim::<4>(3)
-            .repeat_dim(1, self.num_heads)
-            .repeat_dim(3, seq_len);
         let zeros = Tensor::zeros(
             [batch_size, self.num_heads, seq_len, seq_len],
             &attn.device(),
         );
-        attn = attn.mask_where(expanded_query_mask.bool_not(), zeros);
+        attn = attn.mask_where(attn_mask.bool_not(), zeros);
         self.dropout.forward(attn)
     }
 }
@@ -874,43 +865,34 @@ impl<B: Backend> ZipformerBlock<B> {
         pos_emb: Tensor<B, 2>,
         lengths: &[usize],
     ) -> Tensor<B, 3> {
-        let device = input.device();
-        let mask = sequence_mask::<B>(lengths, input.dims()[1], &device);
         let attn_weights = self
             .attention_weights
-            .forward(input.clone(), pos_emb, mask.clone());
+            .forward(input.clone(), pos_emb, lengths);
 
         let residual = input.clone();
-        let mut output = mask_time(input.clone() + self.feed_forward1.forward(input), lengths);
-        output = mask_time(
-            output.clone()
-                + self
-                    .non_linear_attention
-                    .forward(output.clone(), attn_weights.clone()),
+        let mut output = mask_add_time(input.clone(), self.feed_forward1.forward(input), lengths);
+        output = mask_add_time(
+            output.clone(),
+            self.non_linear_attention
+                .forward(output.clone(), attn_weights.clone()),
             lengths,
         );
-        output = mask_time(
-            output.clone()
-                + self
-                    .self_attention1
-                    .forward(output.clone(), attn_weights.clone()),
+        output = mask_add_time(
+            output.clone(),
+            self.self_attention1
+                .forward(output.clone(), attn_weights.clone()),
             lengths,
         );
-        output = mask_time(
-            output.clone() + self.conv1.forward(output, lengths),
-            lengths,
-        );
-        output = mask_time(output.clone() + self.feed_forward2.forward(output), lengths);
+        output = mask_add_time(output.clone(), self.conv1.forward(output, lengths), lengths);
+        output = mask_add_time(output.clone(), self.feed_forward2.forward(output), lengths);
         output = mask_time(self.mid_bypass.forward(residual.clone(), output), lengths);
 
-        output = mask_time(
-            output.clone() + self.self_attention2.forward(output.clone(), attn_weights),
+        output = mask_add_time(
+            output.clone(),
+            self.self_attention2.forward(output.clone(), attn_weights),
             lengths,
         );
-        output = mask_time(
-            output.clone() + self.conv2.forward(output, lengths),
-            lengths,
-        );
+        output = mask_add_time(output.clone(), self.conv2.forward(output, lengths), lengths);
         output = output.clone() + self.feed_forward3.forward(output);
         output = self
             .output_norm
@@ -1019,10 +1001,7 @@ impl<B: Backend> ZipformerConvModule<B> {
     fn forward(&self, input: Tensor<B, 3>, lengths: &[usize]) -> Tensor<B, 3> {
         let [batch_size, seq_len, dim] = input.dims();
         let output = self.input_balancer.forward(self.input_proj.forward(input));
-        let mut chunks = output.chunk(2, 2);
-        let gate = chunks.remove(1);
-        let value = chunks.remove(0);
-        let output = (value * sigmoid(gate)).swap_dims(1, 2);
+        let output = glu_last_dim(output).swap_dims(1, 2);
         let output = silu(self.depthwise.forward(output));
         let output = self.depthwise_balancer.forward(output.swap_dims(1, 2));
         let output = self
@@ -1285,6 +1264,29 @@ fn sequence_mask<B: Backend>(
     Tensor::from_data(TensorData::new(values, [lengths.len(), max_len]), device)
 }
 
+fn attention_mask_4d<B: Backend>(
+    lengths: &[usize],
+    heads: usize,
+    query_len: usize,
+    key_len: usize,
+    device: &B::Device,
+) -> Tensor<B, 4, Bool> {
+    let mut values = Vec::with_capacity(lengths.len() * heads * query_len * key_len);
+    for length in lengths {
+        for _ in 0..heads {
+            for query in 0..query_len {
+                for key in 0..key_len {
+                    values.push(query < *length && key < *length);
+                }
+            }
+        }
+    }
+    Tensor::from_data(
+        TensorData::new(values, [lengths.len(), heads, query_len, key_len]),
+        device,
+    )
+}
+
 fn padded_sequence_mask<B: Backend>(
     lengths: &[usize],
     original_len: usize,
@@ -1307,6 +1309,21 @@ fn mask_time<B: Backend>(input: Tensor<B, 3>, lengths: &[usize]) -> Tensor<B, 3>
         .float()
         .unsqueeze_dim::<3>(2);
     input * mask
+}
+
+fn mask_add_time<B: Backend>(
+    residual: Tensor<B, 3>,
+    update: Tensor<B, 3>,
+    lengths: &[usize],
+) -> Tensor<B, 3> {
+    mask_time(residual + update, lengths)
+}
+
+fn glu_last_dim<B: Backend>(input: Tensor<B, 3>) -> Tensor<B, 3> {
+    let mut chunks = input.chunk(2, 2);
+    let gate = chunks.remove(1);
+    let value = chunks.remove(0);
+    value * sigmoid(gate)
 }
 
 #[cfg(test)]
