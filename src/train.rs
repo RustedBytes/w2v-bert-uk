@@ -1,7 +1,8 @@
 use std::fs;
+use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use burn::module::{AutodiffModule, Module, ModuleMapper, ModuleVisitor, Param, ParamId};
@@ -20,16 +21,17 @@ use kenlm::{Config as KenlmConfig, Model as KenlmModel};
 use serde_json::{Value, json};
 use splintr::SentencePieceTokenizer;
 
+use crate::audio::{AudioDecodeConfig, audio_file_to_w2v_bert_features_with_config};
 use crate::ctc::{CtcCandidate, threaded_ctc_beam_search_decode_n_best};
-use crate::normalize_spaces;
 use crate::paraformer::{
     EnhancedParaformerV2, EnhancedParaformerV2Config, ParaformerAlignmentMode, ParaformerV2,
     ParaformerV2Config,
 };
 use crate::squeezeformer::{SqueezeformerCtc, SqueezeformerCtcConfig, SqueezeformerEncoderConfig};
-use crate::tokenizer::load_sentencepiece_tokenizer;
+use crate::tokenizer::{load_sentencepiece_tokenizer, load_sentencepiece_transcript_tokenizer};
 use crate::wav2vec::{Wav2VecBertConfig, Wav2VecBertCtc, Wav2VecBertCtcConfig};
 use crate::zipformer::{ZipformerConfig, ZipformerCtc, ZipformerCtcConfig};
+use crate::{W2vBertEncoderConfig, normalize_spaces};
 
 #[derive(Clone, Copy, Debug)]
 pub enum TrainArchitecture {
@@ -134,6 +136,7 @@ pub struct BurnTrainConfig {
     pub val_lm_word_bonus: f32,
     pub val_lm_bos: bool,
     pub val_lm_eos: bool,
+    pub val_log_samples: usize,
     pub dry_run: bool,
     pub paraformer_alignment_mode: ParaformerAlignmentMode,
     pub paraformer_enhanced: bool,
@@ -189,6 +192,7 @@ impl Default for BurnTrainConfig {
             val_lm_word_bonus: 0.0,
             val_lm_bos: true,
             val_lm_eos: true,
+            val_log_samples: 0,
             dry_run: false,
             paraformer_alignment_mode: ParaformerAlignmentMode::Viterbi,
             paraformer_enhanced: false,
@@ -334,6 +338,16 @@ struct ValidationSummary {
     cer: Option<f32>,
     wer: Option<f32>,
     decoded_samples: usize,
+    sample_predictions: Vec<ValidationSamplePrediction>,
+}
+
+#[derive(Clone, Debug)]
+struct ValidationSamplePrediction {
+    id: String,
+    prediction_text: String,
+    reference_text: String,
+    prediction_tokens: Vec<u32>,
+    reference_tokens: Vec<i64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1400,6 +1414,18 @@ where
     let start_epoch = resume_start_epoch(&resume);
     let decoder = ValidationDecoder::from_config(config)?;
     let started = Instant::now();
+    let mut logger = RunLogger::new(config, started)?;
+    logger.log(
+        "run_start",
+        json!({
+            "architecture": architecture_name(&config.architecture),
+            "start_epoch": start_epoch,
+            "global_step": global_step,
+            "devices": devices.len(),
+            "resume_from": config.resume_from,
+            "dry_run": config.dry_run,
+        }),
+    )?;
     let mut accumulator = GradientsAccumulator::<M>::new();
     let mut accumulated_batches = 0usize;
 
@@ -1412,6 +1438,7 @@ where
             config.sort_buffer_size,
             config.input_dim,
             config.max_train_samples,
+            config.tokenizer_path.clone(),
         )?;
         while let Some(batch) = train_batches.next_batch()? {
             let batches = if !config.dry_run && devices.len() > 1 {
@@ -1455,6 +1482,7 @@ where
                     accumulator.accumulate::<B>(&model, grads);
                     accumulated_batches += 1;
                 }
+                let pending_micro_batches = accumulated_batches;
                 let (next_model, lr) = maybe_step_accumulated::<B, M, _>(
                     model,
                     &mut optimizer,
@@ -1473,6 +1501,17 @@ where
                             started.elapsed().as_secs_f64()
                         );
                     }
+                    logger.log(
+                        "train_step",
+                        json!({
+                            "epoch": epoch,
+                            "global_step": global_step,
+                            "learning_rate": lr,
+                            "losses": {"ctc": loss_value},
+                            "micro_batches": pending_micro_batches,
+                            "dry_run": false,
+                        }),
+                    )?;
                 }
             } else {
                 global_step += 1;
@@ -1482,6 +1521,16 @@ where
                         started.elapsed().as_secs_f64()
                     );
                 }
+                logger.log(
+                    "train_step",
+                    json!({
+                        "epoch": epoch,
+                        "global_step": global_step,
+                        "learning_rate": Value::Null,
+                        "losses": {"ctc": loss_value},
+                        "dry_run": true,
+                    }),
+                )?;
             }
 
             if global_step > 0
@@ -1497,6 +1546,10 @@ where
                     last_val_loss = Some(val.loss);
                     last_val_cer = val.cer;
                     last_val_wer = val.wer;
+                    logger.log(
+                        "validation",
+                        validation_event(epoch, Some(global_step), "ctc", &val),
+                    )?;
                     save_training_checkpoint::<B, M, _>(
                         &model,
                         &optimizer,
@@ -1515,6 +1568,7 @@ where
         }
 
         if !config.dry_run {
+            let pending_micro_batches = accumulated_batches;
             let (next_model, lr) = maybe_step_accumulated::<B, M, _>(
                 model,
                 &mut optimizer,
@@ -1531,6 +1585,15 @@ where
                     "epoch={epoch} step={global_step} lr={lr:.8} flushed_accumulated_gradients=true elapsed_sec={:.1}",
                     started.elapsed().as_secs_f64()
                 );
+                logger.log(
+                    "optimizer_flush",
+                    json!({
+                        "epoch": epoch,
+                        "global_step": global_step,
+                        "learning_rate": lr,
+                        "micro_batches": pending_micro_batches,
+                    }),
+                )?;
             }
         }
 
@@ -1543,6 +1606,7 @@ where
             last_val_loss = Some(val.loss);
             last_val_cer = val.cer;
             last_val_wer = val.wer;
+            logger.log("validation", validation_event(epoch, None, "ctc", &val))?;
         }
         save_training_checkpoint::<B, M, _>(
             &model,
@@ -1559,14 +1623,26 @@ where
         )?;
     }
 
-    Ok(TrainSummary {
+    let summary = TrainSummary {
         epochs: config.epochs,
         steps: global_step,
         last_train_loss,
         last_val_loss,
         last_val_cer,
         last_val_wer,
-    })
+    };
+    logger.log(
+        "run_complete",
+        json!({
+            "epochs": summary.epochs,
+            "steps": summary.steps,
+            "last_train_loss": summary.last_train_loss,
+            "last_val_loss": summary.last_val_loss,
+            "last_val_cer": summary.last_val_cer,
+            "last_val_wer": summary.last_val_wer,
+        }),
+    )?;
+    Ok(summary)
 }
 
 fn evaluate_ctc_model<B, M>(
@@ -1582,6 +1658,7 @@ where
     let mut total = 0.0f64;
     let mut count = 0usize;
     let mut metrics = ValidationMetrics::default();
+    let mut sample_predictions = Vec::new();
     let val_manifest = config
         .val_manifest
         .as_ref()
@@ -1594,6 +1671,7 @@ where
         config.sort_buffer_size,
         config.input_dim,
         config.max_val_samples,
+        config.tokenizer_path.clone(),
     )?;
     while let Some(batch) = batches.next_batch()? {
         let (logits_or_log_probs, output_lengths) =
@@ -1613,12 +1691,19 @@ where
             decoder,
         )?;
         metrics.update(&batch, &predictions, decoder);
+        collect_validation_sample_predictions(
+            &mut sample_predictions,
+            config.val_log_samples,
+            &batch,
+            &predictions,
+            decoder,
+        );
         count += 1;
     }
     if count == 0 {
         bail!("validation manifest is empty");
     }
-    Ok(metrics.summary((total / count as f64) as f32))
+    Ok(metrics.summary((total / count as f64) as f32, sample_predictions))
 }
 
 fn train_paraformer_model<B>(
@@ -1656,6 +1741,19 @@ where
     let start_epoch = resume_start_epoch(&resume);
     let decoder = ValidationDecoder::from_config(config)?;
     let started = Instant::now();
+    let mut logger = RunLogger::new(config, started)?;
+    logger.log(
+        "run_start",
+        json!({
+            "architecture": architecture_name(&config.architecture),
+            "start_epoch": start_epoch,
+            "global_step": global_step,
+            "devices": devices.len(),
+            "resume_from": config.resume_from,
+            "dry_run": config.dry_run,
+            "paraformer_enhanced": false,
+        }),
+    )?;
     let mut accumulator = GradientsAccumulator::<ParaformerV2<B>>::new();
     let mut accumulated_batches = 0usize;
 
@@ -1668,6 +1766,7 @@ where
             config.sort_buffer_size,
             config.input_dim,
             config.max_train_samples,
+            config.tokenizer_path.clone(),
         )?;
         while let Some(batch) = train_batches.next_batch()? {
             let batches = if !config.dry_run && devices.len() > 1 {
@@ -1715,6 +1814,7 @@ where
                     accumulator.accumulate::<B>(&model, grads);
                     accumulated_batches += 1;
                 }
+                let pending_micro_batches = accumulated_batches;
                 let (next_model, lr) = maybe_step_accumulated::<B, ParaformerV2<B>, _>(
                     model,
                     &mut optimizer,
@@ -1741,6 +1841,21 @@ where
                             started.elapsed().as_secs_f64()
                         );
                     }
+                    logger.log(
+                        "train_step",
+                        json!({
+                            "epoch": epoch,
+                            "global_step": global_step,
+                            "learning_rate": lr,
+                            "losses": {
+                                "total": metric_values[0],
+                                "ctc": metric_values[1],
+                                "ce": metric_values[2],
+                            },
+                            "micro_batches": pending_micro_batches,
+                            "dry_run": false,
+                        }),
+                    )?;
                 }
             } else {
                 global_step += 1;
@@ -1753,6 +1868,20 @@ where
                         started.elapsed().as_secs_f64()
                     );
                 }
+                logger.log(
+                    "train_step",
+                    json!({
+                        "epoch": epoch,
+                        "global_step": global_step,
+                        "learning_rate": Value::Null,
+                        "losses": {
+                            "total": metric_values[0],
+                            "ctc": metric_values[1],
+                            "ce": metric_values[2],
+                        },
+                        "dry_run": true,
+                    }),
+                )?;
             }
 
             if global_step > 0
@@ -1768,6 +1897,10 @@ where
                     last_val_loss = Some(val.loss);
                     last_val_cer = val.cer;
                     last_val_wer = val.wer;
+                    logger.log(
+                        "validation",
+                        validation_event(epoch, Some(global_step), "loss", &val),
+                    )?;
                     save_training_checkpoint::<B, ParaformerV2<B>, _>(
                         &model,
                         &optimizer,
@@ -1786,6 +1919,7 @@ where
         }
 
         if !config.dry_run {
+            let pending_micro_batches = accumulated_batches;
             let (next_model, lr) = maybe_step_accumulated::<B, ParaformerV2<B>, _>(
                 model,
                 &mut optimizer,
@@ -1807,6 +1941,15 @@ where
                     "epoch={epoch} step={global_step} lr={lr:.8} flushed_accumulated_gradients=true elapsed_sec={:.1}",
                     started.elapsed().as_secs_f64()
                 );
+                logger.log(
+                    "optimizer_flush",
+                    json!({
+                        "epoch": epoch,
+                        "global_step": global_step,
+                        "learning_rate": lr,
+                        "micro_batches": pending_micro_batches,
+                    }),
+                )?;
             }
         }
 
@@ -1819,6 +1962,7 @@ where
             last_val_loss = Some(val.loss);
             last_val_cer = val.cer;
             last_val_wer = val.wer;
+            logger.log("validation", validation_event(epoch, None, "loss", &val))?;
         }
         save_training_checkpoint::<B, ParaformerV2<B>, _>(
             &model,
@@ -1835,14 +1979,26 @@ where
         )?;
     }
 
-    Ok(TrainSummary {
+    let summary = TrainSummary {
         epochs: config.epochs,
         steps: global_step,
         last_train_loss,
         last_val_loss,
         last_val_cer,
         last_val_wer,
-    })
+    };
+    logger.log(
+        "run_complete",
+        json!({
+            "epochs": summary.epochs,
+            "steps": summary.steps,
+            "last_train_loss": summary.last_train_loss,
+            "last_val_loss": summary.last_val_loss,
+            "last_val_cer": summary.last_val_cer,
+            "last_val_wer": summary.last_val_wer,
+        }),
+    )?;
+    Ok(summary)
 }
 
 fn evaluate_paraformer_model<B>(
@@ -1857,6 +2013,7 @@ where
     let mut total = 0.0f64;
     let mut count = 0usize;
     let mut metrics = ValidationMetrics::default();
+    let mut sample_predictions = Vec::new();
     let val_manifest = config
         .val_manifest
         .as_ref()
@@ -1869,6 +2026,7 @@ where
         config.sort_buffer_size,
         config.input_dim,
         config.max_val_samples,
+        config.tokenizer_path.clone(),
     )?;
     while let Some(batch) = batches.next_batch()? {
         let output = paraformer_loss_for_batch(model, &batch, config, device);
@@ -1880,12 +2038,19 @@ where
             decoder,
         )?;
         metrics.update(&batch, &predictions, decoder);
+        collect_validation_sample_predictions(
+            &mut sample_predictions,
+            config.val_log_samples,
+            &batch,
+            &predictions,
+            decoder,
+        );
         count += 1;
     }
     if count == 0 {
         bail!("validation manifest is empty");
     }
-    Ok(metrics.summary((total / count as f64) as f32))
+    Ok(metrics.summary((total / count as f64) as f32, sample_predictions))
 }
 
 fn train_enhanced_paraformer_model<B>(
@@ -1924,6 +2089,19 @@ where
     let start_epoch = resume_start_epoch(&resume);
     let decoder = ValidationDecoder::from_config(config)?;
     let started = Instant::now();
+    let mut logger = RunLogger::new(config, started)?;
+    logger.log(
+        "run_start",
+        json!({
+            "architecture": architecture_name(&config.architecture),
+            "start_epoch": start_epoch,
+            "global_step": global_step,
+            "devices": devices.len(),
+            "resume_from": config.resume_from,
+            "dry_run": config.dry_run,
+            "paraformer_enhanced": true,
+        }),
+    )?;
     let mut accumulator = GradientsAccumulator::<EnhancedParaformerV2<B>>::new();
     let mut accumulated_batches = 0usize;
 
@@ -1936,6 +2114,7 @@ where
             config.sort_buffer_size,
             config.input_dim,
             config.max_train_samples,
+            config.tokenizer_path.clone(),
         )?;
         while let Some(batch) = train_batches.next_batch()? {
             let batches = if !config.dry_run && devices.len() > 1 {
@@ -1992,6 +2171,7 @@ where
                     accumulator.accumulate::<B>(&model, grads);
                     accumulated_batches += 1;
                 }
+                let pending_micro_batches = accumulated_batches;
                 let (next_model, lr) = maybe_step_accumulated::<B, EnhancedParaformerV2<B>, _>(
                     model,
                     &mut optimizer,
@@ -2020,6 +2200,23 @@ where
                             started.elapsed().as_secs_f64()
                         );
                     }
+                    logger.log(
+                        "train_step",
+                        json!({
+                            "epoch": epoch,
+                            "global_step": global_step,
+                            "learning_rate": lr,
+                            "losses": {
+                                "total": metric_values[0],
+                                "ctc": metric_values[1],
+                                "shallow_ctc": metric_values[2],
+                                "ce": metric_values[3],
+                                "boundary": metric_values[4],
+                            },
+                            "micro_batches": pending_micro_batches,
+                            "dry_run": false,
+                        }),
+                    )?;
                 }
             } else {
                 global_step += 1;
@@ -2034,6 +2231,22 @@ where
                         started.elapsed().as_secs_f64()
                     );
                 }
+                logger.log(
+                    "train_step",
+                    json!({
+                        "epoch": epoch,
+                        "global_step": global_step,
+                        "learning_rate": Value::Null,
+                        "losses": {
+                            "total": metric_values[0],
+                            "ctc": metric_values[1],
+                            "shallow_ctc": metric_values[2],
+                            "ce": metric_values[3],
+                            "boundary": metric_values[4],
+                        },
+                        "dry_run": true,
+                    }),
+                )?;
             }
 
             if global_step > 0
@@ -2049,6 +2262,10 @@ where
                     last_val_loss = Some(val.loss);
                     last_val_cer = val.cer;
                     last_val_wer = val.wer;
+                    logger.log(
+                        "validation",
+                        validation_event(epoch, Some(global_step), "loss", &val),
+                    )?;
                     save_training_checkpoint::<B, EnhancedParaformerV2<B>, _>(
                         &model,
                         &optimizer,
@@ -2067,6 +2284,7 @@ where
         }
 
         if !config.dry_run {
+            let pending_micro_batches = accumulated_batches;
             let (next_model, lr) = maybe_step_accumulated::<B, EnhancedParaformerV2<B>, _>(
                 model,
                 &mut optimizer,
@@ -2088,6 +2306,15 @@ where
                     "epoch={epoch} step={global_step} lr={lr:.8} flushed_accumulated_gradients=true elapsed_sec={:.1}",
                     started.elapsed().as_secs_f64()
                 );
+                logger.log(
+                    "optimizer_flush",
+                    json!({
+                        "epoch": epoch,
+                        "global_step": global_step,
+                        "learning_rate": lr,
+                        "micro_batches": pending_micro_batches,
+                    }),
+                )?;
             }
         }
 
@@ -2100,6 +2327,7 @@ where
             last_val_loss = Some(val.loss);
             last_val_cer = val.cer;
             last_val_wer = val.wer;
+            logger.log("validation", validation_event(epoch, None, "loss", &val))?;
         }
         save_training_checkpoint::<B, EnhancedParaformerV2<B>, _>(
             &model,
@@ -2116,14 +2344,26 @@ where
         )?;
     }
 
-    Ok(TrainSummary {
+    let summary = TrainSummary {
         epochs: config.epochs,
         steps: global_step,
         last_train_loss,
         last_val_loss,
         last_val_cer,
         last_val_wer,
-    })
+    };
+    logger.log(
+        "run_complete",
+        json!({
+            "epochs": summary.epochs,
+            "steps": summary.steps,
+            "last_train_loss": summary.last_train_loss,
+            "last_val_loss": summary.last_val_loss,
+            "last_val_cer": summary.last_val_cer,
+            "last_val_wer": summary.last_val_wer,
+        }),
+    )?;
+    Ok(summary)
 }
 
 fn evaluate_enhanced_paraformer_model<B>(
@@ -2138,6 +2378,7 @@ where
     let mut total = 0.0f64;
     let mut count = 0usize;
     let mut metrics = ValidationMetrics::default();
+    let mut sample_predictions = Vec::new();
     let val_manifest = config
         .val_manifest
         .as_ref()
@@ -2150,6 +2391,7 @@ where
         config.sort_buffer_size,
         config.input_dim,
         config.max_val_samples,
+        config.tokenizer_path.clone(),
     )?;
     while let Some(batch) = batches.next_batch()? {
         let output = enhanced_paraformer_loss_for_batch(model, &batch, config, device);
@@ -2161,12 +2403,19 @@ where
             decoder,
         )?;
         metrics.update(&batch, &predictions, decoder);
+        collect_validation_sample_predictions(
+            &mut sample_predictions,
+            config.val_log_samples,
+            &batch,
+            &predictions,
+            decoder,
+        );
         count += 1;
     }
     if count == 0 {
         bail!("validation manifest is empty");
     }
-    Ok(metrics.summary((total / count as f64) as f32))
+    Ok(metrics.summary((total / count as f64) as f32, sample_predictions))
 }
 
 fn paraformer_loss_for_batch<B>(
@@ -2364,14 +2613,50 @@ impl ValidationMetrics {
         }
     }
 
-    fn summary(self, loss: f32) -> ValidationSummary {
+    fn summary(
+        self,
+        loss: f32,
+        sample_predictions: Vec<ValidationSamplePrediction>,
+    ) -> ValidationSummary {
         ValidationSummary {
             loss,
             token_error_rate: self.token_stats.rate(),
             cer: self.char_stats.rate(),
             wer: self.word_stats.rate(),
             decoded_samples: self.decoded_samples,
+            sample_predictions,
         }
+    }
+}
+
+fn collect_validation_sample_predictions(
+    samples: &mut Vec<ValidationSamplePrediction>,
+    limit: usize,
+    batch: &TrainBatch,
+    predictions: &[Vec<u32>],
+    decoder: &ValidationDecoder,
+) {
+    if limit == 0 || samples.len() >= limit {
+        return;
+    }
+    for sample_index in 0..batch.batch_size {
+        if samples.len() >= limit {
+            break;
+        }
+        let prediction_tokens = predictions.get(sample_index).cloned().unwrap_or_default();
+        let reference_tokens = target_tokens_for_batch_item(batch, sample_index);
+        let prediction_text = normalize_spaces(&decoder.decode_tokens(&prediction_tokens));
+        let reference_text = normalize_spaces(&decoder.reference_text(
+            batch.reference_texts[sample_index].as_ref(),
+            &reference_tokens,
+        ));
+        samples.push(ValidationSamplePrediction {
+            id: batch.ids[sample_index].clone(),
+            prediction_text,
+            reference_text,
+            prediction_tokens,
+            reference_tokens,
+        });
     }
 }
 
@@ -2489,6 +2774,33 @@ fn format_validation_summary(
     parts.join(" ")
 }
 
+fn validation_event(
+    epoch: usize,
+    step: Option<usize>,
+    loss_name: &str,
+    summary: &ValidationSummary,
+) -> Value {
+    json!({
+        "epoch": epoch,
+        "global_step": step,
+        "loss_name": loss_name,
+        "loss": summary.loss,
+        "cer": summary.cer,
+        "wer": summary.wer,
+        "token_error_rate": summary.token_error_rate,
+        "decoded_samples": summary.decoded_samples,
+        "samples": summary.sample_predictions.iter().map(|sample| {
+            json!({
+                "id": sample.id,
+                "prediction_text": sample.prediction_text,
+                "reference_text": sample.reference_text,
+                "prediction_tokens": sample.prediction_tokens,
+                "reference_tokens": sample.reference_tokens,
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
 fn load_inference_model<B, M>(
     model: M,
     checkpoint_dir: &Path,
@@ -2534,6 +2846,7 @@ where
         config.sort_buffer_size,
         config.input_dim,
         config.max_train_samples,
+        config.tokenizer_path.clone(),
     )?;
     let mut decoded_samples = 0usize;
     while let Some(batch) = batches.next_batch()? {
@@ -2652,6 +2965,9 @@ pub struct StreamingBatchLoader {
     expected_dim: usize,
     yielded: usize,
     limit: Option<usize>,
+    tokenizer: Option<SentencePieceTokenizer>,
+    audio_decode: AudioDecodeConfig,
+    audio_frontend: asr_features::W2vBertFrontendConfig,
     pending: Option<FeatureRecord>,
     sort_buffer: Vec<FeatureRecordMetadata>,
 }
@@ -2682,6 +2998,7 @@ impl StreamingBatchLoader {
         sort_buffer_size: usize,
         expected_dim: usize,
         limit: Option<usize>,
+        tokenizer_path: Option<PathBuf>,
     ) -> Result<Self> {
         if batch_size == 0 {
             bail!("batch_size must be > 0");
@@ -2692,6 +3009,10 @@ impl StreamingBatchLoader {
         if sort_by_length_desc && sort_buffer_size == 0 {
             bail!("sort_buffer_size must be > 0 when length sorting is enabled");
         }
+        let tokenizer = tokenizer_path
+            .as_deref()
+            .map(load_sentencepiece_transcript_tokenizer)
+            .transpose()?;
         Ok(Self {
             files: manifest_files(&manifest)?,
             file_index: 0,
@@ -2703,6 +3024,9 @@ impl StreamingBatchLoader {
             expected_dim,
             yielded: 0,
             limit,
+            tokenizer,
+            audio_decode: AudioDecodeConfig::default(),
+            audio_frontend: W2vBertEncoderConfig::default().to_frontend_config(),
             pending: None,
             sort_buffer: Vec::new(),
         })
@@ -2792,7 +3116,13 @@ impl StreamingBatchLoader {
 
     fn next_raw_record(&mut self) -> Result<Option<FeatureRecord>> {
         self.next_raw_line()?
-            .map(|raw| raw.parse_record())
+            .map(|raw| {
+                raw.parse_record(
+                    self.tokenizer.as_ref(),
+                    &self.audio_decode,
+                    &self.audio_frontend,
+                )
+            })
             .transpose()
     }
 
@@ -2853,9 +3183,21 @@ struct RawManifestLine {
 }
 
 impl RawManifestLine {
-    fn parse_record(&self) -> Result<FeatureRecord> {
+    fn parse_record(
+        &self,
+        tokenizer: Option<&SentencePieceTokenizer>,
+        audio_decode: &AudioDecodeConfig,
+        audio_frontend: &asr_features::W2vBertFrontendConfig,
+    ) -> Result<FeatureRecord> {
         if self.line.starts_with('{') {
-            parse_json_record(&self.line, &self.base_dir, self.line_number)
+            parse_json_record(
+                &self.line,
+                &self.base_dir,
+                self.line_number,
+                tokenizer,
+                audio_decode,
+                audio_frontend,
+            )
         } else {
             parse_tsv_record(&self.line, &self.base_dir, self.line_number)
         }
@@ -2893,7 +3235,14 @@ impl FeatureRecordMetadata {
             .with_context(|| format!("failed reading {}", self.manifest_path.display()))?;
         let line = line.trim();
         if line.starts_with('{') {
-            parse_json_record(line, &self.base_dir, self.line_number)
+            parse_json_record(
+                line,
+                &self.base_dir,
+                self.line_number,
+                None,
+                &AudioDecodeConfig::default(),
+                &W2vBertEncoderConfig::default().to_frontend_config(),
+            )
         } else {
             parse_tsv_record(line, &self.base_dir, self.line_number)
         }
@@ -2981,7 +3330,14 @@ fn load_manifest_file(path: &Path, limit: Option<usize>) -> Result<Vec<FeatureRe
             continue;
         }
         let record = if line.starts_with('{') {
-            parse_json_record(line, base_dir, line_index + 1)?
+            parse_json_record(
+                line,
+                base_dir,
+                line_index + 1,
+                None,
+                &AudioDecodeConfig::default(),
+                &W2vBertEncoderConfig::default().to_frontend_config(),
+            )?
         } else {
             parse_tsv_record(line, base_dir, line_index + 1)?
         };
@@ -2997,7 +3353,14 @@ fn load_manifest_file(path: &Path, limit: Option<usize>) -> Result<Vec<FeatureRe
     Ok(records)
 }
 
-fn parse_json_record(line: &str, base_dir: &Path, line_number: usize) -> Result<FeatureRecord> {
+fn parse_json_record(
+    line: &str,
+    base_dir: &Path,
+    line_number: usize,
+    tokenizer: Option<&SentencePieceTokenizer>,
+    audio_decode: &AudioDecodeConfig,
+    audio_frontend: &asr_features::W2vBertFrontendConfig,
+) -> Result<FeatureRecord> {
     let value: Value = serde_json::from_str(line)
         .with_context(|| format!("invalid JSON manifest line {line_number}"))?;
     let id = value
@@ -3005,19 +3368,13 @@ fn parse_json_record(line: &str, base_dir: &Path, line_number: usize) -> Result<
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| format!("line-{line_number}"));
-    let tokens = parse_tokens_value(
-        value
-            .get("tokens")
-            .or_else(|| value.get("target"))
-            .or_else(|| value.get("targets"))
-            .ok_or_else(|| anyhow!("record '{id}' is missing tokens"))?,
-    )?;
     let text = value
         .get("text")
         .or_else(|| value.get("transcript"))
         .or_else(|| value.get("sentence"))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
+    let tokens = parse_record_tokens(&value, text.as_deref(), tokenizer, &id)?;
 
     if let Some(features) = value.get("features") {
         let rows = value
@@ -3043,24 +3400,46 @@ fn parse_json_record(line: &str, base_dir: &Path, line_number: usize) -> Result<
         .get("features_path")
         .or_else(|| value.get("feature_path"))
         .or_else(|| value.get("path"))
+        .and_then(Value::as_str);
+    if let Some(feature_path) = feature_path {
+        let rows = value
+            .get("rows")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow!("record '{id}' with feature file must include rows"))?
+            as usize;
+        let cols = value
+            .get("cols")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow!("record '{id}' with feature file must include cols"))?
+            as usize;
+        let features = read_feature_file(&resolve_path(base_dir, feature_path), rows, cols)?;
+        return Ok(FeatureRecord {
+            id,
+            rows,
+            cols,
+            features,
+            tokens,
+            text,
+        });
+    }
+
+    let audio_path = value
+        .get("audio_path")
+        .or_else(|| value.get("audio"))
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("record '{id}' is missing features or features_path"))?;
-    let rows = value
-        .get("rows")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| anyhow!("record '{id}' with feature file must include rows"))?
-        as usize;
-    let cols = value
-        .get("cols")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| anyhow!("record '{id}' with feature file must include cols"))?
-        as usize;
-    let features = read_feature_file(&resolve_path(base_dir, feature_path), rows, cols)?;
+        .ok_or_else(|| {
+            anyhow!("record '{id}' is missing features, features_path, or audio_path")
+        })?;
+    let audio = audio_file_to_w2v_bert_features_with_config(
+        resolve_path(base_dir, audio_path),
+        audio_decode,
+        audio_frontend,
+    )?;
     Ok(FeatureRecord {
         id,
-        rows,
-        cols,
-        features,
+        rows: audio.features.rows,
+        cols: audio.features.cols,
+        features: audio.features.values,
         tokens,
         text,
     })
@@ -3110,6 +3489,20 @@ fn parse_json_record_metadata(line: &str, line_number: usize) -> Result<(String,
             .and_then(Value::as_u64)
             .map(|v| v as usize);
         let (rows, _cols) = inline_feature_shape(features, rows, cols, &id)?;
+        return Ok((id, rows));
+    }
+
+    if value
+        .get("audio_path")
+        .or_else(|| value.get("audio"))
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        let rows = value
+            .get("rows")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or(usize::MAX);
         return Ok((id, rows));
     }
 
@@ -3254,6 +3647,34 @@ fn parse_tokens_value(value: &Value) -> Result<Vec<i64>> {
         .collect()
 }
 
+fn parse_record_tokens(
+    value: &Value,
+    text: Option<&str>,
+    tokenizer: Option<&SentencePieceTokenizer>,
+    id: &str,
+) -> Result<Vec<i64>> {
+    if let Some(tokens) = value
+        .get("tokens")
+        .or_else(|| value.get("target"))
+        .or_else(|| value.get("targets"))
+    {
+        return parse_tokens_value(tokens);
+    }
+    let text = text.ok_or_else(|| anyhow!("record '{id}' is missing tokens or transcript text"))?;
+    let tokenizer = tokenizer.ok_or_else(|| {
+        anyhow!("record '{id}' needs tokenizer_path to derive tokens from transcript text")
+    })?;
+    let tokens = tokenizer
+        .encode(text)
+        .into_iter()
+        .map(i64::from)
+        .collect::<Vec<_>>();
+    if tokens.is_empty() {
+        bail!("record '{id}' transcript encoded to an empty token sequence");
+    }
+    Ok(tokens)
+}
+
 fn parse_token_string(value: &str) -> Result<Vec<i64>> {
     let tokens = value
         .split(|ch: char| ch == ',' || ch.is_whitespace())
@@ -3390,6 +3811,91 @@ fn write_run_config(config: &BurnTrainConfig) -> Result<()> {
     .with_context(|| format!("failed to write {}", path.display()))
 }
 
+fn structured_log_path(config: &BurnTrainConfig) -> PathBuf {
+    config.output_dir.join("events.jsonl")
+}
+
+fn append_structured_event(config: &BurnTrainConfig, event: &str, payload: Value) -> Result<()> {
+    fs::create_dir_all(&config.output_dir).with_context(|| {
+        format!(
+            "failed to create output directory {}",
+            config.output_dir.display()
+        )
+    })?;
+    let path = structured_log_path(config);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("failed to open structured log {}", path.display()))?;
+    writeln!(
+        file,
+        "{}",
+        serde_json::to_string(&structured_event(event, payload))?
+    )
+    .with_context(|| format!("failed to write structured log {}", path.display()))
+}
+
+fn structured_event(event: &str, payload: Value) -> Value {
+    json!({
+        "event": event,
+        "timestamp_ms": SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0),
+        "data": payload,
+    })
+}
+
+struct RunLogger<'a> {
+    config: &'a BurnTrainConfig,
+    file: fs::File,
+    started: Instant,
+}
+
+impl<'a> RunLogger<'a> {
+    fn new(config: &'a BurnTrainConfig, started: Instant) -> Result<Self> {
+        fs::create_dir_all(&config.output_dir).with_context(|| {
+            format!(
+                "failed to create output directory {}",
+                config.output_dir.display()
+            )
+        })?;
+        let path = structured_log_path(config);
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("failed to open structured log {}", path.display()))?;
+        Ok(Self {
+            config,
+            file,
+            started,
+        })
+    }
+
+    fn log(&mut self, event: &str, payload: Value) -> Result<()> {
+        let mut payload = payload;
+        if let Some(object) = payload.as_object_mut() {
+            object.insert(
+                "elapsed_sec".to_string(),
+                json!(self.started.elapsed().as_secs_f64()),
+            );
+        }
+        writeln!(
+            self.file,
+            "{}",
+            serde_json::to_string(&structured_event(event, payload))?
+        )
+        .with_context(|| {
+            format!(
+                "failed to write structured log {}",
+                structured_log_path(self.config).display()
+            )
+        })
+    }
+}
+
 fn architecture_name(architecture: &TrainArchitecture) -> &'static str {
     match architecture {
         TrainArchitecture::Squeezeformer => "squeezeformer",
@@ -3450,6 +3956,7 @@ fn run_config_json(config: &BurnTrainConfig) -> Value {
         "val_lm_word_bonus": config.val_lm_word_bonus,
         "val_lm_bos": config.val_lm_bos,
         "val_lm_eos": config.val_lm_eos,
+        "val_log_samples": config.val_log_samples,
         "paraformer_alignment_mode": match config.paraformer_alignment_mode {
             ParaformerAlignmentMode::Viterbi => "viterbi",
             ParaformerAlignmentMode::Uniform => "uniform",
@@ -3574,6 +4081,7 @@ fn train_config_from_json(value: &Value) -> Result<BurnTrainConfig> {
         json_f32(value, "val_lm_word_bonus").unwrap_or(config.val_lm_word_bonus);
     config.val_lm_bos = json_bool(value, "val_lm_bos").unwrap_or(config.val_lm_bos);
     config.val_lm_eos = json_bool(value, "val_lm_eos").unwrap_or(config.val_lm_eos);
+    config.val_log_samples = json_usize(value, "val_log_samples").unwrap_or(config.val_log_samples);
     config.paraformer_alignment_mode = match value
         .get("paraformer_alignment_mode")
         .and_then(Value::as_str)
@@ -3745,6 +4253,23 @@ where
     let legacy_path = config.output_dir.join("checkpoint_latest.json");
     fs::write(&legacy_path, serde_json::to_string_pretty(&metadata)?)
         .with_context(|| format!("failed to write {}", legacy_path.display()))?;
+    append_structured_event(
+        config,
+        "checkpoint_saved",
+        json!({
+            "epoch": epoch,
+            "epoch_complete": epoch_complete,
+            "global_step": global_step,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "val_cer": val_cer,
+            "val_wer": val_wer,
+            "checkpoint_dir": dir,
+            "model_path": checkpoint_file_path(&dir, "model"),
+            "optimizer_path": checkpoint_file_path(&dir, "optimizer"),
+            "ema_model_path": ema_model.map(|_| checkpoint_file_path(&dir, "ema_model")),
+        }),
+    )?;
     Ok(())
 }
 
@@ -3992,6 +4517,55 @@ mod tests {
     }
 
     #[test]
+    fn manifest_derives_tokens_from_transcript_with_tokenizer() {
+        let tokenizer = SentencePieceTokenizer::new(
+            vec![
+                "<unk>".to_string(),
+                "▁".to_string(),
+                "a".to_string(),
+                "▁a".to_string(),
+            ],
+            Vec::new(),
+            None,
+            0,
+        )
+        .unwrap();
+        let value = json!({"text": "a"});
+
+        let tokens = parse_record_tokens(&value, Some("a"), Some(&tokenizer), "a").unwrap();
+
+        assert_eq!(tokens, vec![3]);
+    }
+
+    #[test]
+    fn manifest_extracts_features_from_audio_path() {
+        let dir =
+            std::env::temp_dir().join(format!("w2v_bert_uk_audio_manifest_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let audio_path = dir.join("sample.wav");
+        let samples = vec![0_i16; 16_000];
+        fs::write(&audio_path, mono_pcm_wav_bytes(16_000, &samples)).unwrap();
+        let line = r#"{"id":"a","audio_path":"sample.wav","tokens":[1],"text":"a"}"#;
+
+        let record = parse_json_record(
+            line,
+            &dir,
+            1,
+            None,
+            &AudioDecodeConfig::default(),
+            &W2vBertEncoderConfig::default().to_frontend_config(),
+        )
+        .unwrap();
+
+        assert_eq!(record.id, "a");
+        assert_eq!(record.tokens, vec![1]);
+        assert!(record.rows > 0);
+        assert!(record.cols > 0);
+        assert_eq!(record.features.len(), record.rows * record.cols);
+    }
+
+    #[test]
     fn batch_pads_features_and_targets() {
         let records = vec![
             FeatureRecord {
@@ -4095,7 +4669,7 @@ mod tests {
         let mut metrics = ValidationMetrics::default();
 
         metrics.update(&batch, &[vec![1, 3]], &decoder);
-        let summary = metrics.summary(0.5);
+        let summary = metrics.summary(0.5, Vec::new());
 
         assert_eq!(summary.loss, 0.5);
         assert_eq!(summary.decoded_samples, 1);
@@ -4213,6 +4787,7 @@ mod tests {
             4096,
             2,
             None,
+            None,
         )
         .unwrap();
 
@@ -4245,10 +4820,35 @@ mod tests {
         .unwrap();
 
         let mut loader =
-            StreamingBatchLoader::new(dir.join("train.jsonl"), 3, None, true, 3, 2, None).unwrap();
+            StreamingBatchLoader::new(dir.join("train.jsonl"), 3, None, true, 3, 2, None, None)
+                .unwrap();
 
         let batch = loader.next_batch().unwrap().unwrap();
 
         assert_eq!(batch.feature_lengths, vec![3, 2, 1]);
+    }
+
+    fn mono_pcm_wav_bytes(sample_rate: u32, samples: &[i16]) -> Vec<u8> {
+        let data_len = (samples.len() * 2) as u32;
+        let mut bytes = Vec::with_capacity(44 + data_len as usize);
+
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(b"fmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&sample_rate.to_le_bytes());
+        bytes.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+        bytes.extend_from_slice(&2_u16.to_le_bytes());
+        bytes.extend_from_slice(&16_u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        for sample in samples {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+
+        bytes
     }
 }

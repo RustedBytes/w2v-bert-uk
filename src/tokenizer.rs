@@ -5,6 +5,17 @@ use prost::Message;
 use splintr::SentencePieceTokenizer;
 
 pub fn load_sentencepiece_tokenizer(path: &Path) -> Result<SentencePieceTokenizer> {
+    load_sentencepiece_tokenizer_with_bos(path, true)
+}
+
+pub fn load_sentencepiece_transcript_tokenizer(path: &Path) -> Result<SentencePieceTokenizer> {
+    load_sentencepiece_tokenizer_with_bos(path, false)
+}
+
+fn load_sentencepiece_tokenizer_with_bos(
+    path: &Path,
+    include_bos: bool,
+) -> Result<SentencePieceTokenizer> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("failed to read tokenizer model {}", path.display()))?;
     let model = SentencePieceModel::decode(bytes.as_slice())
@@ -22,6 +33,7 @@ pub fn load_sentencepiece_tokenizer(path: &Path) -> Result<SentencePieceTokenize
     let bos_token_id = tokens
         .iter()
         .position(|token| token == "<s>")
+        .filter(|_| include_bos)
         .map(|index| index as u32);
 
     SentencePieceTokenizer::new(tokens, scores, bos_token_id, eos_token_id)

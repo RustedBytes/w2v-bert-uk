@@ -197,6 +197,10 @@ struct Args {
     #[arg(long)]
     val_lm_no_eos: bool,
 
+    /// Number of validation sample predictions to include in structured events.
+    #[arg(long, default_value_t = 0)]
+    val_log_samples: usize,
+
     /// Run forward/loss only and skip optimizer updates.
     #[arg(long)]
     dry_run: bool,
@@ -331,6 +335,7 @@ fn main() -> Result<()> {
         val_lm_word_bonus: args.val_lm_word_bonus,
         val_lm_bos: !args.val_lm_no_bos,
         val_lm_eos: !args.val_lm_no_eos,
+        val_log_samples: args.val_log_samples,
         dry_run: args.dry_run,
         paraformer_alignment_mode: match args.paraformer_alignment_mode {
             ParaformerAlignmentArg::Viterbi => ParaformerAlignmentMode::Viterbi,

@@ -50,8 +50,8 @@
 - [x] Add largest-batches-first sorting.
 - [x] Make sorting metadata-only so large inline features are not buffered in memory.
 - [ ] Add raw audio dataset loading.
-- [ ] Add feature extraction from audio.
-- [ ] Add tokenizer-driven transcript-to-token conversion.
+- [x] Add feature extraction from audio.
+- [x] Add tokenizer-driven transcript-to-token conversion.
 - [ ] Add dataset cache/index support.
 - [ ] Add SpecAugment and waveform augmentation.
 
@@ -62,14 +62,13 @@
 - [x] Add CER/WER metrics.
 - [x] Add beam search decoding.
 - [x] Add optional language-model decoding.
-- [ ] Add sample prediction logging.
+- [x] Add sample prediction logging.
 - [x] Add inference/export entrypoints for all architectures.
 
 ## Experiment Ergonomics
 
 - [x] Write training config metadata to output directory.
-- [ ] Add structured run logging.
-- [ ] Add Trackio or compatible experiment tracking.
+- [x] Add structured run logging.
 - [ ] Add detailed diagnostics for losses, batch sizes, and throughput.
 - [ ] Add model export packaging.
 - [ ] Add Hugging Face upload support.
