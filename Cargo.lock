@@ -365,6 +365,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "log",
  "num-traits",
+ "parking_lot",
  "portable-atomic",
  "spin",
 ]
@@ -473,6 +474,20 @@ checksum = "654f854f46c1916baa16cc88dcff10dee09b90d06453f86424ba927d9e5a73be"
 dependencies = [
  "burn-core",
  "num-traits",
+]
+
+[[package]]
+name = "burn-optim"
+version = "0.21.0-pre.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8cecc1963011c3dfe385ccc3b50740f2ed785590d4faeb8487300fbde7399966"
+dependencies = [
+ "burn-core",
+ "derive-new",
+ "hashbrown 0.16.1",
+ "log",
+ "num-traits",
+ "serde",
 ]
 
 [[package]]
@@ -4128,9 +4143,11 @@ version = "0.1.4"
 dependencies = [
  "anyhow",
  "asr-features",
+ "burn-autodiff",
  "burn-core",
  "burn-ndarray",
  "burn-nn",
+ "burn-optim",
  "cbindgen",
  "clap",
  "csbindgen",

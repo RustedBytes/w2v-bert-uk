@@ -41,6 +41,7 @@ pub mod squeezeformer;
 #[cfg(feature = "swift")]
 mod swift;
 pub mod tokenizer;
+pub mod train;
 pub mod wav2vec;
 pub mod zipformer;
 

@@ -35,7 +35,10 @@ swift = ["dep:swift-bridge"]
 anyhow = "1.0"
 asr-features = { version = "0.1.1", features = ["frontend"] }
 burn = { package = "burn-core", version = "0.21.0-pre.3", default-features = false, features = ["std"] }
+burn-autodiff = { version = "0.21.0-pre.3", default-features = false, features = ["std"] }
+burn-ndarray = { version = "0.21.0-pre.3", default-features = false, features = ["std"] }
 burn-nn = { version = "0.21.0-pre.3", default-features = false, features = ["std"] }
+burn-optim = { version = "0.21.0-pre.3", default-features = false, features = ["std"] }
 clap = { version = "4.6.1", features = ["derive"] }
 env_logger = "0.11"
 half = { version = "2.1", default-features = false }
@@ -64,7 +67,6 @@ rb-sys-build = { version = "0.9.126", optional = true }
 swift-bridge-build = "0.1.59"
 
 [dev-dependencies]
-burn-ndarray = { version = "0.21.0-pre.3", default-features = false, features = ["std"] }
 
 [profile.release]
 opt-level = 3
