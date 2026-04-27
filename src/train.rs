@@ -4632,17 +4632,24 @@ fn parquet_optional_audio_bytes(
                 .and_then(|series| anyvalue_to_string(series.get(row).ok()?))
                 .and_then(|path| audio_format_hint_from_path(&path));
             if let Some(bytes) = bytes {
+                let hint = hint.or_else(|| audio_format_hint_from_bytes(&bytes));
                 return Ok(Some((bytes, hint)));
             }
         }
         if let Some(bytes) = anyvalue_to_bytes(column.get(row)?)? {
-            return Ok(Some((bytes, None)));
+            let hint = audio_format_hint_from_bytes(&bytes);
+            return Ok(Some((bytes, hint)));
         }
     }
     for name in ["audio_bytes", "bytes", "wav", "audio_data"] {
         if let Ok(column) = df.column(name) {
             if let Some(bytes) = anyvalue_to_bytes(column.get(row)?)? {
-                return Ok(Some((bytes, None)));
+                let hint = if name == "wav" {
+                    Some("audio.wav".to_string())
+                } else {
+                    audio_format_hint_from_bytes(&bytes)
+                };
+                return Ok(Some((bytes, hint)));
             }
         }
     }
@@ -4671,7 +4678,20 @@ fn audio_format_hint_from_path(path: &str) -> Option<String> {
     Path::new(path)
         .extension()
         .and_then(|extension| extension.to_str())
-        .map(str::to_string)
+        .map(|extension| format!("audio.{extension}"))
+}
+
+fn audio_format_hint_from_bytes(bytes: &[u8]) -> Option<String> {
+    if bytes.starts_with(b"OggS") && bytes.windows(b"OpusHead".len()).any(|w| w == b"OpusHead") {
+        return Some("audio.opus".to_string());
+    }
+    if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WAVE") {
+        return Some("audio.wav".to_string());
+    }
+    if bytes.starts_with(b"fLaC") {
+        return Some("audio.flac".to_string());
+    }
+    None
 }
 
 fn anyvalue_to_i64_vec(value: AnyValue<'_>) -> Result<Vec<i64>> {
@@ -6879,6 +6899,22 @@ mod tests {
         };
         let err = validate_config(&config).unwrap_err();
         assert!(err.to_string().contains("gain_min_db"));
+    }
+
+    #[test]
+    fn parquet_audio_hints_are_filename_like_for_asr_features() {
+        assert_eq!(
+            audio_format_hint_from_path("clips/sample.opus"),
+            Some("audio.opus".to_string())
+        );
+        assert_eq!(
+            audio_format_hint_from_bytes(b"OggS......OpusHead"),
+            Some("audio.opus".to_string())
+        );
+        assert_eq!(
+            audio_format_hint_from_bytes(b"RIFF....WAVEfmt "),
+            Some("audio.wav".to_string())
+        );
     }
 
     #[test]
