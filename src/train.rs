@@ -53,6 +53,9 @@ pub struct BurnTrainConfig {
     pub num_layers: usize,
     pub num_heads: usize,
     pub batch_size: usize,
+    pub adaptive_batch: Option<AdaptiveBatchConfig>,
+    pub sort_by_length_desc: bool,
+    pub sort_buffer_size: usize,
     pub epochs: usize,
     pub learning_rate: f64,
     pub weight_decay: f64,
@@ -78,6 +81,9 @@ impl Default for BurnTrainConfig {
             num_layers: 16,
             num_heads: 4,
             batch_size: 8,
+            adaptive_batch: None,
+            sort_by_length_desc: false,
+            sort_buffer_size: 4096,
             epochs: 10,
             learning_rate: 1.0e-3,
             weight_decay: 1.0e-2,
@@ -88,6 +94,35 @@ impl Default for BurnTrainConfig {
             dry_run: false,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdaptiveBatchUnit {
+    Samples,
+    Frames,
+    PaddedFrames,
+    FeatureValues,
+}
+
+impl std::str::FromStr for AdaptiveBatchUnit {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "samples" => Ok(Self::Samples),
+            "frames" => Ok(Self::Frames),
+            "padded-frames" | "padded_frames" => Ok(Self::PaddedFrames),
+            "feature-values" | "feature_values" | "values" => Ok(Self::FeatureValues),
+            other => bail!("unknown adaptive batch unit '{other}'"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct AdaptiveBatchConfig {
+    pub unit: AdaptiveBatchUnit,
+    pub budget: usize,
+    pub max_samples: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -272,6 +307,9 @@ where
         let mut train_batches = StreamingBatchLoader::new(
             config.train_manifest.clone(),
             config.batch_size,
+            config.adaptive_batch,
+            config.sort_by_length_desc,
+            config.sort_buffer_size,
             config.input_dim,
             config.max_train_samples,
         )?;
@@ -339,6 +377,9 @@ where
     let mut batches = StreamingBatchLoader::new(
         val_manifest.clone(),
         config.batch_size,
+        config.adaptive_batch,
+        config.sort_by_length_desc,
+        config.sort_buffer_size,
         config.input_dim,
         config.max_val_samples,
     )?;
@@ -475,9 +516,14 @@ pub struct StreamingBatchLoader {
     file_index: usize,
     current: Option<CurrentManifestFile>,
     batch_size: usize,
+    adaptive_batch: Option<AdaptiveBatchConfig>,
+    sort_by_length_desc: bool,
+    sort_buffer_size: usize,
     expected_dim: usize,
     yielded: usize,
     limit: Option<usize>,
+    pending: Option<FeatureRecord>,
+    sort_buffer: Vec<FeatureRecord>,
 }
 
 struct CurrentManifestFile {
@@ -491,31 +537,49 @@ impl StreamingBatchLoader {
     pub fn new(
         manifest: PathBuf,
         batch_size: usize,
+        adaptive_batch: Option<AdaptiveBatchConfig>,
+        sort_by_length_desc: bool,
+        sort_buffer_size: usize,
         expected_dim: usize,
         limit: Option<usize>,
     ) -> Result<Self> {
         if batch_size == 0 {
             bail!("batch_size must be > 0");
         }
+        if adaptive_batch.is_some_and(|config| config.budget == 0) {
+            bail!("adaptive batch budget must be > 0");
+        }
+        if sort_by_length_desc && sort_buffer_size == 0 {
+            bail!("sort_buffer_size must be > 0 when length sorting is enabled");
+        }
         Ok(Self {
             files: manifest_files(&manifest)?,
             file_index: 0,
             current: None,
             batch_size,
+            adaptive_batch,
+            sort_by_length_desc,
+            sort_buffer_size,
             expected_dim,
             yielded: 0,
             limit,
+            pending: None,
+            sort_buffer: Vec::new(),
         })
     }
 
     pub fn next_batch(&mut self) -> Result<Option<TrainBatch>> {
         let mut records = Vec::with_capacity(self.batch_size);
-        while records.len() < self.batch_size {
+        while self.can_add_more_samples(records.len()) {
             if self.limit.is_some_and(|limit| self.yielded >= limit) {
                 break;
             }
             match self.next_record()? {
                 Some(record) => {
+                    if !records.is_empty() && !self.fits_adaptive_budget(&records, &record) {
+                        self.pending = Some(record);
+                        break;
+                    }
                     self.yielded += 1;
                     records.push(record);
                 }
@@ -530,7 +594,63 @@ impl StreamingBatchLoader {
         }
     }
 
+    fn can_add_more_samples(&self, current_len: usize) -> bool {
+        if let Some(config) = self.adaptive_batch {
+            current_len < config.max_samples.unwrap_or(self.batch_size)
+        } else {
+            current_len < self.batch_size
+        }
+    }
+
+    fn fits_adaptive_budget(&self, records: &[FeatureRecord], candidate: &FeatureRecord) -> bool {
+        let Some(config) = self.adaptive_batch else {
+            return true;
+        };
+        adaptive_cost(
+            records.iter().chain(std::iter::once(candidate)),
+            config.unit,
+            self.expected_dim,
+        ) <= config.budget
+    }
+
     fn next_record(&mut self) -> Result<Option<FeatureRecord>> {
+        if self.pending.is_some() {
+            return Ok(self.pending.take());
+        }
+        if self.sort_by_length_desc {
+            return self.next_sorted_record();
+        }
+        self.next_raw_record()
+    }
+
+    fn next_sorted_record(&mut self) -> Result<Option<FeatureRecord>> {
+        if self.sort_buffer.is_empty() {
+            let remaining = self
+                .limit
+                .map(|limit| limit.saturating_sub(self.yielded))
+                .unwrap_or(self.sort_buffer_size);
+            let target = self.sort_buffer_size.min(remaining);
+            for _ in 0..target {
+                let Some(record) = self.next_raw_record()? else {
+                    break;
+                };
+                self.sort_buffer.push(record);
+            }
+            self.sort_buffer.sort_by(|left, right| {
+                right
+                    .rows
+                    .cmp(&left.rows)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+        }
+        if self.sort_buffer.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(self.sort_buffer.remove(0)))
+        }
+    }
+
+    fn next_raw_record(&mut self) -> Result<Option<FeatureRecord>> {
         loop {
             if self.current.is_none() {
                 if self.file_index >= self.files.len() {
@@ -613,6 +733,27 @@ fn is_manifest_file(path: &Path) -> bool {
             .extension()
             .and_then(|extension| extension.to_str())
             .is_some_and(|extension| matches!(extension, "jsonl" | "json"))
+}
+
+fn adaptive_cost<'a>(
+    records: impl Iterator<Item = &'a FeatureRecord>,
+    unit: AdaptiveBatchUnit,
+    expected_dim: usize,
+) -> usize {
+    let mut samples = 0usize;
+    let mut frames = 0usize;
+    let mut max_frames = 0usize;
+    for record in records {
+        samples += 1;
+        frames += record.rows;
+        max_frames = max_frames.max(record.rows);
+    }
+    match unit {
+        AdaptiveBatchUnit::Samples => samples,
+        AdaptiveBatchUnit::Frames => frames,
+        AdaptiveBatchUnit::PaddedFrames => samples * max_frames,
+        AdaptiveBatchUnit::FeatureValues => samples * max_frames * expected_dim,
+    }
 }
 
 fn load_manifest_file(path: &Path, limit: Option<usize>) -> Result<Vec<FeatureRecord>> {
@@ -869,6 +1010,17 @@ fn validate_config(config: &BurnTrainConfig) -> Result<()> {
     if config.batch_size == 0 {
         bail!("batch_size must be > 0");
     }
+    if let Some(adaptive_batch) = config.adaptive_batch {
+        if adaptive_batch.budget == 0 {
+            bail!("adaptive_batch.budget must be > 0");
+        }
+        if adaptive_batch.max_samples == Some(0) {
+            bail!("adaptive_batch.max_samples must be > 0 when set");
+        }
+    }
+    if config.sort_by_length_desc && config.sort_buffer_size == 0 {
+        bail!("sort_buffer_size must be > 0 when length sorting is enabled");
+    }
     if config.epochs == 0 {
         bail!("epochs must be > 0");
     }
@@ -903,6 +1055,18 @@ fn write_run_config(config: &BurnTrainConfig) -> Result<()> {
             "num_layers": config.num_layers,
             "num_heads": config.num_heads,
             "batch_size": config.batch_size,
+            "adaptive_batch": config.adaptive_batch.map(|adaptive| json!({
+                "unit": match adaptive.unit {
+                    AdaptiveBatchUnit::Samples => "samples",
+                    AdaptiveBatchUnit::Frames => "frames",
+                    AdaptiveBatchUnit::PaddedFrames => "padded_frames",
+                    AdaptiveBatchUnit::FeatureValues => "feature_values",
+                },
+                "budget": adaptive.budget,
+                "max_samples": adaptive.max_samples,
+            })),
+            "sort_by_length_desc": config.sort_by_length_desc,
+            "sort_buffer_size": config.sort_buffer_size,
             "epochs": config.epochs,
             "learning_rate": config.learning_rate,
             "weight_decay": config.weight_decay,
@@ -1005,5 +1169,75 @@ mod tests {
 
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].id, "a");
+    }
+
+    #[test]
+    fn streaming_loader_respects_adaptive_padded_frame_budget() {
+        let dir = std::env::temp_dir().join(format!(
+            "w2v_bert_uk_adaptive_batch_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("train.jsonl"),
+            [
+                r#"{"id":"a","features":[[0.1,0.2],[0.3,0.4]],"tokens":[1]}"#,
+                r#"{"id":"b","features":[[0.1,0.2],[0.3,0.4],[0.5,0.6]],"tokens":[1]}"#,
+                r#"{"id":"c","features":[[0.1,0.2]],"tokens":[1]}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let mut loader = StreamingBatchLoader::new(
+            dir.join("train.jsonl"),
+            8,
+            Some(AdaptiveBatchConfig {
+                unit: AdaptiveBatchUnit::PaddedFrames,
+                budget: 6,
+                max_samples: None,
+            }),
+            false,
+            4096,
+            2,
+            None,
+        )
+        .unwrap();
+
+        let first = loader.next_batch().unwrap().unwrap();
+        let second = loader.next_batch().unwrap().unwrap();
+
+        assert_eq!(first.batch_size, 2);
+        assert_eq!(first.feature_lengths, vec![2, 3]);
+        assert_eq!(second.batch_size, 1);
+        assert_eq!(second.feature_lengths, vec![1]);
+    }
+
+    #[test]
+    fn streaming_loader_sorts_by_length_desc_within_buffer() {
+        let dir = std::env::temp_dir().join(format!(
+            "w2v_bert_uk_sort_batch_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("train.jsonl"),
+            [
+                r#"{"id":"short","features":[[0.1,0.2]],"tokens":[1]}"#,
+                r#"{"id":"long","features":[[0.1,0.2],[0.3,0.4],[0.5,0.6]],"tokens":[1]}"#,
+                r#"{"id":"mid","features":[[0.1,0.2],[0.3,0.4]],"tokens":[1]}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let mut loader =
+            StreamingBatchLoader::new(dir.join("train.jsonl"), 3, None, true, 3, 2, None).unwrap();
+
+        let batch = loader.next_batch().unwrap().unwrap();
+
+        assert_eq!(batch.feature_lengths, vec![3, 2, 1]);
     }
 }

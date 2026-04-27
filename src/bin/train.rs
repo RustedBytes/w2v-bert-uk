@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use env_logger::Env;
-use w2v_bert_uk::train::{BurnTrainConfig, TrainArchitecture, run_burn_training};
+use w2v_bert_uk::train::{
+    AdaptiveBatchConfig, AdaptiveBatchUnit, BurnTrainConfig, TrainArchitecture, run_burn_training,
+};
 
 #[derive(Parser)]
 #[command(
@@ -77,6 +79,26 @@ struct Args {
     #[arg(long, default_value_t = 8)]
     batch_size: usize,
 
+    /// Adaptive batch unit: samples, frames, padded-frames, or feature-values.
+    #[arg(long, value_enum)]
+    adaptive_batch_unit: Option<AdaptiveBatchUnitArg>,
+
+    /// Adaptive batch budget measured in --adaptive-batch-unit.
+    #[arg(long)]
+    adaptive_batch_budget: Option<usize>,
+
+    /// Optional hard cap on samples per adaptive batch. Defaults to --batch-size.
+    #[arg(long)]
+    adaptive_batch_max_samples: Option<usize>,
+
+    /// Sort streamed records by descending frame length within a bounded buffer.
+    #[arg(long)]
+    sort_by_length_desc: bool,
+
+    /// Number of records to hold for bounded length sorting.
+    #[arg(long, default_value_t = 4096)]
+    sort_buffer_size: usize,
+
     /// Number of epochs.
     #[arg(long, default_value_t = 10)]
     epochs: usize,
@@ -119,10 +141,19 @@ enum ArchitectureArg {
     W2vBert,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum AdaptiveBatchUnitArg {
+    Samples,
+    Frames,
+    PaddedFrames,
+    FeatureValues,
+}
+
 fn main() -> Result<()> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
     let args = Args::parse();
     let (train_manifest, val_manifest) = resolve_manifest_paths(&args)?;
+    let adaptive_batch = resolve_adaptive_batch(&args)?;
     let config = BurnTrainConfig {
         architecture: resolve_architecture(&args),
         train_manifest,
@@ -136,6 +167,9 @@ fn main() -> Result<()> {
         num_layers: args.num_layers,
         num_heads: args.num_heads,
         batch_size: args.batch_size,
+        adaptive_batch,
+        sort_by_length_desc: args.sort_by_length_desc,
+        sort_buffer_size: args.sort_buffer_size,
         epochs: args.epochs,
         learning_rate: args.learning_rate,
         weight_decay: args.weight_decay,
@@ -169,6 +203,30 @@ fn resolve_architecture(args: &Args) -> TrainArchitecture {
         ArchitectureArg::Zipformer => TrainArchitecture::Zipformer,
         ArchitectureArg::Paraformer => TrainArchitecture::Paraformer,
         ArchitectureArg::W2vBert => TrainArchitecture::Wav2VecBert,
+    }
+}
+
+fn resolve_adaptive_batch(args: &Args) -> Result<Option<AdaptiveBatchConfig>> {
+    match (args.adaptive_batch_unit, args.adaptive_batch_budget) {
+        (None, None) => Ok(None),
+        (Some(unit), Some(budget)) => {
+            if budget == 0 {
+                anyhow::bail!("--adaptive-batch-budget must be > 0");
+            }
+            Ok(Some(AdaptiveBatchConfig {
+                unit: match unit {
+                    AdaptiveBatchUnitArg::Samples => AdaptiveBatchUnit::Samples,
+                    AdaptiveBatchUnitArg::Frames => AdaptiveBatchUnit::Frames,
+                    AdaptiveBatchUnitArg::PaddedFrames => AdaptiveBatchUnit::PaddedFrames,
+                    AdaptiveBatchUnitArg::FeatureValues => AdaptiveBatchUnit::FeatureValues,
+                },
+                budget,
+                max_samples: args.adaptive_batch_max_samples,
+            }))
+        }
+        _ => {
+            anyhow::bail!("--adaptive-batch-unit and --adaptive-batch-budget must be set together")
+        }
     }
 }
 
