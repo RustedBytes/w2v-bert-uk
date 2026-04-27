@@ -8,6 +8,7 @@ use burn::module::AutodiffModule;
 use burn::tensor::activation::log_softmax;
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{Int, Tensor, TensorData};
+use burn_autodiff::checkpoint::strategy::BalancedCheckpointing;
 use burn_nn::loss::{CTCLossConfig, Reduction};
 use burn_optim::{AdamWConfig, GradientsParams, Optimizer};
 use serde_json::{Value, json};
@@ -71,6 +72,7 @@ pub struct BurnTrainConfig {
     pub paraformer_enhanced: bool,
     pub w2v_hf_model_dir: Option<PathBuf>,
     pub w2v_hf_load_weights: bool,
+    pub w2v_activation_checkpointing: bool,
 }
 
 impl Default for BurnTrainConfig {
@@ -103,6 +105,7 @@ impl Default for BurnTrainConfig {
             paraformer_enhanced: false,
             w2v_hf_model_dir: None,
             w2v_hf_load_weights: false,
+            w2v_activation_checkpointing: false,
         }
     }
 }
@@ -266,39 +269,53 @@ pub fn run_burn_training(config: BurnTrainConfig) -> Result<TrainSummary> {
             }
         }
         TrainArchitecture::Wav2VecBert => {
-            let model_config = if let Some(path) = &config.w2v_hf_model_dir {
-                Wav2VecBertCtcConfig::from_huggingface_dir(path, Some(config.vocab_size))?
+            if config.w2v_activation_checkpointing {
+                type CheckpointBackend =
+                    burn_autodiff::Autodiff<InnerBackend, BalancedCheckpointing>;
+                train_wav2vec_model::<CheckpointBackend>(&config, &device)
             } else {
-                let encoder = Wav2VecBertConfig::new(config.input_dim, config.d_model)
-                    .with_layers(config.num_layers);
-                Wav2VecBertCtcConfig {
-                    encoder,
-                    vocab_size: config.vocab_size,
-                }
-            };
-            let mut train_config = config.clone();
-            train_config.input_dim = model_config.encoder.feature_dim;
-            train_config.d_model = model_config.encoder.hidden_size;
-            train_config.num_layers = model_config.encoder.num_hidden_layers;
-            train_config.num_heads = model_config.encoder.num_attention_heads;
-            let mut model = model_config.init::<TrainBackend>(&device);
-            if config.w2v_hf_load_weights {
-                let path = config
-                    .w2v_hf_model_dir
-                    .as_ref()
-                    .context("--w2v-hf-load-weights requires --w2v-hf-model-dir")?;
-                let report = model.load_huggingface_weights(path, &device)?;
-                log::info!(
-                    "loaded {} Hugging Face W2V-BERT tensors from {} file(s), skipped_missing={}, skipped_shape={}",
-                    report.loaded_count(),
-                    report.source_files.len(),
-                    report.skipped_missing.len(),
-                    report.skipped_shape.len()
-                );
+                train_wav2vec_model::<TrainBackend>(&config, &device)
             }
-            train_ctc_model(model, &train_config, &device)
         }
     }
+}
+
+fn train_wav2vec_model<B>(config: &BurnTrainConfig, device: &B::Device) -> Result<TrainSummary>
+where
+    B: AutodiffBackend,
+{
+    let mut model_config = if let Some(path) = &config.w2v_hf_model_dir {
+        Wav2VecBertCtcConfig::from_huggingface_dir(path, Some(config.vocab_size))?
+    } else {
+        let encoder =
+            Wav2VecBertConfig::new(config.input_dim, config.d_model).with_layers(config.num_layers);
+        Wav2VecBertCtcConfig {
+            encoder,
+            vocab_size: config.vocab_size,
+        }
+    };
+    model_config.encoder.activation_checkpointing = config.w2v_activation_checkpointing;
+    let mut train_config = config.clone();
+    train_config.input_dim = model_config.encoder.feature_dim;
+    train_config.d_model = model_config.encoder.hidden_size;
+    train_config.num_layers = model_config.encoder.num_hidden_layers;
+    train_config.num_heads = model_config.encoder.num_attention_heads;
+    let mut model = model_config.init::<B>(device);
+    if config.w2v_hf_load_weights {
+        let path = config
+            .w2v_hf_model_dir
+            .as_ref()
+            .context("--w2v-hf-load-weights requires --w2v-hf-model-dir")?;
+        let report = model.load_huggingface_weights(path, device)?;
+        log::info!(
+            "loaded {} Hugging Face W2V-BERT tensors from {} file(s), skipped_missing={}, skipped_shape={}",
+            report.loaded_count(),
+            report.source_files.len(),
+            report.skipped_missing.len(),
+            report.skipped_shape.len()
+        );
+    }
+    train_ctc_model(model, &train_config, device)
 }
 
 trait TrainableCtc<B: AutodiffBackend>: AutodiffModule<B> {
@@ -1427,6 +1444,7 @@ fn write_run_config(config: &BurnTrainConfig) -> Result<()> {
             "weight_decay": config.weight_decay,
             "w2v_hf_model_dir": config.w2v_hf_model_dir,
             "w2v_hf_load_weights": config.w2v_hf_load_weights,
+            "w2v_activation_checkpointing": config.w2v_activation_checkpointing,
         }))?,
     )
     .with_context(|| format!("failed to write {}", path.display()))

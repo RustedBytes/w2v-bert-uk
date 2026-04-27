@@ -36,6 +36,7 @@ pub struct Wav2VecBertConfig {
     pub add_adapter: bool,
     pub adapter_stride: usize,
     pub num_adapter_layers: usize,
+    pub activation_checkpointing: bool,
 }
 
 impl Default for Wav2VecBertConfig {
@@ -55,6 +56,7 @@ impl Default for Wav2VecBertConfig {
             add_adapter: false,
             adapter_stride: 2,
             num_adapter_layers: 0,
+            activation_checkpointing: false,
         }
     }
 }
@@ -183,6 +185,14 @@ impl Wav2VecBertConfig {
         {
             self.num_adapter_layers = layers;
         }
+        if let Some(activation_checkpointing) = self
+            .model_config
+            .get("activation_checkpointing")
+            .or_else(|| self.model_config.get("gradient_checkpointing"))
+            .and_then(Value::as_bool)
+        {
+            self.activation_checkpointing = activation_checkpointing;
+        }
         self
     }
 
@@ -220,6 +230,12 @@ impl Wav2VecBertConfig {
             .map(|value| value as usize)
         {
             config.sample_rate = sample_rate;
+        }
+        if let Some(activation_checkpointing) = mapping
+            .get("activation_checkpointing")
+            .and_then(Value::as_bool)
+        {
+            config.activation_checkpointing = activation_checkpointing;
         }
         config
     }
@@ -261,6 +277,11 @@ impl Wav2VecBertConfig {
         self
     }
 
+    pub fn with_activation_checkpointing(mut self, activation_checkpointing: bool) -> Self {
+        self.activation_checkpointing = activation_checkpointing;
+        self
+    }
+
     pub fn model_dim(&self) -> usize {
         self.hidden_size
     }
@@ -273,6 +294,7 @@ impl Wav2VecBertConfig {
             "feature_dim": self.feature_dim,
             "sample_rate": self.sample_rate,
             "model_config": self.model_config,
+            "activation_checkpointing": self.activation_checkpointing,
         })
     }
 
@@ -1176,6 +1198,7 @@ mod tests {
         hf_config.insert("add_adapter".to_string(), json!(true));
         hf_config.insert("adapter_stride".to_string(), json!(2));
         hf_config.insert("num_adapter_layers".to_string(), json!(2));
+        hf_config.insert("gradient_checkpointing".to_string(), json!(true));
         let mut mapping = Map::new();
         mapping.insert("model_name".to_string(), json!("local-w2v-bert"));
         mapping.insert("sample_rate".to_string(), json!(16_000));
@@ -1188,8 +1211,10 @@ mod tests {
         assert_eq!(config.feature_dim, 8);
         assert_eq!(config.num_attention_heads, 2);
         assert!(config.add_adapter);
+        assert!(config.activation_checkpointing);
         assert_eq!(value["architecture"], "w2v_bert");
         assert_eq!(value["model_name"], "local-w2v-bert");
+        assert_eq!(value["activation_checkpointing"], true);
     }
 
     #[test]

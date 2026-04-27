@@ -17,7 +17,7 @@
 - [x] Add enhanced Paraformer-v2 shallow CTC, boundary, and refinement heads.
 - [x] Tighten Wav2Vec/W2V-BERT parity against the Python implementation.
 - [x] Add Hugging Face W2V-BERT weight import/config loading for Burn.
-- [ ] Add W2V-BERT activation checkpointing
+- [x] Add W2V-BERT activation checkpointing
 
 ## Training
 
@@ -38,6 +38,8 @@
 - [ ] Add learning-rate scheduler with warmup/hold/decay.
 - [ ] Add EMA model tracking.
 - [ ] Add distributed training support.
+- [ ] Add multi-GPU training support.
+- [ ] Add FP16 and mixed precision training support.
 
 ## Data Loading
 
