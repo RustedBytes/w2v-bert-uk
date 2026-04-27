@@ -5867,9 +5867,11 @@ struct TuiMetrics {
     step: Option<usize>,
     phase: String,
     train_loss: Option<f64>,
+    previous_train_loss: Option<f64>,
     train_ctc_loss: Option<f64>,
     train_ce_loss: Option<f64>,
     val_loss: Option<f64>,
+    previous_val_loss: Option<f64>,
     val_cer: Option<f64>,
     val_wer: Option<f64>,
     learning_rate: Option<f64>,
@@ -5936,9 +5938,12 @@ impl TrainingTui {
                 self.metrics.step = json_usize(payload, "global_step");
                 self.metrics.learning_rate = json_f64(payload, "learning_rate");
                 if let Some(losses) = payload.get("losses") {
-                    self.metrics.train_loss = json_f64(losses, "total")
-                        .or_else(|| json_f64(losses, "ctc"))
-                        .or(self.metrics.train_loss);
+                    if let Some(train_loss) =
+                        json_f64(losses, "total").or_else(|| json_f64(losses, "ctc"))
+                    {
+                        self.metrics.previous_train_loss = self.metrics.train_loss;
+                        self.metrics.train_loss = Some(train_loss);
+                    }
                     self.metrics.train_ctc_loss =
                         json_f64(losses, "ctc").or(self.metrics.train_ctc_loss);
                     self.metrics.train_ce_loss =
@@ -5958,7 +5963,10 @@ impl TrainingTui {
                 self.metrics.phase = "validation".to_string();
                 self.metrics.epoch = json_usize(payload, "epoch").or(self.metrics.epoch);
                 self.metrics.step = json_usize(payload, "global_step").or(self.metrics.step);
-                self.metrics.val_loss = json_f64(payload, "loss");
+                if let Some(val_loss) = json_f64(payload, "loss") {
+                    self.metrics.previous_val_loss = self.metrics.val_loss;
+                    self.metrics.val_loss = Some(val_loss);
+                }
                 self.metrics.val_cer = json_f64(payload, "cer");
                 self.metrics.val_wer = json_f64(payload, "wer");
             }
@@ -6018,14 +6026,16 @@ impl TrainingTui {
             Print("Loss\n"),
             ResetColor,
             Print(format!(
-                "  train: {}   ctc: {}   ce: {}\n",
+                "  train: {}   prev: {}   ctc: {}   ce: {}\n",
                 fmt_opt_f64(self.metrics.train_loss, 6),
+                fmt_opt_f64(self.metrics.previous_train_loss, 6),
                 fmt_opt_f64(self.metrics.train_ctc_loss, 6),
                 fmt_opt_f64(self.metrics.train_ce_loss, 6)
             )),
             Print(format!(
-                "  val: {}   cer: {}   wer: {}\n\n",
+                "  val: {}   prev: {}   cer: {}   wer: {}\n\n",
                 fmt_opt_f64(self.metrics.val_loss, 6),
+                fmt_opt_f64(self.metrics.previous_val_loss, 6),
                 fmt_opt_f64(self.metrics.val_cer, 6),
                 fmt_opt_f64(self.metrics.val_wer, 6)
             )),
