@@ -1,8 +1,13 @@
-use std::path::PathBuf;
+use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
-use anyhow::Result;
-use clap::{Parser, ValueEnum};
+use anyhow::{Context, Result, anyhow, bail};
+use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use env_logger::Env;
+use polars::prelude::{AnyValue, DataFrame, ParquetReader, SerReader};
+use serde_json::Value;
 use w2v_bert_uk::audio::WaveformAugmentConfig;
 use w2v_bert_uk::paraformer::ParaformerAlignmentMode;
 use w2v_bert_uk::train::{
@@ -16,7 +21,24 @@ use w2v_bert_uk::train::{
     version,
     about = "Train Burn ASR architectures with a Python-train.py-style CLI"
 )]
-struct Args {
+struct Cli {
+    #[command(subcommand)]
+    command: Option<CommandArg>,
+
+    #[command(flatten)]
+    run: RunArgs,
+}
+
+#[derive(Subcommand)]
+enum CommandArg {
+    /// Run Burn model training. This is also the default when no subcommand is provided.
+    Run(RunArgs),
+    /// Train a SentencePiece tokenizer from manifest transcripts or text files.
+    Tokenizer(TokenizerArgs),
+}
+
+#[derive(ClapArgs)]
+struct RunArgs {
     /// Architecture to train.
     #[arg(long, value_enum, default_value_t = ArchitectureArg::Squeezeformer)]
     architecture: ArchitectureArg,
@@ -60,7 +82,7 @@ struct Args {
 
     /// Vocabulary size including the blank symbol for CTC models.
     #[arg(long)]
-    vocab_size: usize,
+    vocab_size: Option<usize>,
 
     /// CTC blank token id.
     #[arg(long, default_value_t = 0)]
@@ -283,6 +305,117 @@ struct Args {
     mixed_precision: bool,
 }
 
+#[derive(ClapArgs)]
+struct TokenizerArgs {
+    /// Input manifest, text file, Parquet file, or directory. Can be passed multiple times.
+    #[arg(long = "input", required = true)]
+    inputs: Vec<PathBuf>,
+
+    /// Output directory for the tokenizer files.
+    #[arg(long, default_value = "tokenizer")]
+    output_dir: PathBuf,
+
+    /// SentencePiece model prefix. Creates <prefix>.model and <prefix>.vocab in --output-dir.
+    #[arg(long, default_value = "tokenizer")]
+    model_prefix: String,
+
+    /// Vocabulary size for the SentencePiece model.
+    #[arg(long, default_value_t = 5000)]
+    vocab_size: usize,
+
+    /// SentencePiece model type.
+    #[arg(long, value_enum, default_value_t = SentencePieceModelTypeArg::Unigram)]
+    model_type: SentencePieceModelTypeArg,
+
+    /// Character coverage passed to SentencePiece.
+    #[arg(long, default_value_t = 0.9995)]
+    character_coverage: f64,
+
+    /// Maximum sentence length accepted by SentencePiece.
+    #[arg(long, default_value_t = 4192)]
+    max_sentence_length: usize,
+
+    /// Randomly sample this many sentences before training. 0 lets SentencePiece use all input.
+    #[arg(long, default_value_t = 0)]
+    input_sentence_size: usize,
+
+    /// Shuffle sentences before SentencePiece sampling.
+    #[arg(long)]
+    shuffle_input_sentence: bool,
+
+    /// Enable SentencePiece's extremely large corpus mode.
+    #[arg(long)]
+    train_extremely_large_corpus: bool,
+
+    /// User-defined symbols, comma-separated or repeated.
+    #[arg(long, value_delimiter = ',')]
+    user_defined_symbols: Vec<String>,
+
+    /// Control symbols, comma-separated or repeated.
+    #[arg(long, value_delimiter = ',')]
+    control_symbols: Vec<String>,
+
+    /// Unknown token string.
+    #[arg(long, default_value = "<unk>")]
+    unk_piece: String,
+
+    /// BOS token string.
+    #[arg(long, default_value = "<s>")]
+    bos_piece: String,
+
+    /// EOS token string.
+    #[arg(long, default_value = "</s>")]
+    eos_piece: String,
+
+    /// Padding token string.
+    #[arg(long, default_value = "<pad>")]
+    pad_piece: String,
+
+    /// Unknown token id.
+    #[arg(long, default_value_t = 0)]
+    unk_id: i32,
+
+    /// BOS token id. Use -1 to disable.
+    #[arg(long, default_value_t = 1)]
+    bos_id: i32,
+
+    /// EOS token id. Use -1 to disable.
+    #[arg(long, default_value_t = 2)]
+    eos_id: i32,
+
+    /// Padding token id. Use -1 to disable.
+    #[arg(long, default_value_t = -1)]
+    pad_id: i32,
+
+    /// SentencePiece normalization rule name.
+    #[arg(long, default_value = "nmt_nfkc")]
+    normalization_rule_name: String,
+
+    /// Enable SentencePiece byte fallback.
+    #[arg(long)]
+    byte_fallback: bool,
+
+    /// Keep the generated plain-text corpus beside the tokenizer model.
+    #[arg(long)]
+    keep_corpus: bool,
+
+    /// Explicit corpus output path. Implies --keep-corpus.
+    #[arg(long)]
+    corpus_output: Option<PathBuf>,
+
+    /// SentencePiece trainer executable. Defaults to SENTENCEPIECE_TRAIN, spm_train, then sentencepiece-train.
+    #[arg(long)]
+    sentencepiece_command: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum SentencePieceModelTypeArg {
+    Unigram,
+    Bpe,
+    Char,
+    Word,
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum ArchitectureArg {
     Squeezeformer,
@@ -323,7 +456,15 @@ enum ParaformerAlignmentArg {
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
-    let args = Args::parse();
+    let cli = Cli::parse();
+    match cli.command {
+        Some(CommandArg::Run(args)) => run_training(args),
+        Some(CommandArg::Tokenizer(args)) => run_tokenizer_training(args),
+        None => run_training(cli.run),
+    }
+}
+
+fn run_training(args: RunArgs) -> Result<()> {
     let (train_manifest, val_manifest) = resolve_manifest_paths(&args)?;
     let adaptive_batch = resolve_adaptive_batch(&args)?;
     let precision = resolve_precision(&args);
@@ -335,7 +476,9 @@ fn main() -> Result<()> {
         output_dir: args.output_dir,
         variant: args.variant,
         input_dim: args.input_dim,
-        vocab_size: args.vocab_size,
+        vocab_size: args
+            .vocab_size
+            .ok_or_else(|| anyhow!("--vocab-size is required for model training"))?,
         blank_id: args.blank_id,
         d_model: args.d_model,
         num_layers: args.num_layers,
@@ -415,7 +558,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn resolve_device_indices(args: &Args) -> Vec<usize> {
+fn resolve_device_indices(args: &RunArgs) -> Vec<usize> {
     if args.device_indices.is_empty() {
         vec![args.device_index]
     } else {
@@ -423,7 +566,7 @@ fn resolve_device_indices(args: &Args) -> Vec<usize> {
     }
 }
 
-fn resolve_precision(args: &Args) -> TrainPrecision {
+fn resolve_precision(args: &RunArgs) -> TrainPrecision {
     if args.mixed_precision && matches!(args.precision, PrecisionArg::F32) {
         return TrainPrecision::F16;
     }
@@ -434,7 +577,7 @@ fn resolve_precision(args: &Args) -> TrainPrecision {
     }
 }
 
-fn resolve_architecture(args: &Args) -> TrainArchitecture {
+fn resolve_architecture(args: &RunArgs) -> TrainArchitecture {
     if args.zipformer {
         return TrainArchitecture::Zipformer;
     }
@@ -452,7 +595,7 @@ fn resolve_architecture(args: &Args) -> TrainArchitecture {
     }
 }
 
-fn resolve_adaptive_batch(args: &Args) -> Result<Option<AdaptiveBatchConfig>> {
+fn resolve_adaptive_batch(args: &RunArgs) -> Result<Option<AdaptiveBatchConfig>> {
     match (args.adaptive_batch_unit, args.adaptive_batch_budget) {
         (None, None) => Ok(None),
         (Some(unit), Some(budget)) => {
@@ -476,7 +619,7 @@ fn resolve_adaptive_batch(args: &Args) -> Result<Option<AdaptiveBatchConfig>> {
     }
 }
 
-fn resolve_manifest_paths(args: &Args) -> Result<(PathBuf, Option<PathBuf>)> {
+fn resolve_manifest_paths(args: &RunArgs) -> Result<(PathBuf, Option<PathBuf>)> {
     if let Some(manifest_dir) = &args.manifest_dir {
         let train_manifest = args
             .train_manifest
@@ -495,4 +638,331 @@ fn resolve_manifest_paths(args: &Args) -> Result<(PathBuf, Option<PathBuf>)> {
         anyhow::anyhow!("--train-manifest is required unless --manifest-dir is provided")
     })?;
     Ok((train_manifest, args.val_manifest.clone()))
+}
+
+fn run_tokenizer_training(args: TokenizerArgs) -> Result<()> {
+    fs::create_dir_all(&args.output_dir)
+        .with_context(|| format!("failed to create {}", args.output_dir.display()))?;
+
+    let corpus_path = args.corpus_output.clone().unwrap_or_else(|| {
+        args.output_dir
+            .join(format!("{}.corpus.txt", args.model_prefix))
+    });
+    let sentence_count = write_tokenizer_corpus(&args.inputs, &corpus_path)?;
+    if sentence_count == 0 {
+        bail!("tokenizer inputs did not contain any transcript text");
+    }
+
+    let model_prefix = args.output_dir.join(&args.model_prefix);
+    let mut spm_args = vec![
+        format!("--input={}", corpus_path.display()),
+        format!("--model_prefix={}", model_prefix.display()),
+        format!("--vocab_size={}", args.vocab_size),
+        format!("--model_type={}", sentencepiece_model_type(args.model_type)),
+        format!("--character_coverage={}", args.character_coverage),
+        format!("--max_sentence_length={}", args.max_sentence_length),
+        format!("--unk_piece={}", args.unk_piece),
+        format!("--bos_piece={}", args.bos_piece),
+        format!("--eos_piece={}", args.eos_piece),
+        format!("--pad_piece={}", args.pad_piece),
+        format!("--unk_id={}", args.unk_id),
+        format!("--bos_id={}", args.bos_id),
+        format!("--eos_id={}", args.eos_id),
+        format!("--pad_id={}", args.pad_id),
+        format!("--normalization_rule_name={}", args.normalization_rule_name),
+    ];
+    if args.input_sentence_size > 0 {
+        spm_args.push(format!(
+            "--input_sentence_size={}",
+            args.input_sentence_size
+        ));
+    }
+    if args.shuffle_input_sentence {
+        spm_args.push("--shuffle_input_sentence=true".to_string());
+    }
+    if args.train_extremely_large_corpus {
+        spm_args.push("--train_extremely_large_corpus=true".to_string());
+    }
+    if args.byte_fallback {
+        spm_args.push("--byte_fallback=true".to_string());
+    }
+    if !args.user_defined_symbols.is_empty() {
+        spm_args.push(format!(
+            "--user_defined_symbols={}",
+            args.user_defined_symbols.join(",")
+        ));
+    }
+    if !args.control_symbols.is_empty() {
+        spm_args.push(format!(
+            "--control_symbols={}",
+            args.control_symbols.join(",")
+        ));
+    }
+
+    run_sentencepiece(&args, &spm_args)?;
+
+    let model_path = model_prefix.with_extension("model");
+    let vocab_path = model_prefix.with_extension("vocab");
+    w2v_bert_uk::tokenizer::load_sentencepiece_transcript_tokenizer(&model_path).with_context(
+        || {
+            format!(
+                "SentencePiece model was created but could not be loaded by the Rust tokenizer: {}",
+                model_path.display()
+            )
+        },
+    )?;
+
+    if !args.keep_corpus && args.corpus_output.is_none() {
+        let _ = fs::remove_file(&corpus_path);
+    }
+
+    println!(
+        "tokenizer complete sentences={} model={} vocab={}",
+        sentence_count,
+        model_path.display(),
+        vocab_path.display()
+    );
+    Ok(())
+}
+
+fn run_sentencepiece(args: &TokenizerArgs, spm_args: &[String]) -> Result<()> {
+    let mut candidates = Vec::new();
+    if let Some(command) = &args.sentencepiece_command {
+        candidates.push(command.clone());
+    } else if let Ok(command) = std::env::var("SENTENCEPIECE_TRAIN") {
+        candidates.push(PathBuf::from(command));
+    } else {
+        candidates.push(PathBuf::from("spm_train"));
+        candidates.push(PathBuf::from("sentencepiece-train"));
+    }
+
+    let mut not_found = Vec::new();
+    for command in candidates {
+        match Command::new(&command).args(spm_args).status() {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => bail!(
+                "SentencePiece trainer {} exited with status {}",
+                command.display(),
+                status
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                not_found.push(command.display().to_string());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to run {}", command.display()));
+            }
+        }
+    }
+
+    bail!(
+        "could not find SentencePiece trainer executable. Tried: {}. Install sentencepiece so spm_train is on PATH, or pass --sentencepiece-command",
+        not_found.join(", ")
+    )
+}
+
+fn sentencepiece_model_type(model_type: SentencePieceModelTypeArg) -> &'static str {
+    match model_type {
+        SentencePieceModelTypeArg::Unigram => "unigram",
+        SentencePieceModelTypeArg::Bpe => "bpe",
+        SentencePieceModelTypeArg::Char => "char",
+        SentencePieceModelTypeArg::Word => "word",
+    }
+}
+
+fn write_tokenizer_corpus(inputs: &[PathBuf], corpus_path: &Path) -> Result<usize> {
+    if let Some(parent) = corpus_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let mut writer = fs::File::create(corpus_path)
+        .with_context(|| format!("failed to create corpus {}", corpus_path.display()))?;
+    let mut count = 0usize;
+    for input in inputs {
+        count += write_tokenizer_input(input, &mut writer)?;
+    }
+    Ok(count)
+}
+
+fn write_tokenizer_input(path: &Path, writer: &mut fs::File) -> Result<usize> {
+    if path.is_dir() {
+        let mut entries = fs::read_dir(path)
+            .with_context(|| format!("failed to read directory {}", path.display()))?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()
+            .with_context(|| format!("failed to list directory {}", path.display()))?;
+        entries.sort();
+        let mut count = 0usize;
+        for entry in entries {
+            if entry.is_dir() || is_tokenizer_input_file(&entry) {
+                count += write_tokenizer_input(&entry, writer)?;
+            }
+        }
+        return Ok(count);
+    }
+
+    if !path.exists() {
+        bail!("tokenizer input does not exist: {}", path.display());
+    }
+
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("parquet") => write_parquet_text(path, writer),
+        Some("json") | Some("jsonl") => write_jsonl_text(path, writer),
+        Some("tsv") => write_tsv_text(path, writer),
+        Some("txt") | Some("text") | Some("transcript") | Some("lab") => {
+            write_plain_text(path, writer)
+        }
+        Some("wav") | Some("flac") | Some("mp3") | Some("ogg") | Some("m4a") | Some("aac") => {
+            write_audio_sidecar_text(path, writer)
+        }
+        _ => write_plain_text(path, writer),
+    }
+}
+
+fn is_tokenizer_input_file(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .as_deref(),
+        Some("json")
+            | Some("jsonl")
+            | Some("parquet")
+            | Some("tsv")
+            | Some("txt")
+            | Some("text")
+            | Some("transcript")
+            | Some("lab")
+            | Some("wav")
+            | Some("flac")
+            | Some("mp3")
+            | Some("ogg")
+            | Some("m4a")
+            | Some("aac")
+    )
+}
+
+fn write_jsonl_text(path: &Path, writer: &mut fs::File) -> Result<usize> {
+    let file =
+        fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut count = 0usize;
+    for (index, raw_line) in reader.lines().enumerate() {
+        let line = raw_line.with_context(|| format!("failed reading {}", path.display()))?;
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if !line.starts_with('{') {
+            if let Some(text) = line.split('\t').nth(4) {
+                count += write_corpus_line(writer, text)?;
+            }
+            continue;
+        }
+        let value: Value = serde_json::from_str(line)
+            .with_context(|| format!("invalid JSON line {} in {}", index + 1, path.display()))?;
+        if let Some(text) = json_text_field(&value) {
+            count += write_corpus_line(writer, text)?;
+        }
+    }
+    Ok(count)
+}
+
+fn write_tsv_text(path: &Path, writer: &mut fs::File) -> Result<usize> {
+    let file =
+        fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut count = 0usize;
+    for raw_line in reader.lines() {
+        let line = raw_line.with_context(|| format!("failed reading {}", path.display()))?;
+        if let Some(text) = line.split('\t').nth(4) {
+            count += write_corpus_line(writer, text)?;
+        }
+    }
+    Ok(count)
+}
+
+fn write_plain_text(path: &Path, writer: &mut fs::File) -> Result<usize> {
+    let file =
+        fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut count = 0usize;
+    for raw_line in reader.lines() {
+        let line = raw_line.with_context(|| format!("failed reading {}", path.display()))?;
+        count += write_corpus_line(writer, &line)?;
+    }
+    Ok(count)
+}
+
+fn write_audio_sidecar_text(path: &Path, writer: &mut fs::File) -> Result<usize> {
+    for extension in ["txt", "lab", "transcript"] {
+        let sidecar = path.with_extension(extension);
+        if sidecar.exists() {
+            return write_plain_text(&sidecar, writer);
+        }
+    }
+    Ok(0)
+}
+
+fn write_parquet_text(path: &Path, writer: &mut fs::File) -> Result<usize> {
+    let df = read_parquet_dataframe(path)?;
+    let mut count = 0usize;
+    for row in 0..df.height() {
+        if let Some(text) = parquet_optional_string(
+            &df,
+            row,
+            &["text", "transcript", "sentence", "normalized_text"],
+        )? {
+            count += write_corpus_line(writer, &text)?;
+        }
+    }
+    Ok(count)
+}
+
+fn read_parquet_dataframe(path: &Path) -> Result<DataFrame> {
+    let file = fs::File::open(path)
+        .with_context(|| format!("failed to open parquet file {}", path.display()))?;
+    ParquetReader::new(file)
+        .finish()
+        .with_context(|| format!("failed to read parquet file {}", path.display()))
+}
+
+fn parquet_optional_string(df: &DataFrame, row: usize, names: &[&str]) -> Result<Option<String>> {
+    for name in names {
+        if let Ok(column) = df.column(name) {
+            match column.get(row)? {
+                AnyValue::String(value) => return Ok(Some(value.to_string())),
+                AnyValue::StringOwned(value) => return Ok(Some(value.to_string())),
+                AnyValue::Null => {}
+                other => return Ok(Some(other.to_string())),
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn json_text_field(value: &Value) -> Option<&str> {
+    value
+        .get("text")
+        .or_else(|| value.get("transcript"))
+        .or_else(|| value.get("sentence"))
+        .or_else(|| value.get("normalized_text"))
+        .and_then(Value::as_str)
+}
+
+fn write_corpus_line(writer: &mut fs::File, text: &str) -> Result<usize> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(0);
+    }
+    writeln!(writer, "{text}").context("failed writing tokenizer corpus")?;
+    Ok(1)
 }
