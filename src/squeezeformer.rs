@@ -8,6 +8,8 @@ use burn_nn::{
     LinearConfig, PaddingConfig1d,
 };
 
+pub mod transcribe;
+
 #[derive(Clone, Copy, Debug)]
 pub enum SqueezeformerActivation {
     Gelu,
