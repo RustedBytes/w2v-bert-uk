@@ -6228,6 +6228,9 @@ fn run_config_json(config: &BurnTrainConfig) -> Value {
         "w2v_hf_model_dir": config.w2v_hf_model_dir,
         "w2v_hf_load_weights": config.w2v_hf_load_weights,
         "w2v_activation_checkpointing": config.w2v_activation_checkpointing,
+        "w2v_num_adapter_layers": config.w2v_num_adapter_layers,
+        "w2v_adapter_stride": config.w2v_adapter_stride,
+        "w2v_adapter_kernel_size": config.w2v_adapter_kernel_size,
         "init_from": config.init_from,
         "backend": match config.backend {
             TrainBackendKind::Cpu => "cpu",
@@ -6383,6 +6386,12 @@ fn train_config_from_json(value: &Value) -> Result<BurnTrainConfig> {
         json_bool(value, "w2v_hf_load_weights").unwrap_or(config.w2v_hf_load_weights);
     config.w2v_activation_checkpointing = json_bool(value, "w2v_activation_checkpointing")
         .unwrap_or(config.w2v_activation_checkpointing);
+    config.w2v_num_adapter_layers =
+        json_usize(value, "w2v_num_adapter_layers").unwrap_or(config.w2v_num_adapter_layers);
+    config.w2v_adapter_stride =
+        json_usize(value, "w2v_adapter_stride").unwrap_or(config.w2v_adapter_stride);
+    config.w2v_adapter_kernel_size =
+        json_usize(value, "w2v_adapter_kernel_size").unwrap_or(config.w2v_adapter_kernel_size);
     config.init_from = json_path(value, "init_from");
     config.backend = value
         .get("backend")
@@ -6679,6 +6688,9 @@ fn validate_resume_config(config: &BurnTrainConfig, saved_config: &Value) -> Res
         "paraformer_enhanced",
         "w2v_hf_model_dir",
         "w2v_activation_checkpointing",
+        "w2v_num_adapter_layers",
+        "w2v_adapter_stride",
+        "w2v_adapter_kernel_size",
         "precision",
         "max_audio_duration_ms",
         "gradient_accumulation_steps",

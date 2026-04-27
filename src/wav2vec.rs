@@ -712,9 +712,11 @@ impl<B: Backend> Wav2VecBertSelfAttention<B> {
             scores = scores + relative_scores / (self.head_size as f64).sqrt();
         }
 
-        let mask = padding_mask::<B>(lengths, seq_len, device)
-            .unsqueeze_dim::<4>(1)
-            .repeat_dim(1, self.num_heads);
+        let mask = sequence_mask::<B>(lengths, seq_len, device)
+            .unsqueeze_dim::<3>(1)
+            .unsqueeze_dim::<4>(2)
+            .repeat_dim(1, self.num_heads)
+            .repeat_dim(2, seq_len);
         let negative = Tensor::full(
             [batch_size, self.num_heads, seq_len, seq_len],
             -1.0e9,
@@ -1806,20 +1808,6 @@ fn ctc_loss_from_log_probs<B: Backend>(
             target_lengths,
             Reduction::Mean,
         )
-}
-
-fn padding_mask<B: Backend>(
-    lengths: &[usize],
-    max_len: usize,
-    device: &B::Device,
-) -> Tensor<B, 2, Bool> {
-    let mut values = Vec::with_capacity(lengths.len() * max_len);
-    for length in lengths {
-        for index in 0..max_len {
-            values.push(index >= *length);
-        }
-    }
-    Tensor::from_data(TensorData::new(values, [lengths.len(), max_len]), device)
 }
 
 fn sequence_mask<B: Backend>(
