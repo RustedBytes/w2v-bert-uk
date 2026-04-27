@@ -389,12 +389,15 @@ The trainer uses AdamW.
 
 | Argument | Default | Description |
 | --- | --- | --- |
-| `--epochs <N>` | `10` | Number of epochs. |
-| `--learning-rate <F>` | `0.001` | Peak AdamW learning rate. |
-| `--weight-decay <F>` | `0.01` | AdamW weight decay. |
-| `--lr-warmup-steps <N>` | `0` | Linear warmup steps. |
-| `--lr-hold-steps <N>` | `0` | Hold peak LR after warmup. |
-| `--lr-decay-steps <N>` | `0` | Linear decay steps after warmup/hold. |
+| `--epochs <N>` | `500` | Number of epochs. |
+| `--learning-rate <F>` | variant recipe | Peak AdamW learning rate. Defaults to `min(variant_peak_lr, 0.0003)`. |
+| `--weight-decay <F>` | `0.0005` | AdamW weight decay. |
+| `--lr-warmup-epochs <N>` / `--warmup-epochs <N>` | `20` | Linear warmup epochs. |
+| `--lr-hold-epochs <N>` / `--hold-epochs <N>` | `160` | Hold peak LR after warmup. |
+| `--lr-decay-exponent <F>` / `--decay-exponent <F>` | `1.0` | Inverse epoch-decay exponent after warmup/hold. |
+| `--lr-warmup-steps <N>` | unset | Linear warmup steps. Step schedule overrides epoch schedule when any step schedule option is set. |
+| `--lr-hold-steps <N>` | unset | Hold peak LR after step warmup. |
+| `--lr-decay-steps <N>` | unset | Linear decay steps after step warmup/hold. |
 | `--lr-min <F>` | `0` | Final LR after decay. |
 | `--gradient-accumulation-steps <N>` | `1` | Number of micro-batches per optimizer step. |
 | `--gradient-clip-norm <F>` | unset | Clip gradients by L2 norm. Mutually exclusive with value clipping. |

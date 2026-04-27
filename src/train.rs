@@ -135,6 +135,9 @@ pub struct BurnTrainConfig {
     pub lr_warmup_steps: usize,
     pub lr_hold_steps: usize,
     pub lr_decay_steps: usize,
+    pub lr_warmup_epochs: usize,
+    pub lr_hold_epochs: usize,
+    pub lr_decay_exponent: f64,
     pub lr_min: f64,
     pub weight_decay: f64,
     pub gradient_accumulation_steps: usize,
@@ -195,13 +198,16 @@ impl Default for BurnTrainConfig {
             dataset_index_dir: None,
             spec_augment: SpecAugmentConfig::default(),
             waveform_augment: WaveformAugmentConfig::default(),
-            epochs: 10,
-            learning_rate: 1.0e-3,
+            epochs: 500,
+            learning_rate: 3.0e-4,
             lr_warmup_steps: 0,
             lr_hold_steps: 0,
             lr_decay_steps: 0,
+            lr_warmup_epochs: 20,
+            lr_hold_epochs: 160,
+            lr_decay_exponent: 1.0,
             lr_min: 0.0,
-            weight_decay: 1.0e-2,
+            weight_decay: 5.0e-4,
             gradient_accumulation_steps: 1,
             gradient_clip_norm: None,
             gradient_clip_value: None,
@@ -1338,31 +1344,54 @@ fn gradient_clipping_config(config: &BurnTrainConfig) -> Option<GradientClipping
         })
 }
 
-fn scheduled_learning_rate(config: &BurnTrainConfig, optimizer_step: usize) -> f64 {
+fn scheduled_learning_rate(config: &BurnTrainConfig, optimizer_step: usize, epoch: usize) -> f64 {
     let base = config.learning_rate;
     let min_lr = config.lr_min;
     let step = optimizer_step.max(1);
 
-    if config.lr_warmup_steps > 0 && step <= config.lr_warmup_steps {
-        return base * step as f64 / config.lr_warmup_steps as f64;
+    let has_step_schedule =
+        config.lr_warmup_steps > 0 || config.lr_hold_steps > 0 || config.lr_decay_steps > 0;
+    if has_step_schedule {
+        if config.lr_warmup_steps > 0 && step <= config.lr_warmup_steps {
+            return base * step as f64 / config.lr_warmup_steps as f64;
+        }
+
+        let after_warmup = step.saturating_sub(config.lr_warmup_steps);
+        if config.lr_hold_steps > 0 && after_warmup <= config.lr_hold_steps {
+            return base;
+        }
+
+        if config.lr_decay_steps == 0 {
+            return base;
+        }
+
+        let decay_step = after_warmup.saturating_sub(config.lr_hold_steps);
+        if decay_step >= config.lr_decay_steps {
+            return min_lr;
+        }
+
+        let progress = decay_step as f64 / config.lr_decay_steps as f64;
+        return min_lr + (base - min_lr) * (1.0 - progress);
     }
 
-    let after_warmup = step.saturating_sub(config.lr_warmup_steps);
-    if config.lr_hold_steps > 0 && after_warmup <= config.lr_hold_steps {
+    let epoch = epoch.max(1);
+    if config.lr_warmup_epochs > 0 && epoch <= config.lr_warmup_epochs {
+        return base * epoch as f64 / config.lr_warmup_epochs as f64;
+    }
+
+    let after_warmup = epoch.saturating_sub(config.lr_warmup_epochs);
+    if config.lr_hold_epochs > 0 && after_warmup <= config.lr_hold_epochs {
         return base;
     }
 
-    if config.lr_decay_steps == 0 {
+    if config.lr_decay_exponent == 0.0 {
         return base;
     }
 
-    let decay_step = after_warmup.saturating_sub(config.lr_hold_steps);
-    if decay_step >= config.lr_decay_steps {
-        return min_lr;
-    }
-
-    let progress = decay_step as f64 / config.lr_decay_steps as f64;
-    min_lr + (base - min_lr) * (1.0 - progress)
+    let warmup = config.lr_warmup_epochs.max(1) as f64;
+    let decay_epoch = epoch.saturating_sub(config.lr_hold_epochs).max(1) as f64;
+    let lr = base * (warmup / decay_epoch).powf(config.lr_decay_exponent);
+    lr.max(min_lr)
 }
 
 fn scale_gradients<B, M>(module: &M, grads: GradientsParams, scale: f64) -> GradientsParams
@@ -1479,6 +1508,7 @@ fn maybe_step_accumulated<B, M, O>(
     accumulator: &mut GradientsAccumulator<M>,
     accumulated_batches: &mut usize,
     optimizer_step: &mut usize,
+    epoch: usize,
     config: &BurnTrainConfig,
     force: bool,
 ) -> (M, Option<f64>)
@@ -1497,7 +1527,7 @@ where
     let grads = scale_gradients::<B, M>(&model, grads, 1.0 / *accumulated_batches as f64);
     *accumulated_batches = 0;
     *optimizer_step += 1;
-    let lr = scheduled_learning_rate(config, *optimizer_step);
+    let lr = scheduled_learning_rate(config, *optimizer_step, epoch);
     (optimizer.step(lr, model, grads), Some(lr))
 }
 
@@ -1814,6 +1844,7 @@ where
                     &mut accumulator,
                     &mut accumulated_batches,
                     &mut global_step,
+                    epoch,
                     config,
                     false,
                 );
@@ -1907,6 +1938,7 @@ where
                 &mut accumulator,
                 &mut accumulated_batches,
                 &mut global_step,
+                epoch,
                 config,
                 true,
             );
@@ -2175,6 +2207,7 @@ where
                     &mut accumulator,
                     &mut accumulated_batches,
                     &mut global_step,
+                    epoch,
                     config,
                     false,
                 );
@@ -2292,6 +2325,7 @@ where
                 &mut accumulator,
                 &mut accumulated_batches,
                 &mut global_step,
+                epoch,
                 config,
                 true,
             );
@@ -2567,6 +2601,7 @@ where
                     &mut accumulator,
                     &mut accumulated_batches,
                     &mut global_step,
+                    epoch,
                     config,
                     false,
                 );
@@ -2694,6 +2729,7 @@ where
                 &mut accumulator,
                 &mut accumulated_batches,
                 &mut global_step,
+                epoch,
                 config,
                 true,
             );
@@ -5490,6 +5526,9 @@ fn validate_config(config: &BurnTrainConfig) -> Result<()> {
     if config.lr_min < 0.0 {
         bail!("lr_min must be >= 0");
     }
+    if config.lr_decay_exponent < 0.0 {
+        bail!("lr_decay_exponent must be >= 0");
+    }
     if config.gradient_accumulation_steps == 0 {
         bail!("gradient_accumulation_steps must be > 0");
     }
@@ -5921,6 +5960,9 @@ fn run_config_json(config: &BurnTrainConfig) -> Value {
         "lr_warmup_steps": config.lr_warmup_steps,
         "lr_hold_steps": config.lr_hold_steps,
         "lr_decay_steps": config.lr_decay_steps,
+        "lr_warmup_epochs": config.lr_warmup_epochs,
+        "lr_hold_epochs": config.lr_hold_epochs,
+        "lr_decay_exponent": config.lr_decay_exponent,
         "lr_min": config.lr_min,
         "weight_decay": config.weight_decay,
         "gradient_accumulation_steps": config.gradient_accumulation_steps,
@@ -6055,6 +6097,11 @@ fn train_config_from_json(value: &Value) -> Result<BurnTrainConfig> {
     config.lr_warmup_steps = json_usize(value, "lr_warmup_steps").unwrap_or(config.lr_warmup_steps);
     config.lr_hold_steps = json_usize(value, "lr_hold_steps").unwrap_or(config.lr_hold_steps);
     config.lr_decay_steps = json_usize(value, "lr_decay_steps").unwrap_or(config.lr_decay_steps);
+    config.lr_warmup_epochs =
+        json_usize(value, "lr_warmup_epochs").unwrap_or(config.lr_warmup_epochs);
+    config.lr_hold_epochs = json_usize(value, "lr_hold_epochs").unwrap_or(config.lr_hold_epochs);
+    config.lr_decay_exponent =
+        json_f64(value, "lr_decay_exponent").unwrap_or(config.lr_decay_exponent);
     config.lr_min = json_f64(value, "lr_min").unwrap_or(config.lr_min);
     config.weight_decay = json_f64(value, "weight_decay").unwrap_or(config.weight_decay);
     config.gradient_accumulation_steps = json_usize(value, "gradient_accumulation_steps")
@@ -6393,6 +6440,9 @@ fn validate_resume_config(config: &BurnTrainConfig, saved_config: &Value) -> Res
         "lr_warmup_steps",
         "lr_hold_steps",
         "lr_decay_steps",
+        "lr_warmup_epochs",
+        "lr_hold_epochs",
+        "lr_decay_exponent",
         "lr_min",
         "ema_decay",
         "ema_start_step",
@@ -6418,6 +6468,9 @@ fn resume_config_default_value(key: &str) -> Option<Value> {
         "ema_decay" => Some(Value::Null),
         "ema_start_step" => Some(json!(0)),
         "max_audio_duration_ms" => Some(Value::Null),
+        "lr_warmup_epochs" => Some(json!(0)),
+        "lr_hold_epochs" => Some(json!(0)),
+        "lr_decay_exponent" => Some(json!(0.0)),
         _ => None,
     }
 }
@@ -6852,10 +6905,31 @@ mod tests {
         };
 
         let values = (1..=6)
-            .map(|step| scheduled_learning_rate(&config, step))
+            .map(|step| scheduled_learning_rate(&config, step, 1))
             .collect::<Vec<_>>();
 
         assert_eq!(values, vec![0.5, 1.0, 1.0, 0.55, 0.1, 0.1]);
+    }
+
+    #[test]
+    fn scheduler_epoch_warmup_hold_decay_sequence() {
+        let config = BurnTrainConfig {
+            learning_rate: 1.0,
+            lr_warmup_steps: 0,
+            lr_hold_steps: 0,
+            lr_decay_steps: 0,
+            lr_warmup_epochs: 2,
+            lr_hold_epochs: 1,
+            lr_decay_exponent: 1.0,
+            lr_min: 0.1,
+            ..BurnTrainConfig::default()
+        };
+
+        let values = (1..=6)
+            .map(|epoch| scheduled_learning_rate(&config, 1, epoch))
+            .collect::<Vec<_>>();
+
+        assert_eq!(values, vec![0.5, 1.0, 1.0, 2.0 / 3.0, 0.5, 0.4]);
     }
 
     #[test]

@@ -172,33 +172,45 @@ struct RunArgs {
     #[arg(long, default_value_t = 0.0)]
     waveform_noise_std: f32,
 
-    /// Number of epochs.
-    #[arg(long, default_value_t = 10)]
-    epochs: usize,
+    /// Number of epochs. Defaults to the PositiveLoss paper recipe.
+    #[arg(long)]
+    epochs: Option<usize>,
 
-    /// AdamW learning rate.
-    #[arg(long, default_value_t = 1.0e-3)]
-    learning_rate: f64,
+    /// AdamW learning rate. Defaults to the PositiveLoss variant recipe.
+    #[arg(long)]
+    learning_rate: Option<f64>,
 
     /// Linear warmup optimizer steps before reaching --learning-rate.
-    #[arg(long, default_value_t = 0)]
-    lr_warmup_steps: usize,
+    #[arg(long)]
+    lr_warmup_steps: Option<usize>,
 
     /// Optimizer steps to hold --learning-rate after warmup.
-    #[arg(long, default_value_t = 0)]
-    lr_hold_steps: usize,
+    #[arg(long)]
+    lr_hold_steps: Option<usize>,
 
     /// Linear decay optimizer steps after warmup/hold.
-    #[arg(long, default_value_t = 0)]
-    lr_decay_steps: usize,
+    #[arg(long)]
+    lr_decay_steps: Option<usize>,
+
+    /// Linear warmup epochs before reaching --learning-rate.
+    #[arg(long, alias = "warmup-epochs")]
+    lr_warmup_epochs: Option<usize>,
+
+    /// Epochs to hold --learning-rate after warmup.
+    #[arg(long, alias = "hold-epochs")]
+    lr_hold_epochs: Option<usize>,
+
+    /// Inverse epoch-decay exponent after warmup/hold.
+    #[arg(long, alias = "decay-exponent")]
+    lr_decay_exponent: Option<f64>,
 
     /// Final learning rate after decay.
     #[arg(long, default_value_t = 0.0)]
     lr_min: f64,
 
-    /// AdamW weight decay.
-    #[arg(long, default_value_t = 1.0e-2)]
-    weight_decay: f64,
+    /// AdamW weight decay. Defaults to the PositiveLoss paper recipe.
+    #[arg(long)]
+    weight_decay: Option<f64>,
 
     /// Number of micro-batches to accumulate before each optimizer step.
     #[arg(long, default_value_t = 1)]
@@ -570,8 +582,13 @@ fn run_training(args: RunArgs) -> Result<()> {
     let adaptive_batch = resolve_adaptive_batch(&args)?;
     let precision = resolve_precision(&args);
     let device_indices = resolve_device_indices(&args);
+    let architecture = resolve_architecture(&args);
+    let defaults = training_defaults(architecture, args.variant.as_deref());
+    let step_schedule_requested = args.lr_warmup_steps.is_some()
+        || args.lr_hold_steps.is_some()
+        || args.lr_decay_steps.is_some();
     let config = BurnTrainConfig {
-        architecture: resolve_architecture(&args),
+        architecture,
         train_manifest,
         val_manifest,
         output_dir: args.output_dir,
@@ -600,13 +617,30 @@ fn run_training(args: RunArgs) -> Result<()> {
             gain_max_db: args.waveform_gain_max_db,
             noise_std: args.waveform_noise_std,
         },
-        epochs: args.epochs,
-        learning_rate: args.learning_rate,
-        lr_warmup_steps: args.lr_warmup_steps,
-        lr_hold_steps: args.lr_hold_steps,
-        lr_decay_steps: args.lr_decay_steps,
+        epochs: args.epochs.unwrap_or(defaults.epochs),
+        learning_rate: args.learning_rate.unwrap_or(defaults.learning_rate),
+        lr_warmup_steps: args.lr_warmup_steps.unwrap_or(0),
+        lr_hold_steps: args.lr_hold_steps.unwrap_or(0),
+        lr_decay_steps: args.lr_decay_steps.unwrap_or(0),
+        lr_warmup_epochs: args.lr_warmup_epochs.unwrap_or(if step_schedule_requested {
+            0
+        } else {
+            defaults.lr_warmup_epochs
+        }),
+        lr_hold_epochs: args.lr_hold_epochs.unwrap_or(if step_schedule_requested {
+            0
+        } else {
+            defaults.lr_hold_epochs
+        }),
+        lr_decay_exponent: args
+            .lr_decay_exponent
+            .unwrap_or(if step_schedule_requested {
+                0.0
+            } else {
+                defaults.lr_decay_exponent
+            }),
         lr_min: args.lr_min,
-        weight_decay: args.weight_decay,
+        weight_decay: args.weight_decay.unwrap_or(defaults.weight_decay),
         gradient_accumulation_steps: args.gradient_accumulation_steps,
         gradient_clip_norm: args.gradient_clip_norm,
         gradient_clip_value: args.gradient_clip_value,
@@ -681,6 +715,34 @@ fn resolve_precision(args: &RunArgs) -> TrainPrecision {
         PrecisionArg::F32 => TrainPrecision::F32,
         PrecisionArg::F16 => TrainPrecision::F16,
         PrecisionArg::Bf16 => TrainPrecision::Bf16,
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TrainingDefaults {
+    epochs: usize,
+    learning_rate: f64,
+    weight_decay: f64,
+    lr_warmup_epochs: usize,
+    lr_hold_epochs: usize,
+    lr_decay_exponent: f64,
+}
+
+fn training_defaults(_architecture: TrainArchitecture, variant: Option<&str>) -> TrainingDefaults {
+    const ADAMW_LR_CAP: f64 = 3.0e-4;
+    let peak_lr: f64 = match variant.unwrap_or("sm") {
+        "xs" | "s" | "sm" => 2.0e-3,
+        "m" => 1.5e-3,
+        "ml" | "l" => 1.0e-3,
+        _ => 1.0e-3,
+    };
+    TrainingDefaults {
+        epochs: 500,
+        learning_rate: peak_lr.min(ADAMW_LR_CAP),
+        weight_decay: 5.0e-4,
+        lr_warmup_epochs: 20,
+        lr_hold_epochs: 160,
+        lr_decay_exponent: 1.0,
     }
 }
 
