@@ -6935,14 +6935,20 @@ fn should_transpose_warm_start_2d(path: &str) -> bool {
     path.ends_with(".weight")
         && (path == "classifier.weight"
             || path.contains("input_projection.")
+            || path.contains("feature_projection.projection.")
             || path.contains(".attention.")
+            || path.contains(".mha.")
             || path.contains(".feed_forward.")
+            || path.contains(".pwff.")
             || path.contains("time_recovery.projection."))
 }
 
 fn warm_start_name_candidates(path: &str) -> Vec<String> {
     let mut candidates = vec![path.to_string()];
     if let Some(alias) = squeezeformer_positiveloss_alias(path) {
+        candidates.push(alias);
+    }
+    if let Some(alias) = wav2vec_positiveloss_alias(path) {
         candidates.push(alias);
     }
     candidates.sort();
@@ -6977,6 +6983,70 @@ fn squeezeformer_positiveloss_alias(path: &str) -> Option<String> {
         return squeezeformer_conv_ff_alias(block, &rest[1..]);
     }
     None
+}
+
+fn wav2vec_positiveloss_alias(path: &str) -> Option<String> {
+    if let Some(suffix) = path.strip_prefix("classifier.") {
+        return Some(format!("lm_head.{suffix}"));
+    }
+    if let Some(suffix) = path.strip_prefix("encoder.feature_projection.layer_norm.") {
+        return Some(format!(
+            "wav2vec2_bert.feature_projection.layer_norm.{}",
+            layer_norm_suffix_alias(suffix)
+        ));
+    }
+    if let Some(suffix) = path.strip_prefix("encoder.feature_projection.projection.") {
+        return Some(format!(
+            "wav2vec2_bert.feature_projection.projection.{suffix}"
+        ));
+    }
+
+    let parts = path.split('.').collect::<Vec<_>>();
+    if parts.len() < 6 || parts[0] != "encoder" || parts[1] != "encoder" || parts[2] != "layers" {
+        return None;
+    }
+    let layer = parts[3];
+    let rest = &parts[4..];
+    match rest {
+        ["mha", projection, tail @ ..] => {
+            let projection = match *projection {
+                "query" => "linear_q",
+                "key" => "linear_k",
+                "value" => "linear_v",
+                "output" => "linear_out",
+                other => other,
+            };
+            Some(format!(
+                "wav2vec2_bert.encoder.layers.{layer}.self_attn.{projection}.{}",
+                tail.join(".")
+            ))
+        }
+        ["pwff", "linear_inner", tail @ ..] => Some(format!(
+            "wav2vec2_bert.encoder.layers.{layer}.ffn1.intermediate_dense.{}",
+            tail.join(".")
+        )),
+        ["pwff", "linear_outer", tail @ ..] => Some(format!(
+            "wav2vec2_bert.encoder.layers.{layer}.ffn1.output_dense.{}",
+            tail.join(".")
+        )),
+        ["norm_2", suffix] => Some(format!(
+            "wav2vec2_bert.encoder.layers.{layer}.self_attn_layer_norm.{}",
+            layer_norm_suffix_alias(suffix)
+        )),
+        ["norm_1", suffix] => Some(format!(
+            "wav2vec2_bert.encoder.layers.{layer}.final_layer_norm.{}",
+            layer_norm_suffix_alias(suffix)
+        )),
+        _ => None,
+    }
+}
+
+fn layer_norm_suffix_alias(suffix: &str) -> &str {
+    match suffix {
+        "gamma" => "weight",
+        "beta" => "bias",
+        other => other,
+    }
 }
 
 fn squeezeformer_mhsa_ff_alias(block: &str, rest: &[&str]) -> Option<String> {
