@@ -5,6 +5,12 @@ use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use crossterm::{
+    cursor::{Hide, MoveTo, Show},
+    execute, queue,
+    style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
+    terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
+};
 use env_logger::Env;
 use polars::prelude::{
     AnyValue, DataFrame, IntoColumn, IntoSeries, ListChunked, NamedFrom, ParquetReader,
@@ -14,8 +20,9 @@ use serde_json::Value;
 use w2v_bert_uk::audio::WaveformAugmentConfig;
 use w2v_bert_uk::paraformer::ParaformerAlignmentMode;
 use w2v_bert_uk::train::{
-    AdaptiveBatchConfig, AdaptiveBatchUnit, BurnTrainConfig, SpecAugmentConfig, TrainArchitecture,
-    TrainBackendKind, TrainPrecision, extract_feature_records,
+    AdaptiveBatchConfig, AdaptiveBatchUnit, BurnTrainConfig, FeatureExtractionProgress,
+    SpecAugmentConfig, TrainArchitecture, TrainBackendKind, TrainPrecision,
+    extract_feature_records, extract_feature_records_with_progress,
     feature_extractor_for_train_architecture, run_burn_training,
 };
 
@@ -317,6 +324,10 @@ struct RunArgs {
     #[arg(long)]
     mixed_precision: bool,
 
+    /// Show a live terminal UI with batch, throughput, loss, and validation metrics.
+    #[arg(long)]
+    tui: bool,
+
     /// Upload checkpoint_latest to Hugging Face after each checkpoint save.
     #[arg(long)]
     hf_upload_checkpoints: bool,
@@ -470,6 +481,10 @@ struct ExtractFeaturesArgs {
     /// Limit number of output records.
     #[arg(long)]
     max_samples: Option<usize>,
+
+    /// Show a live terminal UI while decoding audio and writing feature rows.
+    #[arg(long)]
+    tui: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -626,6 +641,7 @@ fn run_training(args: RunArgs) -> Result<()> {
         device_index: args.device_index,
         device_indices,
         precision,
+        tui: args.tui,
         hf_upload_checkpoints: args.hf_upload_checkpoints,
         hf_upload_repo_id: args.hf_upload_repo_id,
         hf_upload_revision: args.hf_upload_revision,
@@ -887,6 +903,11 @@ fn run_feature_extraction(args: ExtractFeaturesArgs) -> Result<()> {
     let architecture = resolve_extract_architecture(&args);
     let frontend = feature_extractor_for_train_architecture(architecture);
     let mut records = Vec::new();
+    let mut tui = if args.tui {
+        Some(ExtractionTui::new(&args.output)?)
+    } else {
+        None
+    };
     for input in &args.inputs {
         let remaining = args
             .max_samples
@@ -894,24 +915,149 @@ fn run_feature_extraction(args: ExtractFeaturesArgs) -> Result<()> {
         if remaining == Some(0) {
             break;
         }
-        records.extend(extract_feature_records(
-            input,
-            remaining,
-            args.tokenizer.as_deref(),
-            &frontend,
-            max_audio_duration_ms,
-        )?);
+        if let Some(tui) = tui.as_mut() {
+            let extracted = extract_feature_records_with_progress(
+                input,
+                remaining,
+                args.tokenizer.as_deref(),
+                &frontend,
+                max_audio_duration_ms,
+                |progress| tui.update(progress),
+            )?;
+            records.extend(extracted);
+        } else {
+            records.extend(extract_feature_records(
+                input,
+                remaining,
+                args.tokenizer.as_deref(),
+                &frontend,
+                max_audio_duration_ms,
+            )?);
+        }
     }
     if records.is_empty() {
         bail!("no records were extracted");
     }
     write_feature_records_parquet(&records, &args.output)?;
+    if let Some(tui) = tui.as_mut() {
+        tui.finish(records.len())?;
+    }
+    drop(tui);
     println!(
         "wrote {} feature records to {}",
         records.len(),
         args.output.display()
     );
     Ok(())
+}
+
+struct ExtractionTui {
+    started: std::time::Instant,
+    stdout: std::io::Stdout,
+    output: PathBuf,
+    records: usize,
+    skipped_duration: usize,
+    input: Option<PathBuf>,
+    last_id: Option<String>,
+    last_rows: Option<usize>,
+    last_duration_ms: Option<usize>,
+    done: bool,
+}
+
+impl ExtractionTui {
+    fn new(output: &Path) -> Result<Self> {
+        let mut stdout = std::io::stdout();
+        execute!(stdout, EnterAlternateScreen, Hide, Clear(ClearType::All))
+            .context("failed to initialize extraction TUI")?;
+        let mut tui = Self {
+            started: std::time::Instant::now(),
+            stdout,
+            output: output.to_path_buf(),
+            records: 0,
+            skipped_duration: 0,
+            input: None,
+            last_id: None,
+            last_rows: None,
+            last_duration_ms: None,
+            done: false,
+        };
+        tui.draw()?;
+        Ok(tui)
+    }
+
+    fn update(&mut self, progress: &FeatureExtractionProgress) -> Result<()> {
+        self.input = Some(progress.input.clone());
+        self.records = progress.records;
+        self.skipped_duration = progress.skipped_duration;
+        self.last_id = progress.last_id.clone();
+        self.last_rows = progress.last_rows;
+        self.last_duration_ms = progress.last_duration_ms;
+        self.draw()
+    }
+
+    fn finish(&mut self, records: usize) -> Result<()> {
+        self.records = records;
+        self.done = true;
+        self.draw()
+    }
+
+    fn draw(&mut self) -> Result<()> {
+        queue!(
+            self.stdout,
+            MoveTo(0, 0),
+            Clear(ClearType::All),
+            SetForegroundColor(Color::Cyan),
+            SetAttribute(Attribute::Bold),
+            Print("w2v-bert-uk feature extraction monitor\n"),
+            ResetColor,
+            SetAttribute(Attribute::Reset),
+            Print(format!("output: {}\n", self.output.display())),
+            Print(format!(
+                "elapsed: {:.1}s   status: {}\n\n",
+                self.started.elapsed().as_secs_f64(),
+                if self.done { "complete" } else { "extracting" }
+            )),
+            SetForegroundColor(Color::Yellow),
+            Print("Progress\n"),
+            ResetColor,
+            Print(format!(
+                "  input: {}\n",
+                self.input
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            )),
+            Print(format!(
+                "  records: {}   skipped_duration: {}\n",
+                self.records, self.skipped_duration
+            )),
+            Print(format!(
+                "  last_id: {}   rows: {}   duration_ms: {}\n",
+                self.last_id.as_deref().unwrap_or("-"),
+                fmt_optional_usize(self.last_rows),
+                fmt_optional_usize(self.last_duration_ms)
+            )),
+            SetForegroundColor(Color::DarkGrey),
+            Print("\nPress Ctrl-C to stop.\n"),
+            ResetColor
+        )
+        .context("failed to draw extraction TUI")?;
+        self.stdout
+            .flush()
+            .context("failed to flush extraction TUI")
+    }
+}
+
+impl Drop for ExtractionTui {
+    fn drop(&mut self) {
+        let _ = execute!(self.stdout, Show, LeaveAlternateScreen);
+    }
+}
+
+fn fmt_optional_usize(value: Option<usize>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn write_feature_records_parquet(

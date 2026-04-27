@@ -123,11 +123,14 @@ cargo run --release --bin train -- extract-features \
   --output data/features-w2v.parquet \
   --architecture w2v-bert \
   --tokenizer tokenizer.model \
-  --max-audio-duration-sec 20
+  --max-audio-duration-sec 20 \
+  --tui
 ```
 
 Pass `--input` multiple times for multiple shards. Use `--max-samples` for a
-bounded preprocessing run.
+bounded preprocessing run. `--tui` opens a live terminal monitor for decoded
+records, skipped long samples, the current input shard, and the last extracted
+sample.
 
 ## Build Modes
 
@@ -462,6 +465,7 @@ Inside the process, those visible GPUs are addressed as `0,1`.
 | `--log-every <N>` | `10` | Log every N optimizer steps. |
 | `--dry-run` | false | Forward/loss only; skip optimizer updates. Useful for smoke tests. |
 | `--max-train-samples <N>` | unset | Limit training samples. Useful for smoke tests. |
+| `--tui` | false | Open a live terminal UI showing batch extraction/loading, throughput, training loss, and validation metrics. |
 | `--hf-upload-checkpoints` | false | Upload `checkpoint_latest/` and `checkpoint_latest.json` after each checkpoint save. |
 | `--hf-upload-repo-id <ID>` | unset | Hugging Face model repository for checkpoint uploads. Required with `--hf-upload-checkpoints`. |
 | `--hf-upload-revision <REV>` | unset | Optional branch/revision for checkpoint uploads. |

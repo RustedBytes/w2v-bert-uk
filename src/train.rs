@@ -19,6 +19,12 @@ use burn_optim::{
     AdamW, AdamWConfig, GradientsAccumulator, GradientsParams, Optimizer,
     adaptor::OptimizerAdaptor, grad_clipping::GradientClippingConfig,
 };
+use crossterm::{
+    cursor::{Hide, MoveTo, Show},
+    execute, queue,
+    style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
+    terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
+};
 use kenlm::{Config as KenlmConfig, Model as KenlmModel};
 use polars::prelude::{AnyValue, DataFrame, ParquetReader, SerReader, Series};
 use rand::Rng;
@@ -160,6 +166,7 @@ pub struct BurnTrainConfig {
     pub device_index: usize,
     pub device_indices: Vec<usize>,
     pub precision: TrainPrecision,
+    pub tui: bool,
     pub hf_upload_checkpoints: bool,
     pub hf_upload_repo_id: Option<String>,
     pub hf_upload_revision: Option<String>,
@@ -224,6 +231,7 @@ impl Default for BurnTrainConfig {
             device_index: 0,
             device_indices: vec![0],
             precision: TrainPrecision::F32,
+            tui: false,
             hf_upload_checkpoints: false,
             hf_upload_repo_id: None,
             hf_upload_revision: None,
@@ -3466,11 +3474,40 @@ pub fn extract_feature_records(
     audio_frontend: &FeatureExtractorConfig,
     max_audio_duration_ms: Option<usize>,
 ) -> Result<Vec<FeatureRecord>> {
+    extract_feature_records_with_progress(
+        path,
+        limit,
+        tokenizer_path,
+        audio_frontend,
+        max_audio_duration_ms,
+        |_| Ok(()),
+    )
+}
+
+#[derive(Clone, Debug)]
+pub struct FeatureExtractionProgress {
+    pub input: PathBuf,
+    pub records: usize,
+    pub skipped_duration: usize,
+    pub last_id: Option<String>,
+    pub last_rows: Option<usize>,
+    pub last_duration_ms: Option<usize>,
+}
+
+pub fn extract_feature_records_with_progress(
+    path: &Path,
+    limit: Option<usize>,
+    tokenizer_path: Option<&Path>,
+    audio_frontend: &FeatureExtractorConfig,
+    max_audio_duration_ms: Option<usize>,
+    mut on_progress: impl FnMut(&FeatureExtractionProgress) -> Result<()>,
+) -> Result<Vec<FeatureRecord>> {
     let files = manifest_files(path)?;
     let tokenizer = tokenizer_path
         .map(load_sentencepiece_transcript_tokenizer)
         .transpose()?;
     let mut records = Vec::new();
+    let mut skipped_duration = 0usize;
     let audio_decode = AudioDecodeConfig::default();
     for file in files {
         if limit.is_some_and(|limit| records.len() >= limit) {
@@ -3478,7 +3515,7 @@ pub fn extract_feature_records(
         }
         let base_dir = file.parent().unwrap_or_else(|| Path::new("."));
         let raw_lines = if is_audio_dataset_file(&file) {
-            vec![RawManifestLine::from_audio_path(file)]
+            vec![RawManifestLine::from_audio_path(file.clone())]
         } else if is_parquet_file(&file) {
             parquet_raw_lines(&file)?
         } else {
@@ -3513,9 +3550,27 @@ pub fn extract_feature_records(
                 WaveformAugmentConfig::default(),
             )?;
             if max_audio_duration_ms.is_some_and(|max| record.duration_ms > max) {
+                skipped_duration += 1;
+                on_progress(&FeatureExtractionProgress {
+                    input: file.clone(),
+                    records: records.len(),
+                    skipped_duration,
+                    last_id: Some(record.id),
+                    last_rows: Some(record.rows),
+                    last_duration_ms: Some(record.duration_ms),
+                })?;
                 continue;
             }
+            let progress = FeatureExtractionProgress {
+                input: file.clone(),
+                records: records.len() + 1,
+                skipped_duration,
+                last_id: Some(record.id.clone()),
+                last_rows: Some(record.rows),
+                last_duration_ms: Some(record.duration_ms),
+            };
             records.push(record);
+            on_progress(&progress)?;
         }
     }
     if records.is_empty() {
@@ -5480,6 +5535,7 @@ struct RunLogger<'a> {
     config: &'a BurnTrainConfig,
     file: fs::File,
     started: Instant,
+    tui: Option<TrainingTui>,
 }
 
 impl<'a> RunLogger<'a> {
@@ -5496,10 +5552,16 @@ impl<'a> RunLogger<'a> {
             .append(true)
             .open(&path)
             .with_context(|| format!("failed to open structured log {}", path.display()))?;
+        let tui = if config.tui {
+            Some(TrainingTui::new(config, started)?)
+        } else {
+            None
+        };
         Ok(Self {
             config,
             file,
             started,
+            tui,
         })
     }
 
@@ -5514,7 +5576,7 @@ impl<'a> RunLogger<'a> {
         writeln!(
             self.file,
             "{}",
-            serde_json::to_string(&structured_event(event, payload))?
+            serde_json::to_string(&structured_event(event, payload.clone()))?
         )
         .with_context(|| {
             format!(
@@ -5527,8 +5589,190 @@ impl<'a> RunLogger<'a> {
                 "failed to flush structured log {}",
                 structured_log_path(self.config).display()
             )
-        })
+        })?;
+        if let Some(tui) = self.tui.as_mut() {
+            tui.update(event, &payload)?;
+        }
+        Ok(())
     }
+}
+
+#[derive(Default)]
+struct TuiMetrics {
+    epoch: Option<usize>,
+    step: Option<usize>,
+    phase: String,
+    train_loss: Option<f64>,
+    train_ctc_loss: Option<f64>,
+    train_ce_loss: Option<f64>,
+    val_loss: Option<f64>,
+    val_cer: Option<f64>,
+    val_wer: Option<f64>,
+    learning_rate: Option<f64>,
+    samples: Option<usize>,
+    max_frames: Option<usize>,
+    padded_frames: Option<usize>,
+    padding_ratio: Option<f64>,
+    samples_per_sec: Option<f64>,
+    frames_per_sec: Option<f64>,
+    last_event: String,
+}
+
+struct TrainingTui {
+    started: Instant,
+    stdout: std::io::Stdout,
+    architecture: String,
+    output_dir: PathBuf,
+    metrics: TuiMetrics,
+}
+
+impl TrainingTui {
+    fn new(config: &BurnTrainConfig, started: Instant) -> Result<Self> {
+        let mut stdout = std::io::stdout();
+        execute!(stdout, EnterAlternateScreen, Hide, Clear(ClearType::All))
+            .context("failed to initialize training TUI")?;
+        let mut tui = Self {
+            started,
+            stdout,
+            architecture: architecture_name(&config.architecture).to_string(),
+            output_dir: config.output_dir.clone(),
+            metrics: TuiMetrics {
+                phase: "starting".to_string(),
+                ..TuiMetrics::default()
+            },
+        };
+        tui.draw()?;
+        Ok(tui)
+    }
+
+    fn update(&mut self, event: &str, payload: &Value) -> Result<()> {
+        self.metrics.last_event = event.to_string();
+        match event {
+            "run_start" => self.metrics.phase = "training".to_string(),
+            "batch_start" => {
+                self.metrics.phase = "loading batch / extracting audio".to_string();
+                self.metrics.epoch = json_usize(payload, "epoch");
+                self.metrics.step = json_usize(payload, "next_step");
+                if let Some(batch) = payload.get("batch") {
+                    self.metrics.samples = json_usize(batch, "samples");
+                    self.metrics.max_frames = json_usize(batch, "max_frames");
+                    self.metrics.padded_frames = json_usize(batch, "padded_frames");
+                    self.metrics.padding_ratio = json_f64(batch, "padding_ratio");
+                }
+            }
+            "train_step" => {
+                self.metrics.phase = "training".to_string();
+                self.metrics.epoch = json_usize(payload, "epoch");
+                self.metrics.step = json_usize(payload, "global_step");
+                self.metrics.learning_rate = json_f64(payload, "learning_rate");
+                if let Some(losses) = payload.get("losses") {
+                    self.metrics.train_loss = json_f64(losses, "total")
+                        .or_else(|| json_f64(losses, "ctc"))
+                        .or(self.metrics.train_loss);
+                    self.metrics.train_ctc_loss =
+                        json_f64(losses, "ctc").or(self.metrics.train_ctc_loss);
+                    self.metrics.train_ce_loss =
+                        json_f64(losses, "ce").or(self.metrics.train_ce_loss);
+                }
+                if let Some(throughput) = payload.get("throughput") {
+                    self.metrics.samples_per_sec = json_f64(throughput, "samples_per_sec");
+                    self.metrics.frames_per_sec = json_f64(throughput, "frames_per_sec");
+                }
+            }
+            "validation" => {
+                self.metrics.phase = "validation".to_string();
+                self.metrics.epoch = json_usize(payload, "epoch").or(self.metrics.epoch);
+                self.metrics.step = json_usize(payload, "global_step").or(self.metrics.step);
+                self.metrics.val_loss = json_f64(payload, "loss");
+                self.metrics.val_cer = json_f64(payload, "cer");
+                self.metrics.val_wer = json_f64(payload, "wer");
+            }
+            "checkpoint_saved" => self.metrics.phase = "checkpoint saved".to_string(),
+            "run_complete" => self.metrics.phase = "complete".to_string(),
+            _ => {}
+        }
+        self.draw()
+    }
+
+    fn draw(&mut self) -> Result<()> {
+        queue!(
+            self.stdout,
+            MoveTo(0, 0),
+            Clear(ClearType::All),
+            SetForegroundColor(Color::Cyan),
+            SetAttribute(Attribute::Bold),
+            Print("w2v-bert-uk training monitor\n"),
+            ResetColor,
+            SetAttribute(Attribute::Reset),
+            Print(format!("architecture: {}\n", self.architecture)),
+            Print(format!("output: {}\n", self.output_dir.display())),
+            Print(format!(
+                "elapsed: {:.1}s   phase: {}   event: {}\n\n",
+                self.started.elapsed().as_secs_f64(),
+                self.metrics.phase,
+                self.metrics.last_event
+            )),
+            SetForegroundColor(Color::Yellow),
+            Print("Progress\n"),
+            ResetColor,
+            Print(format!(
+                "  epoch: {}   step: {}   lr: {}\n",
+                fmt_opt_usize(self.metrics.epoch),
+                fmt_opt_usize(self.metrics.step),
+                fmt_opt_f64(self.metrics.learning_rate, 8)
+            )),
+            Print(format!(
+                "  samples: {}   max_frames: {}   padded_frames: {}   padding_ratio: {}\n",
+                fmt_opt_usize(self.metrics.samples),
+                fmt_opt_usize(self.metrics.max_frames),
+                fmt_opt_usize(self.metrics.padded_frames),
+                fmt_opt_f64(self.metrics.padding_ratio, 3)
+            )),
+            Print(format!(
+                "  samples/sec: {}   frames/sec: {}\n\n",
+                fmt_opt_f64(self.metrics.samples_per_sec, 2),
+                fmt_opt_f64(self.metrics.frames_per_sec, 0)
+            )),
+            SetForegroundColor(Color::Green),
+            Print("Loss\n"),
+            ResetColor,
+            Print(format!(
+                "  train: {}   ctc: {}   ce: {}\n",
+                fmt_opt_f64(self.metrics.train_loss, 6),
+                fmt_opt_f64(self.metrics.train_ctc_loss, 6),
+                fmt_opt_f64(self.metrics.train_ce_loss, 6)
+            )),
+            Print(format!(
+                "  val: {}   cer: {}   wer: {}\n\n",
+                fmt_opt_f64(self.metrics.val_loss, 6),
+                fmt_opt_f64(self.metrics.val_cer, 6),
+                fmt_opt_f64(self.metrics.val_wer, 6)
+            )),
+            SetForegroundColor(Color::DarkGrey),
+            Print("Press Ctrl-C to stop. Structured events are still written to events.jsonl.\n"),
+            ResetColor
+        )
+        .context("failed to draw training TUI")?;
+        self.stdout.flush().context("failed to flush training TUI")
+    }
+}
+
+impl Drop for TrainingTui {
+    fn drop(&mut self) {
+        let _ = execute!(self.stdout, Show, LeaveAlternateScreen);
+    }
+}
+
+fn fmt_opt_usize(value: Option<usize>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn fmt_opt_f64(value: Option<f64>, decimals: usize) -> String {
+    value
+        .map(|value| format!("{value:.decimals$}"))
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn architecture_name(architecture: &TrainArchitecture) -> &'static str {
@@ -5665,6 +5909,7 @@ fn run_config_json(config: &BurnTrainConfig) -> Value {
             TrainPrecision::F16 => "f16",
             TrainPrecision::Bf16 => "bf16",
         },
+        "tui": config.tui,
         "hf_upload_checkpoints": config.hf_upload_checkpoints,
         "hf_upload_repo_id": config.hf_upload_repo_id,
         "hf_upload_revision": config.hf_upload_revision,
@@ -5819,6 +6064,7 @@ fn train_config_from_json(value: &Value) -> Result<BurnTrainConfig> {
         .unwrap_or("f32")
         .parse()
         .unwrap_or(TrainPrecision::F32);
+    config.tui = json_bool(value, "tui").unwrap_or(config.tui);
     config.hf_upload_checkpoints =
         json_bool(value, "hf_upload_checkpoints").unwrap_or(config.hf_upload_checkpoints);
     config.hf_upload_repo_id = value
