@@ -5,9 +5,11 @@ use burn_nn::attention::{MhaInput, MultiHeadAttention, MultiHeadAttentionConfig}
 use burn_nn::conv::{Conv1d, Conv1dConfig, Conv2d, Conv2dConfig};
 use burn_nn::transformer::{TransformerDecoder, TransformerDecoderConfig, TransformerDecoderInput};
 use burn_nn::{
-    BatchNorm, BatchNormConfig, Dropout, DropoutConfig, Embedding, EmbeddingConfig, LayerNorm,
-    LayerNormConfig, Linear, LinearConfig, PaddingConfig1d, PaddingConfig2d,
+    Dropout, DropoutConfig, Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear,
+    LinearConfig, PaddingConfig1d, PaddingConfig2d,
 };
+
+use crate::squeezeformer::PositiveLossBatchNorm1d;
 
 #[derive(Clone, Debug)]
 pub struct ParaformerV2Config {
@@ -380,7 +382,7 @@ impl ConformerBlockConfig {
                     self.kernel_size / 2,
                 ))
                 .init(device),
-            batch_norm: BatchNormConfig::new(self.dim).init(device),
+            batch_norm: PositiveLossBatchNorm1d::new(self.dim, device),
             conv_out: Conv1dConfig::new(self.dim, self.dim, 1).init(device),
             conv_dropout: DropoutConfig::new(self.dropout).init(),
             ff2: FeedForwardConfig {
@@ -403,7 +405,7 @@ struct ConformerBlock<B: Backend> {
     conv_norm: LayerNorm<B>,
     conv_in: Conv1d<B>,
     depthwise: Conv1d<B>,
-    batch_norm: BatchNorm<B>,
+    batch_norm: PositiveLossBatchNorm1d<B>,
     conv_out: Conv1d<B>,
     conv_dropout: Dropout,
     ff2: FeedForward<B>,

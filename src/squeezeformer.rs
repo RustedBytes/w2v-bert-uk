@@ -414,7 +414,7 @@ pub struct PositiveLossBatchNorm1d<B: Backend> {
 }
 
 impl<B: Backend> PositiveLossBatchNorm1d<B> {
-    fn new(num_features: usize, device: &B::Device) -> Self {
+    pub(crate) fn new(num_features: usize, device: &B::Device) -> Self {
         Self {
             gamma: Initializer::Ones.init([num_features], device),
             beta: Initializer::Zeros.init([num_features], device),
@@ -429,7 +429,7 @@ impl<B: Backend> PositiveLossBatchNorm1d<B> {
         }
     }
 
-    fn forward(&self, input: Tensor<B, 3>) -> Tensor<B, 3> {
+    pub(crate) fn forward(&self, input: Tensor<B, 3>) -> Tensor<B, 3> {
         if B::ad_enabled(&input.device()) {
             self.forward_train(input)
         } else {

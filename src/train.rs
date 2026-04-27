@@ -6830,9 +6830,7 @@ where
         let shape = view.shape().to_vec();
         let values = f32_values_from_safetensor(view.data())?;
         let data = TensorData::new(values, shape);
-        for alias in safetensor_name_aliases(name) {
-            weights.entry(alias).or_insert_with(|| data.clone());
-        }
+        insert_warm_start_aliases(&mut weights, name, data);
     }
 
     let mut mapper = WarmStartMapper::<B> {
@@ -6883,6 +6881,88 @@ fn safetensor_name_aliases(name: &str) -> Vec<String> {
     aliases.sort();
     aliases.dedup();
     aliases
+}
+
+fn insert_warm_start_aliases(
+    weights: &mut HashMap<String, TensorData>,
+    name: &str,
+    data: TensorData,
+) {
+    for alias in safetensor_name_aliases(name) {
+        weights.entry(alias).or_insert_with(|| data.clone());
+    }
+    for (alias, alias_data) in paraformer_split_in_proj_aliases(name, &data) {
+        weights.entry(alias).or_insert(alias_data);
+    }
+}
+
+fn paraformer_split_in_proj_aliases(name: &str, data: &TensorData) -> Vec<(String, TensorData)> {
+    let Some(prefix) = name
+        .strip_suffix(".in_proj_weight")
+        .or_else(|| name.strip_suffix(".in_proj_bias"))
+    else {
+        return Vec::new();
+    };
+    let Some(target_prefix) = paraformer_in_proj_target_prefix(prefix) else {
+        return Vec::new();
+    };
+    let shape = data.shape.as_slice();
+    let is_weight = name.ends_with(".in_proj_weight");
+    let Ok(values) = data.clone().into_vec::<f32>() else {
+        return Vec::new();
+    };
+    let projections = ["query", "key", "value"];
+    if is_weight {
+        if shape.len() != 2 || shape[0] % 3 != 0 {
+            return Vec::new();
+        }
+        let rows = shape[0] / 3;
+        let cols = shape[1];
+        let mut aliases = Vec::with_capacity(3);
+        for (index, projection) in projections.iter().enumerate() {
+            let start = index * rows * cols;
+            let end = start + rows * cols;
+            aliases.push((
+                format!("{target_prefix}.{projection}.weight"),
+                TensorData::new(values[start..end].to_vec(), [rows, cols]),
+            ));
+        }
+        aliases
+    } else {
+        if shape.len() != 1 || shape[0] % 3 != 0 {
+            return Vec::new();
+        }
+        let len = shape[0] / 3;
+        let mut aliases = Vec::with_capacity(3);
+        for (index, projection) in projections.iter().enumerate() {
+            let start = index * len;
+            let end = start + len;
+            aliases.push((
+                format!("{target_prefix}.{projection}.bias"),
+                TensorData::new(values[start..end].to_vec(), [len]),
+            ));
+        }
+        aliases
+    }
+}
+
+fn paraformer_in_proj_target_prefix(prefix: &str) -> Option<String> {
+    if let Some(layer) = prefix
+        .strip_prefix("encoder.layers.")
+        .and_then(|suffix| suffix.strip_suffix(".self_attn"))
+    {
+        return Some(format!("encoder.layers.{layer}.self_attn"));
+    }
+    let parts = prefix.split('.').collect::<Vec<_>>();
+    if parts.len() == 4 && parts[0] == "decoder" && parts[1] == "layers" {
+        let layer = parts[2];
+        return match parts[3] {
+            "self_attn" => Some(format!("decoder.layers.{layer}.self_attn")),
+            "multihead_attn" => Some(format!("decoder.layers.{layer}.cross_attn")),
+            _ => None,
+        };
+    }
+    None
 }
 
 struct WarmStartMapper<'a, B: AutodiffBackend> {
@@ -6980,8 +7060,11 @@ fn should_transpose_warm_start_2d(path: &str) -> bool {
         && (path == "classifier.weight"
             || path.contains("input_projection.")
             || path.contains("feature_projection.projection.")
+            || path.contains("encoder.subsampling.projection.")
             || path.contains(".attention.")
             || path.contains(".mha.")
+            || path.contains(".ff1.linear_")
+            || path.contains(".ff2.linear_")
             || path.contains(".linear_q.")
             || path.contains(".linear_k.")
             || path.contains(".linear_v.")
@@ -6990,6 +7073,11 @@ fn should_transpose_warm_start_2d(path: &str) -> bool {
             || path.contains(".output_dense.")
             || path.contains(".feed_forward.")
             || path.contains(".pwff.")
+            || path.contains(".self_attn.")
+            || path.contains(".cross_attn.")
+            || path == "ctc_projection.weight"
+            || path == "posterior_embed.weight"
+            || path == "decoder_projection.weight"
             || path.contains("time_recovery.projection."))
 }
 
@@ -6999,6 +7087,9 @@ fn warm_start_name_candidates(path: &str) -> Vec<String> {
         candidates.push(alias);
     }
     if let Some(alias) = wav2vec_positiveloss_alias(path) {
+        candidates.push(alias);
+    }
+    if let Some(alias) = paraformer_positiveloss_alias(path) {
         candidates.push(alias);
     }
     candidates.sort();
@@ -7039,6 +7130,121 @@ fn squeezeformer_positiveloss_alias(path: &str) -> Option<String> {
         return squeezeformer_conv_ff_alias(block, &rest[1..]);
     }
     None
+}
+
+fn paraformer_positiveloss_alias(path: &str) -> Option<String> {
+    if let Some(suffix) = path.strip_prefix("encoder.subsampling.conv1.") {
+        return Some(format!("encoder.subsampling.conv.0.{suffix}"));
+    }
+    if let Some(suffix) = path.strip_prefix("encoder.subsampling.conv2.") {
+        return Some(format!("encoder.subsampling.conv.2.{suffix}"));
+    }
+    if let Some(suffix) = path.strip_prefix("encoder.subsampling.projection.") {
+        return Some(format!("encoder.subsampling.proj.{suffix}"));
+    }
+
+    let parts = path.split('.').collect::<Vec<_>>();
+    if parts.len() >= 5 && parts[0] == "encoder" && parts[1] == "layers" {
+        let layer = parts[2];
+        let rest = &parts[3..];
+        return paraformer_encoder_layer_alias(layer, rest);
+    }
+    if parts.len() >= 4 && parts[0] == "decoder" && parts[1] == "layers" {
+        let layer = parts[2];
+        let rest = &parts[3..];
+        return paraformer_decoder_layer_alias(layer, rest);
+    }
+    None
+}
+
+fn paraformer_encoder_layer_alias(layer: &str, rest: &[&str]) -> Option<String> {
+    match rest {
+        ["ff1", "norm", suffix] => Some(format!(
+            "encoder.layers.{layer}.ff1.net.0.{}",
+            layer_norm_suffix_alias(suffix)
+        )),
+        ["ff1", "linear_in", tail @ ..] => Some(format!(
+            "encoder.layers.{layer}.ff1.net.1.{}",
+            tail.join(".")
+        )),
+        ["ff1", "linear_out", tail @ ..] => Some(format!(
+            "encoder.layers.{layer}.ff1.net.4.{}",
+            tail.join(".")
+        )),
+        ["self_attn_norm", suffix] => Some(format!(
+            "encoder.layers.{layer}.self_attn_norm.{}",
+            layer_norm_suffix_alias(suffix)
+        )),
+        ["self_attn", "output", tail @ ..] => Some(format!(
+            "encoder.layers.{layer}.self_attn.out_proj.{}",
+            tail.join(".")
+        )),
+        ["conv_norm", suffix] => Some(format!(
+            "encoder.layers.{layer}.conv_norm.{}",
+            layer_norm_suffix_alias(suffix)
+        )),
+        ["conv_in", tail @ ..] => Some(format!("encoder.layers.{layer}.conv.0.{}", tail.join("."))),
+        ["depthwise", tail @ ..] => {
+            Some(format!("encoder.layers.{layer}.conv.2.{}", tail.join(".")))
+        }
+        ["batch_norm", "gamma"] => Some(format!("encoder.layers.{layer}.conv.3.weight")),
+        ["batch_norm", "beta"] => Some(format!("encoder.layers.{layer}.conv.3.bias")),
+        ["batch_norm", tail @ ..] => {
+            Some(format!("encoder.layers.{layer}.conv.3.{}", tail.join(".")))
+        }
+        ["conv_out", tail @ ..] => {
+            Some(format!("encoder.layers.{layer}.conv.5.{}", tail.join(".")))
+        }
+        ["ff2", "norm", suffix] => Some(format!(
+            "encoder.layers.{layer}.ff2.net.0.{}",
+            layer_norm_suffix_alias(suffix)
+        )),
+        ["ff2", "linear_in", tail @ ..] => Some(format!(
+            "encoder.layers.{layer}.ff2.net.1.{}",
+            tail.join(".")
+        )),
+        ["ff2", "linear_out", tail @ ..] => Some(format!(
+            "encoder.layers.{layer}.ff2.net.4.{}",
+            tail.join(".")
+        )),
+        ["final_norm", suffix] => Some(format!(
+            "encoder.layers.{layer}.final_norm.{}",
+            layer_norm_suffix_alias(suffix)
+        )),
+        _ => None,
+    }
+}
+
+fn paraformer_decoder_layer_alias(layer: &str, rest: &[&str]) -> Option<String> {
+    match rest {
+        ["self_attn", "output", tail @ ..] => Some(format!(
+            "decoder.layers.{layer}.self_attn.out_proj.{}",
+            tail.join(".")
+        )),
+        ["cross_attn", "output", tail @ ..] => Some(format!(
+            "decoder.layers.{layer}.multihead_attn.out_proj.{}",
+            tail.join(".")
+        )),
+        ["pwff", "linear_inner", tail @ ..] => {
+            Some(format!("decoder.layers.{layer}.linear1.{}", tail.join(".")))
+        }
+        ["pwff", "linear_outer", tail @ ..] => {
+            Some(format!("decoder.layers.{layer}.linear2.{}", tail.join(".")))
+        }
+        ["norm_1", suffix] => Some(format!(
+            "decoder.layers.{layer}.norm1.{}",
+            layer_norm_suffix_alias(suffix)
+        )),
+        ["norm_2", suffix] => Some(format!(
+            "decoder.layers.{layer}.norm2.{}",
+            layer_norm_suffix_alias(suffix)
+        )),
+        ["norm_3", suffix] => Some(format!(
+            "decoder.layers.{layer}.norm3.{}",
+            layer_norm_suffix_alias(suffix)
+        )),
+        _ => None,
+    }
 }
 
 fn wav2vec_positiveloss_alias(path: &str) -> Option<String> {
