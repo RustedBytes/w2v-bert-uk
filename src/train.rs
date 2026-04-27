@@ -5088,6 +5088,28 @@ fn parse_json_record(
 ) -> Result<FeatureRecord> {
     let value: Value = serde_json::from_str(line)
         .with_context(|| format!("invalid JSON manifest line {line_number}"))?;
+    if let Some(parquet_path) = value.get("parquet_path").and_then(Value::as_str) {
+        let row = value
+            .get("parquet_row")
+            .or_else(|| value.get("row"))
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                anyhow!(
+                    "JSON manifest line {line_number} parquet reference must include parquet_row"
+                )
+            })? as usize;
+        let parquet_path = resolve_path(base_dir, parquet_path);
+        let parquet_base_dir = parquet_path.parent().unwrap_or_else(|| Path::new("."));
+        return parse_parquet_record(
+            &parquet_path,
+            row,
+            parquet_base_dir,
+            tokenizer,
+            audio_decode,
+            audio_frontend,
+            waveform_augment,
+        );
+    }
     let id = value
         .get("id")
         .and_then(Value::as_str)
@@ -5234,6 +5256,15 @@ fn parse_json_record_metadata(line: &str, line_number: usize) -> Result<(String,
             .and_then(Value::as_u64)
             .map(|v| v as usize);
         let (rows, _cols) = inline_feature_shape(features, rows, cols, &id)?;
+        return Ok((id, rows));
+    }
+
+    if value.get("parquet_path").and_then(Value::as_str).is_some() {
+        let rows = value
+            .get("rows")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or(usize::MAX);
         return Ok((id, rows));
     }
 

@@ -16,7 +16,7 @@ use polars::prelude::{
     AnyValue, DataFrame, IntoColumn, IntoSeries, ListChunked, NamedFrom, ParquetReader,
     ParquetWriter, SerReader, Series,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use w2v_bert_uk::audio::{FeatureExtractorConfig, WaveformAugmentConfig};
 use w2v_bert_uk::paraformer::ParaformerAlignmentMode;
 use w2v_bert_uk::train::{
@@ -826,13 +826,280 @@ fn resolve_manifest_paths(args: &RunArgs) -> Result<(PathBuf, Option<PathBuf>)> 
                 .map(|name| manifest_dir.join(name))
                 .find(|path| path.exists())
         });
-        return Ok((train_manifest, val_manifest));
+        return resolve_auto_validation_split(train_manifest, val_manifest, &args.output_dir);
     }
 
     let train_manifest = args.train_manifest.clone().ok_or_else(|| {
         anyhow::anyhow!("--train-manifest is required unless --manifest-dir is provided")
     })?;
-    Ok((train_manifest, args.val_manifest.clone()))
+    resolve_auto_validation_split(train_manifest, args.val_manifest.clone(), &args.output_dir)
+}
+
+fn resolve_auto_validation_split(
+    train_manifest: PathBuf,
+    val_manifest: Option<PathBuf>,
+    output_dir: &Path,
+) -> Result<(PathBuf, Option<PathBuf>)> {
+    if val_manifest.is_some() {
+        return Ok((train_manifest, val_manifest));
+    }
+    let split_dir = output_dir.join("auto-validation-split");
+    let entries = collect_split_manifest_entries(&train_manifest)?;
+    let (train_entries, val_entries) = split_validation_entries(entries);
+    if val_entries.is_empty() {
+        log::warn!(
+            "training input {} has fewer than two splittable records; validation split disabled",
+            train_manifest.display()
+        );
+        return Ok((train_manifest, None));
+    }
+    fs::create_dir_all(&split_dir)
+        .with_context(|| format!("failed to create {}", split_dir.display()))?;
+    let split_train = split_dir.join("train.jsonl");
+    let split_val = split_dir.join("validation.jsonl");
+    fs::write(&split_train, format!("{}\n", train_entries.join("\n")))
+        .with_context(|| format!("failed to write {}", split_train.display()))?;
+    fs::write(&split_val, format!("{}\n", val_entries.join("\n")))
+        .with_context(|| format!("failed to write {}", split_val.display()))?;
+    log::info!(
+        "created automatic validation split train_records={} val_records={} dir={}",
+        train_entries.len(),
+        val_entries.len(),
+        split_dir.display()
+    );
+    Ok((split_train, Some(split_val)))
+}
+
+fn split_validation_entries(entries: Vec<String>) -> (Vec<String>, Vec<String>) {
+    let len = entries.len();
+    if len < 2 {
+        return (entries, Vec::new());
+    }
+    let val_count = ((len + 9) / 10).max(1).min(len - 1);
+    let train_cutoff = len - val_count;
+    let mut train_entries = Vec::with_capacity(train_cutoff);
+    let mut val_entries = Vec::with_capacity(val_count);
+    for (index, entry) in entries.into_iter().enumerate() {
+        if index >= train_cutoff {
+            val_entries.push(entry);
+        } else {
+            train_entries.push(entry);
+        }
+    }
+    (train_entries, val_entries)
+}
+
+fn collect_split_manifest_entries(path: &Path) -> Result<Vec<String>> {
+    if path.is_dir() {
+        let mut manifest_files = fs::read_dir(path)
+            .with_context(|| format!("failed to read manifest directory {}", path.display()))?
+            .map(|entry| {
+                entry
+                    .map(|entry| entry.path())
+                    .with_context(|| format!("failed to read entry in {}", path.display()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        manifest_files.retain(|path| is_split_manifest_file(path));
+        manifest_files.sort();
+        if manifest_files.is_empty() {
+            let mut audio_files = Vec::new();
+            collect_split_audio_files(path, &mut audio_files)?;
+            audio_files.sort();
+            return audio_files
+                .iter()
+                .map(|path| audio_split_entry(path))
+                .collect();
+        }
+
+        let mut entries = Vec::new();
+        for file in manifest_files {
+            entries.extend(collect_split_manifest_entries(&file)?);
+        }
+        return Ok(entries);
+    }
+
+    if is_split_audio_file(path) {
+        return Ok(vec![audio_split_entry(path)?]);
+    }
+    if is_split_parquet_file(path) {
+        return parquet_split_entries(path);
+    }
+    line_split_entries(path)
+}
+
+fn is_split_manifest_file(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .is_some_and(|extension| {
+                matches!(extension.as_str(), "jsonl" | "json" | "tsv" | "parquet")
+            })
+}
+
+fn is_split_parquet_file(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("parquet"))
+}
+
+fn is_split_audio_file(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .is_some_and(|extension| {
+                matches!(
+                    extension.as_str(),
+                    "wav" | "flac" | "mp3" | "ogg" | "opus" | "m4a" | "aac" | "webm"
+                )
+            })
+}
+
+fn collect_split_audio_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(dir)
+        .with_context(|| format!("failed to read audio directory {}", dir.display()))?
+    {
+        let path = entry
+            .with_context(|| format!("failed to read entry in {}", dir.display()))?
+            .path();
+        if path.is_dir() {
+            collect_split_audio_files(&path, files)?;
+        } else if is_split_audio_file(&path) {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn parquet_split_entries(path: &Path) -> Result<Vec<String>> {
+    let file = fs::File::open(path)
+        .with_context(|| format!("failed to open parquet file {}", path.display()))?;
+    let df = ParquetReader::new(file)
+        .finish()
+        .with_context(|| format!("failed to read parquet file {}", path.display()))?;
+    let path = absolute_path(path)?;
+    (0..df.height())
+        .map(|row| {
+            Ok(serde_json::to_string(&json!({
+                "parquet_path": path,
+                "parquet_row": row,
+            }))?)
+        })
+        .collect()
+}
+
+fn line_split_entries(path: &Path) -> Result<Vec<String>> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read manifest {}", path.display()))?;
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    text.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                None
+            } else {
+                Some(normalize_split_manifest_line(trimmed, base_dir))
+            }
+        })
+        .collect()
+}
+
+fn normalize_split_manifest_line(line: &str, base_dir: &Path) -> Result<String> {
+    if line.starts_with('{') {
+        let mut value =
+            serde_json::from_str::<Value>(line).context("invalid JSON manifest line")?;
+        absolutize_json_path_field(&mut value, base_dir, "features_path")?;
+        absolutize_json_path_field(&mut value, base_dir, "feature_path")?;
+        absolutize_json_path_field(&mut value, base_dir, "path")?;
+        absolutize_json_path_field(&mut value, base_dir, "audio_path")?;
+        absolutize_json_path_field(&mut value, base_dir, "audio")?;
+        return serde_json::to_string(&value).context("failed to serialize split manifest line");
+    }
+
+    let mut parts = line.split('\t').map(str::to_string).collect::<Vec<_>>();
+    if let Some(path) = parts.first_mut() {
+        *path = absolute_child_path(base_dir, path)?
+            .to_string_lossy()
+            .into_owned();
+    }
+    Ok(parts.join("\t"))
+}
+
+fn absolutize_json_path_field(value: &mut Value, base_dir: &Path, key: &str) -> Result<()> {
+    let Some(path) = value.get(key).and_then(Value::as_str).map(str::to_string) else {
+        return Ok(());
+    };
+    let absolute = absolute_child_path(base_dir, &path)?;
+    value[key] = Value::String(absolute.to_string_lossy().into_owned());
+    Ok(())
+}
+
+fn audio_split_entry(path: &Path) -> Result<String> {
+    let absolute = absolute_path(path)?;
+    let mut value = json!({
+        "id": raw_audio_split_id(path),
+        "audio_path": absolute,
+    });
+    if let Some(text) = read_first_existing_sidecar(path, &["txt", "lab", "transcript"])? {
+        value["text"] = Value::String(text.trim().to_string());
+    }
+    if let Some(tokens) = read_first_existing_sidecar(path, &["tokens", "tok"])? {
+        value["tokens"] = Value::Array(
+            tokens
+                .split(|ch: char| ch.is_whitespace() || ch == ',')
+                .filter(|token| !token.is_empty())
+                .map(|token| {
+                    token
+                        .parse::<i64>()
+                        .map(|value| Value::Number(value.into()))
+                        .with_context(|| {
+                            format!("invalid token id '{token}' for {}", path.display())
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        );
+    }
+    serde_json::to_string(&value).context("failed to serialize audio split entry")
+}
+
+fn read_first_existing_sidecar(path: &Path, extensions: &[&str]) -> Result<Option<String>> {
+    for extension in extensions {
+        let sidecar = path.with_extension(extension);
+        if sidecar.exists() {
+            return fs::read_to_string(&sidecar)
+                .with_context(|| format!("failed to read {}", sidecar.display()))
+                .map(Some);
+        }
+    }
+    Ok(None)
+}
+
+fn raw_audio_split_id(path: &Path) -> String {
+    path.with_extension("").to_string_lossy().replace('\\', "/")
+}
+
+fn absolute_child_path(base_dir: &Path, path: &str) -> Result<PathBuf> {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        absolute_path(&base_dir.join(path))
+    }
+}
+
+fn absolute_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        std::env::current_dir()
+            .context("failed to read current directory")
+            .map(|cwd| cwd.join(path))
+    }
 }
 
 fn run_tokenizer_training(args: TokenizerArgs) -> Result<()> {
@@ -1493,4 +1760,32 @@ fn write_corpus_line(writer: &mut fs::File, text: &str) -> Result<usize> {
     }
     writeln!(writer, "{text}").context("failed writing tokenizer corpus")?;
     Ok(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn automatic_validation_split_uses_about_ten_percent() {
+        let entries = (0..10).map(|index| format!("record-{index}")).collect();
+        let (train, val) = split_validation_entries(entries);
+
+        assert_eq!(train.len(), 9);
+        assert_eq!(val.len(), 1);
+        assert_eq!(val[0], "record-9");
+    }
+
+    #[test]
+    fn split_manifest_json_paths_are_absolutized() {
+        let base_dir = std::env::current_dir().unwrap().join("data");
+        let line = r#"{"id":"a","audio_path":"audio/a.wav","tokens":[1]}"#;
+        let normalized = normalize_split_manifest_line(line, &base_dir).unwrap();
+        let value: Value = serde_json::from_str(&normalized).unwrap();
+
+        assert_eq!(
+            value.get("audio_path").and_then(Value::as_str),
+            Some(base_dir.join("audio/a.wav").to_str().unwrap())
+        );
+    }
 }

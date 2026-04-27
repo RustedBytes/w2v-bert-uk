@@ -251,7 +251,9 @@ data/manifests/val.jsonl
 ```
 
 If `val.jsonl` is absent, the trainer also checks `validation.jsonl` and
-`dev.jsonl`.
+`dev.jsonl`. If no validation manifest is provided or found, the trainer writes
+an automatic split under `output-dir/auto-validation-split`, using about 10% of
+the training records for validation.
 
 ### Raw Audio Directory
 
