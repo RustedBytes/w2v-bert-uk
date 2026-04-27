@@ -36,6 +36,7 @@ mod python;
 mod ruby;
 #[cfg(feature = "scala")]
 mod scala;
+pub mod squeezeformer;
 #[cfg(feature = "swift")]
 mod swift;
 pub mod tokenizer;
