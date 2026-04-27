@@ -7072,6 +7072,20 @@ fn should_transpose_warm_start_2d(path: &str) -> bool {
             || path.contains(".intermediate_dense.")
             || path.contains(".output_dense.")
             || path.contains(".feed_forward.")
+            || path.contains(".feed_forward1.")
+            || path.contains(".feed_forward2.")
+            || path.contains(".feed_forward3.")
+            || path.contains(".attention_weights.")
+            || path.contains(".non_linear_attention.")
+            || path.contains(".self_attention1.")
+            || path.contains(".self_attention2.")
+            || path.contains(".conv1.input_proj.")
+            || path.contains(".conv1.output_proj.")
+            || path.contains(".conv2.input_proj.")
+            || path.contains(".conv2.output_proj.")
+            || path.contains(".conv_embed.convnext_in.")
+            || path.contains(".conv_embed.convnext_out.")
+            || path.contains(".conv_embed.output_projection.")
             || path.contains(".pwff.")
             || path.contains(".self_attn.")
             || path.contains(".cross_attn.")
@@ -7092,9 +7106,75 @@ fn warm_start_name_candidates(path: &str) -> Vec<String> {
     if let Some(alias) = paraformer_positiveloss_alias(path) {
         candidates.push(alias);
     }
+    if let Some(alias) = zipformer_positiveloss_alias(path) {
+        candidates.push(alias);
+    }
     candidates.sort();
     candidates.dedup();
     candidates
+}
+
+fn zipformer_positiveloss_alias(path: &str) -> Option<String> {
+    if let Some(suffix) = path.strip_prefix("encoder.conv_embed.convnext_depthwise.") {
+        return Some(format!(
+            "encoder.encoder.conv_embed.convnext.depthwise.{suffix}"
+        ));
+    }
+    if let Some(suffix) = path.strip_prefix("encoder.conv_embed.convnext_in.") {
+        return Some(format!(
+            "encoder.encoder.conv_embed.convnext.pointwise_in.{suffix}"
+        ));
+    }
+    if let Some(suffix) = path.strip_prefix("encoder.conv_embed.convnext_out.") {
+        return Some(format!(
+            "encoder.encoder.conv_embed.convnext.pointwise_out.{suffix}"
+        ));
+    }
+    if let Some(suffix) = path.strip_prefix("encoder.conv_embed.") {
+        return Some(format!("encoder.encoder.conv_embed.{suffix}"));
+    }
+    if let Some(suffix) = path.strip_prefix("encoder.output_downsample.") {
+        return Some(format!("encoder.encoder.output_downsample.{suffix}"));
+    }
+
+    let parts = path.split('.').collect::<Vec<_>>();
+    if parts.len() >= 5 && parts[0] == "encoder" && parts[1] == "stacks" {
+        let stack = parts[2];
+        let rest = &parts[3..];
+        if rest.first() == Some(&"downsample") {
+            return Some(format!("encoder.encoder.stacks.{stack}.{}", rest.join(".")));
+        }
+        if rest.first() == Some(&"output_bypass") {
+            return Some(format!("encoder.encoder.stacks.{stack}.{}", rest.join(".")));
+        }
+        if rest.first() == Some(&"blocks") && rest.len() >= 3 {
+            let block = rest[1];
+            let tail = &rest[2..];
+            let block_prefix = if stack == "0" {
+                format!("encoder.encoder.stacks.{stack}.blocks.{block}")
+            } else {
+                format!("encoder.encoder.stacks.{stack}.stack.blocks.{block}")
+            };
+            return zipformer_block_alias(&block_prefix, tail);
+        }
+    }
+    None
+}
+
+fn zipformer_block_alias(prefix: &str, rest: &[&str]) -> Option<String> {
+    match rest {
+        [
+            "feed_forward1" | "feed_forward2" | "feed_forward3",
+            "linear_in",
+            tail @ ..,
+        ] => Some(format!("{prefix}.{}.in_proj.{}", rest[0], tail.join("."))),
+        [
+            "feed_forward1" | "feed_forward2" | "feed_forward3",
+            "linear_out",
+            tail @ ..,
+        ] => Some(format!("{prefix}.{}.out_proj.{}", rest[0], tail.join("."))),
+        _ => Some(format!("{prefix}.{}", rest.join("."))),
+    }
 }
 
 fn squeezeformer_positiveloss_alias(path: &str) -> Option<String> {

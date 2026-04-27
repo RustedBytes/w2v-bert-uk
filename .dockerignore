@@ -1,0 +1,16 @@
+.git
+.venv
+target
+node_modules
+dist
+artifacts
+runs
+testdata
+*.onnx
+*.ort
+*.pt
+*.pth
+*.safetensors
+*.wav
+*.flac
+*.mp3

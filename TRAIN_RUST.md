@@ -173,6 +173,25 @@ cargo check --features asr-cubecl-kernels
 cargo run --release --features burn-cuda-backend,asr-cubecl-kernels --bin train -- ...
 ```
 
+To produce an `asr-kernel-bench` binary that runs on Colab instead of linking
+against the host system's newer glibc, build it in the pinned Ubuntu CUDA
+container. This requires Docker access on the build machine:
+
+```bash
+./scripts/build-colab-glibc.sh
+```
+
+The binary is written to `target/colab-glibc/release/asr-kernel-bench`. By
+default the container uses Ubuntu 22.04, so the resulting Linux binary links
+against glibc 2.35 instead of the host glibc. Override `COLAB_BASE_IMAGE` if a
+different Colab runtime needs an even older CUDA image, for example:
+
+```bash
+COLAB_BASE_IMAGE=nvidia/cuda:12.4.1-devel-ubuntu20.04 \
+  COLAB_GLIBC_IMAGE_TAG=w2v-bert-uk-colab-glibc:ubuntu20.04-cuda12.4 \
+  ./scripts/build-colab-glibc.sh
+```
+
 The default trainer path still uses portable Burn tensor operations unless code
 is explicitly routed through `w2v_bert_uk::cubecl_kernels`.
 

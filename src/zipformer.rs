@@ -140,7 +140,7 @@ impl ZipformerConfig {
             stacks,
             encoder_dim: self.encoder_dim.clone(),
             output_dim: self.model_dim(),
-            output_downsample: PairwiseDownsample::new(self.output_downsampling_factor),
+            output_downsample: PairwiseDownsample::new(self.output_downsampling_factor, device),
         }
     }
 }
@@ -192,8 +192,9 @@ impl<B: Backend> BiasNorm<B> {
     }
 }
 
-#[derive(Module, Debug, Clone)]
-struct ActivationBalancer {
+#[derive(Module, Debug)]
+struct ActivationBalancer<B: Backend> {
+    count: Param<Tensor<B, 1>>,
     min_positive: f64,
     max_positive: f64,
     sign_gain_factor: f64,
@@ -202,9 +203,10 @@ struct ActivationBalancer {
     max_abs: f64,
 }
 
-impl ActivationBalancer {
-    fn new() -> Self {
+impl<B: Backend> ActivationBalancer<B> {
+    fn new(device: &B::Device) -> Self {
         Self {
+            count: Initializer::Zeros.init([1], device),
             min_positive: 0.05,
             max_positive: 0.95,
             sign_gain_factor: 0.01,
@@ -226,7 +228,7 @@ impl ActivationBalancer {
         self
     }
 
-    fn forward<B: Backend, const D: usize>(&self, input: Tensor<B, D>) -> Tensor<B, D> {
+    fn forward<const D: usize>(&self, input: Tensor<B, D>) -> Tensor<B, D> {
         // Burn 0.21.0-pre.3 does not expose a clean PyTorch-style custom backward hook
         // for generic model code. Keep the forward value unchanged while attaching a
         // differentiable penalty to the graph.
@@ -546,7 +548,9 @@ impl<B: Backend> NonLinearAttention<B> {
         let b = chunks.pop().unwrap();
         let a = chunks.pop().unwrap();
         let values = tanh(b) * c;
-        let weights = attn_weights.slice_dim(1, 0..1).squeeze::<3>();
+        let weights = attn_weights
+            .slice_dim(1, 0..1)
+            .reshape([batch_size, seq_len, seq_len]);
         let attended = weights.matmul(values);
         let output = self.output_proj.forward((a * attended).reshape([
             batch_size,
@@ -567,8 +571,32 @@ fn relative_shift<B: Backend>(input: Tensor<B, 4>, seq_len: usize) -> Tensor<B, 
         .slice_dim(3, 0..seq_len)
 }
 
-fn output_bypass<B: Backend>(residual: Tensor<B, 3>, update: Tensor<B, 3>) -> Tensor<B, 3> {
-    residual.clone() + (update - residual) * 0.5
+#[derive(Module, Debug)]
+struct BypassModule<B: Backend> {
+    scale: Param<Tensor<B, 1>>,
+    num_features: usize,
+    min_value: f64,
+    max_value: f64,
+}
+
+impl<B: Backend> BypassModule<B> {
+    fn new(num_features: usize, device: &B::Device) -> Self {
+        Self {
+            scale: Initializer::Ones.init([num_features], device),
+            num_features,
+            min_value: 0.2,
+            max_value: 1.0,
+        }
+    }
+
+    fn forward(&self, residual: Tensor<B, 3>, update: Tensor<B, 3>) -> Tensor<B, 3> {
+        let scale = self
+            .scale
+            .val()
+            .clamp(self.min_value, self.max_value)
+            .reshape([1, 1, self.num_features]);
+        residual.clone() + (update - residual) * scale
+    }
 }
 
 fn swoosh_l<B: Backend, const D: usize>(input: Tensor<B, D>) -> Tensor<B, D> {
@@ -616,9 +644,9 @@ impl ConvEmbedConfig {
             convnext_out: LinearConfig::new(384, 128).init(device),
             output_projection: LinearConfig::new(128 * freq_dim, self.output_dim).init(device),
             output_norm: BiasNormConfig::new(self.output_dim).init(device),
-            conv1_balancer: ActivationBalancer::new(),
-            conv2_balancer: ActivationBalancer::new(),
-            conv3_balancer: ActivationBalancer::new(),
+            conv1_balancer: ActivationBalancer::new(device),
+            conv2_balancer: ActivationBalancer::new(device),
+            conv3_balancer: ActivationBalancer::new(device),
         }
     }
 }
@@ -633,9 +661,9 @@ struct ConvEmbed<B: Backend> {
     convnext_out: Linear<B>,
     output_projection: Linear<B>,
     output_norm: BiasNorm<B>,
-    conv1_balancer: ActivationBalancer,
-    conv2_balancer: ActivationBalancer,
-    conv3_balancer: ActivationBalancer,
+    conv1_balancer: ActivationBalancer<B>,
+    conv2_balancer: ActivationBalancer<B>,
+    conv3_balancer: ActivationBalancer<B>,
 }
 
 impl<B: Backend> ConvEmbed<B> {
@@ -693,8 +721,9 @@ struct ZipformerStackConfig {
 impl ZipformerStackConfig {
     fn init<B: Backend>(&self, device: &B::Device) -> ZipformerStack<B> {
         ZipformerStack {
-            downsample: PairwiseDownsample::new(self.downsample),
+            downsample: PairwiseDownsample::new(self.downsample, device),
             upsample: PairwiseUpsample::new(self.downsample),
+            output_bypass: (self.downsample > 1).then(|| BypassModule::new(self.dim, device)),
             positional_encoding: CompactRelPositionalEncoding::new(self.pos_dim),
             blocks: (0..self.num_layers)
                 .map(|_| {
@@ -718,8 +747,9 @@ impl ZipformerStackConfig {
 
 #[derive(Module, Debug)]
 struct ZipformerStack<B: Backend> {
-    downsample: PairwiseDownsample,
+    downsample: PairwiseDownsample<B>,
     upsample: PairwiseUpsample,
+    output_bypass: Option<BypassModule<B>>,
     positional_encoding: CompactRelPositionalEncoding,
     blocks: Vec<ZipformerBlock<B>>,
 }
@@ -736,7 +766,12 @@ impl<B: Backend> ZipformerStack<B> {
             output = block.forward(output, pos_emb.clone(), &down_lengths);
         }
         output = self.upsample.forward(output, target_len);
-        mask_time(output_bypass(residual, output), lengths)
+        let output = if let Some(output_bypass) = &self.output_bypass {
+            output_bypass.forward(residual, output)
+        } else {
+            output
+        };
+        mask_time(output, lengths)
     }
 }
 
@@ -788,6 +823,7 @@ impl ZipformerBlockConfig {
                 .init(device),
             feed_forward2: FeedForwardConfig::new(self.dim, self.feedforward_dim, self.dropout)
                 .init(device),
+            mid_bypass: BypassModule::new(self.dim, device),
             self_attention2: SelfAttentionConfig::new(
                 self.dim,
                 self.heads,
@@ -803,10 +839,11 @@ impl ZipformerBlockConfig {
                 self.dropout,
             )
             .init(device),
-            block_balancer: ActivationBalancer::new()
+            block_balancer: ActivationBalancer::new(device)
                 .with_positive_range(0.45, 0.55)
                 .with_abs_range(0.2, 6.0),
             output_norm: BiasNormConfig::new(self.dim).init(device),
+            output_bypass: BypassModule::new(self.dim, device),
             whiten: Whiten::new(),
         }
     }
@@ -820,11 +857,13 @@ struct ZipformerBlock<B: Backend> {
     self_attention1: SelfAttention<B>,
     conv1: ZipformerConvModule<B>,
     feed_forward2: FeedForward<B>,
+    mid_bypass: BypassModule<B>,
     self_attention2: SelfAttention<B>,
     conv2: ZipformerConvModule<B>,
     feed_forward3: FeedForward<B>,
-    block_balancer: ActivationBalancer,
+    block_balancer: ActivationBalancer<B>,
     output_norm: BiasNorm<B>,
+    output_bypass: BypassModule<B>,
     whiten: Whiten,
 }
 
@@ -862,7 +901,7 @@ impl<B: Backend> ZipformerBlock<B> {
             lengths,
         );
         output = mask_time(output.clone() + self.feed_forward2.forward(output), lengths);
-        output = mask_time(output_bypass(residual.clone(), output), lengths);
+        output = mask_time(self.mid_bypass.forward(residual.clone(), output), lengths);
 
         output = mask_time(
             output.clone() + self.self_attention2.forward(output.clone(), attn_weights),
@@ -876,8 +915,10 @@ impl<B: Backend> ZipformerBlock<B> {
         output = self
             .output_norm
             .forward(self.block_balancer.forward(output));
-        self.whiten
-            .forward(mask_time(output_bypass(residual, output), lengths))
+        self.whiten.forward(mask_time(
+            self.output_bypass.forward(residual, output),
+            lengths,
+        ))
     }
 }
 
@@ -900,7 +941,7 @@ impl FeedForwardConfig {
     fn init<B: Backend>(&self, device: &B::Device) -> FeedForward<B> {
         FeedForward {
             linear_in: LinearConfig::new(self.dim, self.hidden).init(device),
-            balancer: ActivationBalancer::new().with_abs_range(0.2, 10.0),
+            balancer: ActivationBalancer::new(device).with_abs_range(0.2, 10.0),
             linear_out: LinearConfig::new(self.hidden, self.dim).init(device),
             dropout: DropoutConfig::new(self.dropout).init(),
             out_dropout: DropoutConfig::new(self.dropout).init(),
@@ -911,7 +952,7 @@ impl FeedForwardConfig {
 #[derive(Module, Debug)]
 struct FeedForward<B: Backend> {
     linear_in: Linear<B>,
-    balancer: ActivationBalancer,
+    balancer: ActivationBalancer<B>,
     linear_out: Linear<B>,
     dropout: Dropout,
     out_dropout: Dropout,
@@ -945,7 +986,7 @@ impl ZipformerConvModuleConfig {
     fn init<B: Backend>(&self, device: &B::Device) -> ZipformerConvModule<B> {
         ZipformerConvModule {
             input_proj: LinearConfig::new(self.dim, self.dim * 2).init(device),
-            input_balancer: ActivationBalancer::new()
+            input_balancer: ActivationBalancer::new(device)
                 .with_positive_range(0.05, 1.0)
                 .with_abs_range(0.2, 10.0),
             depthwise: Conv1dConfig::new(self.dim, self.dim, self.kernel_size)
@@ -955,7 +996,7 @@ impl ZipformerConvModuleConfig {
                     self.kernel_size / 2,
                 ))
                 .init(device),
-            depthwise_balancer: ActivationBalancer::new()
+            depthwise_balancer: ActivationBalancer::new(device)
                 .with_positive_range(0.05, 1.0)
                 .with_abs_range(0.2, 20.0),
             output_proj: LinearConfig::new(self.dim, self.dim).init(device),
@@ -967,9 +1008,9 @@ impl ZipformerConvModuleConfig {
 #[derive(Module, Debug)]
 struct ZipformerConvModule<B: Backend> {
     input_proj: Linear<B>,
-    input_balancer: ActivationBalancer,
+    input_balancer: ActivationBalancer<B>,
     depthwise: Conv1d<B>,
-    depthwise_balancer: ActivationBalancer,
+    depthwise_balancer: ActivationBalancer<B>,
     output_proj: Linear<B>,
     dropout: Dropout,
 }
@@ -992,42 +1033,84 @@ impl<B: Backend> ZipformerConvModule<B> {
     }
 }
 
-#[derive(Module, Debug, Clone)]
-struct PairwiseDownsample {
+#[derive(Module, Debug)]
+struct Downsample<B: Backend> {
+    weights: Param<Tensor<B, 1>>,
     factor: usize,
 }
 
-impl PairwiseDownsample {
-    fn new(factor: usize) -> Self {
-        assert!(factor >= 1 && factor.is_power_of_two());
-        Self { factor }
+impl<B: Backend> Downsample<B> {
+    fn new(factor: usize, device: &B::Device) -> Self {
+        assert!(factor == 1 || factor == 2);
+        Self {
+            weights: Initializer::Zeros.init([factor], device),
+            factor,
+        }
     }
 
-    fn forward<B: Backend>(
-        &self,
-        input: Tensor<B, 3>,
-        lengths: &[usize],
-    ) -> (Tensor<B, 3>, Vec<usize>) {
+    fn forward(&self, input: Tensor<B, 3>, lengths: &[usize]) -> (Tensor<B, 3>, Vec<usize>) {
         if self.factor == 1 {
             return (input, lengths.to_vec());
         }
-        let [_, seq_len, _] = input.dims();
-        let pad = (self.factor - (seq_len % self.factor)) % self.factor;
+
+        let [batch_size, seq_len, dim] = input.dims();
+        let output_len = ceil_divide(seq_len, self.factor);
+        let padded_len = output_len * self.factor;
+        let pad = padded_len - seq_len;
         let output = if pad > 0 {
             input.pad([(0, pad), (0, 0)], PadMode::Edge)
         } else {
             input
         };
-        let [batch_size, padded_len, dim] = output.dims();
-        let output = output
-            .reshape([batch_size, padded_len / self.factor, self.factor, dim])
-            .mean_dim(2)
-            .reshape([batch_size, padded_len / self.factor, dim]);
+
+        let window = output.reshape([batch_size, output_len, self.factor, dim]);
+        let weights = softmax(self.weights.val(), 0).reshape([1, 1, self.factor, 1]);
+        let mask = padded_sequence_mask::<B>(lengths, seq_len, padded_len, &window.device())
+            .float()
+            .reshape([batch_size, output_len, self.factor, 1]);
+        let masked_weights = weights * mask;
+        let denom = masked_weights
+            .clone()
+            .sum_dim(2)
+            .reshape([batch_size, output_len, 1])
+            .clamp_min(1.0e-8);
+        let output = (window * masked_weights)
+            .sum_dim(2)
+            .reshape([batch_size, output_len, dim])
+            / denom;
         let lengths = lengths
             .iter()
             .map(|length| ceil_divide(*length, self.factor))
-            .collect();
-        (output, lengths)
+            .collect::<Vec<_>>();
+        (mask_time(output, &lengths), lengths)
+    }
+}
+
+#[derive(Module, Debug)]
+struct PairwiseDownsample<B: Backend> {
+    stages: Vec<Downsample<B>>,
+    factor: usize,
+}
+
+impl<B: Backend> PairwiseDownsample<B> {
+    fn new(factor: usize, device: &B::Device) -> Self {
+        assert!(factor >= 1 && factor.is_power_of_two());
+        let levels = factor.ilog2() as usize;
+        Self {
+            stages: (0..levels).map(|_| Downsample::new(2, device)).collect(),
+            factor,
+        }
+    }
+
+    fn forward(&self, input: Tensor<B, 3>, lengths: &[usize]) -> (Tensor<B, 3>, Vec<usize>) {
+        let mut output = input;
+        let mut output_lengths = lengths.to_vec();
+        for stage in &self.stages {
+            let (next, next_lengths) = stage.forward(output, &output_lengths);
+            output = next;
+            output_lengths = next_lengths;
+        }
+        (output, output_lengths)
     }
 }
 
@@ -1060,7 +1143,7 @@ pub struct ZipformerEncoder<B: Backend> {
     stacks: Vec<ZipformerStack<B>>,
     encoder_dim: Vec<usize>,
     output_dim: usize,
-    output_downsample: PairwiseDownsample,
+    output_downsample: PairwiseDownsample<B>,
 }
 
 impl<B: Backend> ZipformerEncoder<B> {
@@ -1200,6 +1283,22 @@ fn sequence_mask<B: Backend>(
         }
     }
     Tensor::from_data(TensorData::new(values, [lengths.len(), max_len]), device)
+}
+
+fn padded_sequence_mask<B: Backend>(
+    lengths: &[usize],
+    original_len: usize,
+    padded_len: usize,
+    device: &B::Device,
+) -> Tensor<B, 2, Bool> {
+    let mut values = Vec::with_capacity(lengths.len() * padded_len);
+    for length in lengths {
+        for index in 0..padded_len {
+            let source_index = index.min(original_len.saturating_sub(1));
+            values.push(source_index < *length);
+        }
+    }
+    Tensor::from_data(TensorData::new(values, [lengths.len(), padded_len]), device)
 }
 
 fn mask_time<B: Backend>(input: Tensor<B, 3>, lengths: &[usize]) -> Tensor<B, 3> {
