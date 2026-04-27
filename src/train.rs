@@ -139,6 +139,7 @@ pub struct BurnTrainConfig {
     pub validate_every_steps: Option<usize>,
     pub max_train_samples: Option<usize>,
     pub max_val_samples: Option<usize>,
+    pub max_audio_duration_ms: Option<usize>,
     pub tokenizer_path: Option<PathBuf>,
     pub val_beam_width: usize,
     pub val_n_best: usize,
@@ -159,6 +160,10 @@ pub struct BurnTrainConfig {
     pub device_index: usize,
     pub device_indices: Vec<usize>,
     pub precision: TrainPrecision,
+    pub hf_upload_checkpoints: bool,
+    pub hf_upload_repo_id: Option<String>,
+    pub hf_upload_revision: Option<String>,
+    pub hf_upload_private: bool,
 }
 
 impl Default for BurnTrainConfig {
@@ -198,6 +203,7 @@ impl Default for BurnTrainConfig {
             validate_every_steps: None,
             max_train_samples: None,
             max_val_samples: None,
+            max_audio_duration_ms: None,
             tokenizer_path: None,
             val_beam_width: 1,
             val_n_best: 1,
@@ -218,6 +224,10 @@ impl Default for BurnTrainConfig {
             device_index: 0,
             device_indices: vec![0],
             precision: TrainPrecision::F32,
+            hf_upload_checkpoints: false,
+            hf_upload_repo_id: None,
+            hf_upload_revision: None,
+            hf_upload_private: false,
         }
     }
 }
@@ -228,6 +238,8 @@ pub enum AdaptiveBatchUnit {
     Frames,
     PaddedFrames,
     FeatureValues,
+    DurationMs,
+    PaddedDurationMs,
 }
 
 impl std::str::FromStr for AdaptiveBatchUnit {
@@ -239,6 +251,8 @@ impl std::str::FromStr for AdaptiveBatchUnit {
             "frames" => Ok(Self::Frames),
             "padded-frames" | "padded_frames" => Ok(Self::PaddedFrames),
             "feature-values" | "feature_values" | "values" => Ok(Self::FeatureValues),
+            "duration-ms" | "duration_ms" => Ok(Self::DurationMs),
+            "padded-duration-ms" | "padded_duration_ms" => Ok(Self::PaddedDurationMs),
             other => bail!("unknown adaptive batch unit '{other}'"),
         }
     }
@@ -272,6 +286,7 @@ pub struct FeatureRecord {
     pub rows: usize,
     pub cols: usize,
     pub features: Vec<f32>,
+    pub duration_ms: usize,
     pub tokens: Vec<i64>,
     pub text: Option<String>,
 }
@@ -840,29 +855,32 @@ fn upload_export_to_huggingface(
     private: bool,
     output_dir: &Path,
 ) -> Result<()> {
+    upload_path_to_huggingface(repo_id, revision, private, output_dir, ".")
+}
+
+fn upload_path_to_huggingface(
+    repo_id: &str,
+    revision: Option<&str>,
+    private: bool,
+    source_path: &Path,
+    repo_path: &str,
+) -> Result<()> {
+    let mut create = Command::new("huggingface-cli");
+    create.args(["repo", "create", repo_id, "--type", "model", "--exist-ok"]);
     if private {
-        let mut create = Command::new("huggingface-cli");
-        create.args([
-            "repo",
-            "create",
-            repo_id,
-            "--type",
-            "model",
-            "--exist-ok",
-            "--private",
-        ]);
-        let status = create.status().context(
-            "failed to run huggingface-cli; install huggingface_hub CLI and login first",
-        )?;
-        if !status.success() {
-            bail!("huggingface-cli repo create failed with status {status}");
-        }
+        create.arg("--private");
+    }
+    let status = create
+        .status()
+        .context("failed to run huggingface-cli; install huggingface_hub CLI and login first")?;
+    if !status.success() {
+        bail!("huggingface-cli repo create failed with status {status}");
     }
 
     let mut upload = Command::new("huggingface-cli");
     upload.args(["upload", repo_id]);
-    upload.arg(output_dir);
-    upload.arg(".");
+    upload.arg(source_path);
+    upload.arg(repo_path);
     upload.args(["--repo-type", "model"]);
     if let Some(revision) = revision {
         upload.args(["--revision", revision]);
@@ -872,6 +890,34 @@ fn upload_export_to_huggingface(
         .context("failed to run huggingface-cli; install huggingface_hub CLI and login first")?;
     if !status.success() {
         bail!("huggingface-cli upload failed with status {status}");
+    }
+    Ok(())
+}
+
+fn maybe_upload_training_checkpoint(config: &BurnTrainConfig, checkpoint_dir: &Path) -> Result<()> {
+    if !config.hf_upload_checkpoints {
+        return Ok(());
+    }
+    let repo_id = config
+        .hf_upload_repo_id
+        .as_deref()
+        .context("hf_upload_checkpoints requires hf_upload_repo_id")?;
+    upload_path_to_huggingface(
+        repo_id,
+        config.hf_upload_revision.as_deref(),
+        config.hf_upload_private,
+        checkpoint_dir,
+        "checkpoint_latest",
+    )?;
+    let legacy_metadata = config.output_dir.join("checkpoint_latest.json");
+    if legacy_metadata.exists() {
+        upload_path_to_huggingface(
+            repo_id,
+            config.hf_upload_revision.as_deref(),
+            config.hf_upload_private,
+            &legacy_metadata,
+            "checkpoint_latest.json",
+        )?;
     }
     Ok(())
 }
@@ -1695,6 +1741,7 @@ where
             config.sort_buffer_size,
             config.input_dim,
             config.max_train_samples,
+            config.max_audio_duration_ms,
             config.tokenizer_path.clone(),
             dataset_index_path(config, "train"),
             config.waveform_augment,
@@ -1947,6 +1994,7 @@ where
         config.sort_buffer_size,
         config.input_dim,
         config.max_val_samples,
+        config.max_audio_duration_ms,
         config.tokenizer_path.clone(),
         dataset_index_path(config, "val"),
         WaveformAugmentConfig::default(),
@@ -2045,6 +2093,7 @@ where
             config.sort_buffer_size,
             config.input_dim,
             config.max_train_samples,
+            config.max_audio_duration_ms,
             config.tokenizer_path.clone(),
             dataset_index_path(config, "train"),
             config.waveform_augment,
@@ -2334,6 +2383,7 @@ where
         config.sort_buffer_size,
         config.input_dim,
         config.max_val_samples,
+        config.max_audio_duration_ms,
         config.tokenizer_path.clone(),
         dataset_index_path(config, "val"),
         WaveformAugmentConfig::default(),
@@ -2425,6 +2475,7 @@ where
             config.sort_buffer_size,
             config.input_dim,
             config.max_train_samples,
+            config.max_audio_duration_ms,
             config.tokenizer_path.clone(),
             dataset_index_path(config, "train"),
             config.waveform_augment,
@@ -2734,6 +2785,7 @@ where
         config.sort_buffer_size,
         config.input_dim,
         config.max_val_samples,
+        config.max_audio_duration_ms,
         config.tokenizer_path.clone(),
         dataset_index_path(config, "val"),
         WaveformAugmentConfig::default(),
@@ -3248,6 +3300,7 @@ where
         config.sort_buffer_size,
         config.input_dim,
         config.max_train_samples,
+        config.max_audio_duration_ms,
         config.tokenizer_path.clone(),
         None,
         WaveformAugmentConfig::default(),
@@ -3343,6 +3396,53 @@ fn make_batch(records: &[FeatureRecord], expected_dim: usize) -> Result<TrainBat
     })
 }
 
+fn duration_ms_from_seconds(seconds: f64) -> Option<usize> {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return None;
+    }
+    Some((seconds * 1000.0).ceil().max(1.0) as usize)
+}
+
+fn duration_ms_from_audio(sample_count: usize, sample_rate: u32) -> usize {
+    duration_ms_from_seconds(sample_count as f64 / sample_rate.max(1) as f64).unwrap_or(1)
+}
+
+fn estimated_duration_ms_from_rows(rows: usize, frontend: &FeatureExtractorConfig) -> usize {
+    match frontend {
+        FeatureExtractorConfig::Audio(config) => {
+            let samples = rows.saturating_mul(config.hop_length);
+            duration_ms_from_audio(samples, config.sample_rate)
+        }
+        FeatureExtractorConfig::W2vBert(config) => {
+            let samples = rows
+                .saturating_mul(160)
+                .saturating_mul(config.stride.max(1));
+            duration_ms_from_audio(samples, config.sample_rate)
+        }
+    }
+}
+
+fn json_duration_ms(value: &Value) -> Option<usize> {
+    ["duration_ms", "audio_duration_ms"]
+        .into_iter()
+        .find_map(|name| value.get(name).and_then(Value::as_u64))
+        .map(|value| value.max(1) as usize)
+        .or_else(|| {
+            [
+                "duration",
+                "duration_sec",
+                "duration_secs",
+                "duration_seconds",
+                "audio_duration",
+                "audio_duration_sec",
+                "audio_duration_seconds",
+            ]
+            .into_iter()
+            .find_map(|name| value.get(name).and_then(Value::as_f64))
+            .and_then(duration_ms_from_seconds)
+        })
+}
+
 pub fn load_manifest(path: &Path, limit: Option<usize>) -> Result<Vec<FeatureRecord>> {
     let files = manifest_files(path)?;
     let mut records = Vec::new();
@@ -3359,6 +3459,74 @@ pub fn load_manifest(path: &Path, limit: Option<usize>) -> Result<Vec<FeatureRec
     Ok(records)
 }
 
+pub fn extract_feature_records(
+    path: &Path,
+    limit: Option<usize>,
+    tokenizer_path: Option<&Path>,
+    audio_frontend: &FeatureExtractorConfig,
+    max_audio_duration_ms: Option<usize>,
+) -> Result<Vec<FeatureRecord>> {
+    let files = manifest_files(path)?;
+    let tokenizer = tokenizer_path
+        .map(load_sentencepiece_transcript_tokenizer)
+        .transpose()?;
+    let mut records = Vec::new();
+    let audio_decode = AudioDecodeConfig::default();
+    for file in files {
+        if limit.is_some_and(|limit| records.len() >= limit) {
+            break;
+        }
+        let base_dir = file.parent().unwrap_or_else(|| Path::new("."));
+        let raw_lines = if is_audio_dataset_file(&file) {
+            vec![RawManifestLine::from_audio_path(file)]
+        } else if is_parquet_file(&file) {
+            parquet_raw_lines(&file)?
+        } else {
+            let text = fs::read_to_string(&file)
+                .with_context(|| format!("failed to read manifest {}", file.display()))?;
+            text.lines()
+                .enumerate()
+                .filter_map(|(line_index, line)| {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() || trimmed.starts_with('#') {
+                        None
+                    } else {
+                        Some(RawManifestLine {
+                            manifest_path: file.clone(),
+                            base_dir: base_dir.to_path_buf(),
+                            byte_offset: 0,
+                            line_number: line_index + 1,
+                            line: trimmed.to_string(),
+                        })
+                    }
+                })
+                .collect()
+        };
+        for raw in raw_lines {
+            if limit.is_some_and(|limit| records.len() >= limit) {
+                break;
+            }
+            let record = raw.parse_record(
+                tokenizer.as_ref(),
+                &audio_decode,
+                audio_frontend,
+                WaveformAugmentConfig::default(),
+            )?;
+            if max_audio_duration_ms.is_some_and(|max| record.duration_ms > max) {
+                continue;
+            }
+            records.push(record);
+        }
+    }
+    if records.is_empty() {
+        bail!(
+            "manifest {} contains no records after filtering",
+            path.display()
+        );
+    }
+    Ok(records)
+}
+
 pub struct StreamingBatchLoader {
     files: Vec<PathBuf>,
     file_index: usize,
@@ -3370,6 +3538,7 @@ pub struct StreamingBatchLoader {
     expected_dim: usize,
     yielded: usize,
     limit: Option<usize>,
+    max_audio_duration_ms: Option<usize>,
     tokenizer: Option<SentencePieceTokenizer>,
     audio_decode: AudioDecodeConfig,
     audio_frontend: FeatureExtractorConfig,
@@ -3407,6 +3576,7 @@ impl StreamingBatchLoader {
         sort_buffer_size: usize,
         expected_dim: usize,
         limit: Option<usize>,
+        max_audio_duration_ms: Option<usize>,
         tokenizer_path: Option<PathBuf>,
         index_path: Option<PathBuf>,
         waveform_augment: WaveformAugmentConfig,
@@ -3446,6 +3616,7 @@ impl StreamingBatchLoader {
             expected_dim,
             yielded: 0,
             limit,
+            max_audio_duration_ms,
             tokenizer,
             audio_decode: AudioDecodeConfig::default(),
             audio_frontend,
@@ -3466,6 +3637,12 @@ impl StreamingBatchLoader {
             }
             match self.next_record()? {
                 Some(record) => {
+                    if self
+                        .max_audio_duration_ms
+                        .is_some_and(|max_duration_ms| record.duration_ms > max_duration_ms)
+                    {
+                        continue;
+                    }
                     if !records.is_empty() && !self.fits_adaptive_budget(&records, &record) {
                         self.pending = Some(record);
                         break;
@@ -4151,11 +4328,14 @@ fn parse_parquet_record(
     };
 
     if let Some((features, rows, cols)) = parquet_optional_features(&df, row, &id)? {
+        let duration_ms = parquet_optional_duration_ms(&df, row)?
+            .unwrap_or_else(|| estimated_duration_ms_from_rows(rows, audio_frontend));
         return Ok(FeatureRecord {
             id,
             rows,
             cols,
             features,
+            duration_ms,
             tokens,
             text,
         });
@@ -4183,6 +4363,7 @@ fn parse_parquet_record(
             rows: audio.features.rows,
             cols: audio.features.cols,
             features: audio.features.values,
+            duration_ms: duration_ms_from_audio(audio.sample_count, audio.sample_rate),
             tokens,
             text,
         });
@@ -4207,6 +4388,7 @@ fn parse_parquet_record(
             rows: audio.features.rows,
             cols: audio.features.cols,
             features: audio.features.values,
+            duration_ms: duration_ms_from_audio(audio.sample_count, audio.sample_rate),
             tokens,
             text,
         });
@@ -4287,6 +4469,32 @@ fn parquet_optional_usize(df: &DataFrame, row: usize, names: &[&str]) -> Result<
                 .ok_or_else(|| {
                     anyhow!("parquet column '{name}' must contain non-negative integers")
                 });
+        }
+    }
+    Ok(None)
+}
+
+fn parquet_optional_duration_ms(df: &DataFrame, row: usize) -> Result<Option<usize>> {
+    if let Some(value) = parquet_optional_usize(df, row, &["duration_ms", "audio_duration_ms"])? {
+        return Ok(Some(value.max(1)));
+    }
+    for name in [
+        "duration",
+        "duration_sec",
+        "duration_secs",
+        "duration_seconds",
+        "audio_duration",
+        "audio_duration_sec",
+        "audio_duration_seconds",
+    ] {
+        if let Ok(column) = df.column(name) {
+            let value = column.get(row)?;
+            if matches!(value, AnyValue::Null) {
+                continue;
+            }
+            let seconds = anyvalue_to_f64(value)
+                .ok_or_else(|| anyhow!("parquet column '{name}' must contain numeric seconds"))?;
+            return Ok(duration_ms_from_seconds(seconds));
         }
     }
     Ok(None)
@@ -4490,6 +4698,22 @@ fn anyvalue_to_f32_result(value: AnyValue<'_>) -> Result<f32> {
     anyvalue_to_f32(value).ok_or_else(|| anyhow!("expected numeric value"))
 }
 
+fn anyvalue_to_f64(value: AnyValue<'_>) -> Option<f64> {
+    match value {
+        AnyValue::Float32(value) => Some(f64::from(value)),
+        AnyValue::Float64(value) => Some(value),
+        AnyValue::Int8(value) => Some(f64::from(value)),
+        AnyValue::Int16(value) => Some(f64::from(value)),
+        AnyValue::Int32(value) => Some(f64::from(value)),
+        AnyValue::Int64(value) => Some(value as f64),
+        AnyValue::UInt8(value) => Some(f64::from(value)),
+        AnyValue::UInt16(value) => Some(f64::from(value)),
+        AnyValue::UInt32(value) => Some(f64::from(value)),
+        AnyValue::UInt64(value) => Some(value as f64),
+        _ => None,
+    }
+}
+
 fn anyvalue_to_f32(value: AnyValue<'_>) -> Option<f32> {
     match value {
         AnyValue::Float32(value) => Some(value),
@@ -4553,6 +4777,7 @@ fn parse_raw_audio_record(
         rows: audio.features.rows,
         cols: audio.features.cols,
         features: audio.features.values,
+        duration_ms: duration_ms_from_audio(audio.sample_count, audio.sample_rate),
         tokens,
         text,
     })
@@ -4629,16 +4854,22 @@ fn adaptive_cost<'a>(
     let mut samples = 0usize;
     let mut frames = 0usize;
     let mut max_frames = 0usize;
+    let mut duration_ms = 0usize;
+    let mut max_duration_ms = 0usize;
     for record in records {
         samples += 1;
         frames += record.rows;
         max_frames = max_frames.max(record.rows);
+        duration_ms += record.duration_ms.max(1);
+        max_duration_ms = max_duration_ms.max(record.duration_ms.max(1));
     }
     match unit {
         AdaptiveBatchUnit::Samples => samples,
         AdaptiveBatchUnit::Frames => frames,
         AdaptiveBatchUnit::PaddedFrames => samples * max_frames,
         AdaptiveBatchUnit::FeatureValues => samples * max_frames * expected_dim,
+        AdaptiveBatchUnit::DurationMs => duration_ms,
+        AdaptiveBatchUnit::PaddedDurationMs => samples * max_duration_ms,
     }
 }
 
@@ -4728,6 +4959,7 @@ fn parse_json_record(
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
     let tokens = parse_record_tokens(&value, text.as_deref(), tokenizer, &id)?;
+    let manifest_duration_ms = json_duration_ms(&value);
 
     if let Some(features) = value.get("features") {
         let rows = value
@@ -4744,6 +4976,8 @@ fn parse_json_record(
             rows,
             cols,
             features,
+            duration_ms: manifest_duration_ms
+                .unwrap_or_else(|| estimated_duration_ms_from_rows(rows, audio_frontend)),
             tokens,
             text,
         });
@@ -4771,6 +5005,8 @@ fn parse_json_record(
             rows,
             cols,
             features,
+            duration_ms: manifest_duration_ms
+                .unwrap_or_else(|| estimated_duration_ms_from_rows(rows, audio_frontend)),
             tokens,
             text,
         });
@@ -4799,6 +5035,7 @@ fn parse_json_record(
         rows: audio.features.rows,
         cols: audio.features.cols,
         features: audio.features.values,
+        duration_ms: duration_ms_from_audio(audio.sample_count, audio.sample_rate),
         tokens,
         text,
     })
@@ -4819,11 +5056,17 @@ fn parse_tsv_record(line: &str, base_dir: &Path, line_number: usize) -> Result<F
         .with_context(|| format!("invalid cols on line {line_number}"))?;
     let tokens = parse_token_string(parts[3])?;
     let features = read_feature_file(&resolve_path(base_dir, parts[0]), rows, cols)?;
+    let duration_ms = parts
+        .get(5)
+        .and_then(|value| value.parse::<f64>().ok())
+        .and_then(duration_ms_from_seconds)
+        .unwrap_or_else(|| rows.saturating_mul(10).max(1));
     Ok(FeatureRecord {
         id: format!("line-{line_number}"),
         rows,
         cols,
         features,
+        duration_ms,
         tokens,
         text: parts.get(4).map(|value| (*value).to_string()),
     })
@@ -5146,6 +5389,9 @@ fn validate_config(config: &BurnTrainConfig) -> Result<()> {
     if config.log_every == 0 {
         bail!("log_every must be > 0");
     }
+    if config.max_audio_duration_ms == Some(0) {
+        bail!("max_audio_duration_ms must be > 0 when set");
+    }
     if config.gradient_clip_norm.is_some() && config.gradient_clip_value.is_some() {
         bail!("set at most one of gradient_clip_norm or gradient_clip_value");
     }
@@ -5178,6 +5424,9 @@ fn validate_config(config: &BurnTrainConfig) -> Result<()> {
     }
     if config.val_lm_path.is_some() && config.tokenizer_path.is_none() {
         bail!("val_lm_path requires tokenizer_path");
+    }
+    if config.hf_upload_checkpoints && config.hf_upload_repo_id.is_none() {
+        bail!("hf_upload_checkpoints requires hf_upload_repo_id");
     }
     Ok(())
 }
@@ -5291,8 +5540,10 @@ fn architecture_name(architecture: &TrainArchitecture) -> &'static str {
     }
 }
 
-fn feature_extractor_for_architecture(config: &BurnTrainConfig) -> FeatureExtractorConfig {
-    match config.architecture {
+pub fn feature_extractor_for_train_architecture(
+    architecture: TrainArchitecture,
+) -> FeatureExtractorConfig {
+    match architecture {
         TrainArchitecture::Zipformer => {
             FeatureExtractorConfig::Audio(asr_features::zipformer_frontend_config())
         }
@@ -5308,6 +5559,10 @@ fn feature_extractor_for_architecture(config: &BurnTrainConfig) -> FeatureExtrac
     }
 }
 
+fn feature_extractor_for_architecture(config: &BurnTrainConfig) -> FeatureExtractorConfig {
+    feature_extractor_for_train_architecture(config.architecture)
+}
+
 fn default_training_feature_extractor() -> FeatureExtractorConfig {
     FeatureExtractorConfig::W2vBert(W2vBertEncoderConfig::default().to_frontend_config())
 }
@@ -5320,6 +5575,8 @@ fn adaptive_batch_json(config: &BurnTrainConfig) -> Option<Value> {
                 AdaptiveBatchUnit::Frames => "frames",
                 AdaptiveBatchUnit::PaddedFrames => "padded_frames",
                 AdaptiveBatchUnit::FeatureValues => "feature_values",
+                AdaptiveBatchUnit::DurationMs => "duration_ms",
+                AdaptiveBatchUnit::PaddedDurationMs => "padded_duration_ms",
             },
             "budget": adaptive.budget,
             "max_samples": adaptive.max_samples,
@@ -5375,6 +5632,9 @@ fn run_config_json(config: &BurnTrainConfig) -> Value {
         "gradient_clip_value": config.gradient_clip_value,
         "ema_decay": config.ema_decay,
         "ema_start_step": config.ema_start_step,
+        "max_train_samples": config.max_train_samples,
+        "max_val_samples": config.max_val_samples,
+        "max_audio_duration_ms": config.max_audio_duration_ms,
         "tokenizer_path": config.tokenizer_path,
         "val_beam_width": config.val_beam_width,
         "val_n_best": config.val_n_best,
@@ -5405,6 +5665,10 @@ fn run_config_json(config: &BurnTrainConfig) -> Value {
             TrainPrecision::F16 => "f16",
             TrainPrecision::Bf16 => "bf16",
         },
+        "hf_upload_checkpoints": config.hf_upload_checkpoints,
+        "hf_upload_repo_id": config.hf_upload_repo_id,
+        "hf_upload_revision": config.hf_upload_revision,
+        "hf_upload_private": config.hf_upload_private,
     })
 }
 
@@ -5502,6 +5766,9 @@ fn train_config_from_json(value: &Value) -> Result<BurnTrainConfig> {
     config.gradient_clip_value = json_f32(value, "gradient_clip_value");
     config.ema_decay = json_f64(value, "ema_decay");
     config.ema_start_step = json_usize(value, "ema_start_step").unwrap_or(config.ema_start_step);
+    config.max_train_samples = json_usize(value, "max_train_samples");
+    config.max_val_samples = json_usize(value, "max_val_samples");
+    config.max_audio_duration_ms = json_usize(value, "max_audio_duration_ms");
     config.tokenizer_path = json_path(value, "tokenizer_path");
     config.val_beam_width = json_usize(value, "val_beam_width").unwrap_or(config.val_beam_width);
     config.val_n_best = json_usize(value, "val_n_best").unwrap_or(config.val_n_best);
@@ -5552,6 +5819,18 @@ fn train_config_from_json(value: &Value) -> Result<BurnTrainConfig> {
         .unwrap_or("f32")
         .parse()
         .unwrap_or(TrainPrecision::F32);
+    config.hf_upload_checkpoints =
+        json_bool(value, "hf_upload_checkpoints").unwrap_or(config.hf_upload_checkpoints);
+    config.hf_upload_repo_id = value
+        .get("hf_upload_repo_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    config.hf_upload_revision = value
+        .get("hf_upload_revision")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    config.hf_upload_private =
+        json_bool(value, "hf_upload_private").unwrap_or(config.hf_upload_private);
     Ok(config)
 }
 
@@ -5723,6 +6002,7 @@ where
             "ema_model_path": ema_model.map(|_| checkpoint_file_path(&dir, "ema_model")),
         }),
     )?;
+    maybe_upload_training_checkpoint(config, &dir)?;
     Ok(())
 }
 
@@ -5810,6 +6090,7 @@ fn validate_resume_config(config: &BurnTrainConfig, saved_config: &Value) -> Res
         "w2v_hf_model_dir",
         "w2v_activation_checkpointing",
         "precision",
+        "max_audio_duration_ms",
         "gradient_accumulation_steps",
         "lr_warmup_steps",
         "lr_hold_steps",
@@ -5838,6 +6119,7 @@ fn resume_config_default_value(key: &str) -> Option<Value> {
     match key {
         "ema_decay" => Some(Value::Null),
         "ema_start_step" => Some(json!(0)),
+        "max_audio_duration_ms" => Some(Value::Null),
         _ => None,
     }
 }
@@ -6092,6 +6374,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             WaveformAugmentConfig::default(),
             default_training_feature_extractor(),
         )
@@ -6128,6 +6411,7 @@ mod tests {
                 rows: 2,
                 cols: 2,
                 features: vec![1.0, 2.0, 3.0, 4.0],
+                duration_ms: 20,
                 tokens: vec![1, 2],
                 text: Some("one two".to_string()),
             },
@@ -6136,6 +6420,7 @@ mod tests {
                 rows: 1,
                 cols: 2,
                 features: vec![5.0, 6.0],
+                duration_ms: 10,
                 tokens: vec![3],
                 text: None,
             },
@@ -6211,6 +6496,7 @@ mod tests {
             rows: 1,
             cols: 2,
             features: vec![0.0, 0.0],
+            duration_ms: 10,
             tokens: vec![1, 2, 3],
             text: None,
         }];
@@ -6293,6 +6579,7 @@ mod tests {
             rows: 4,
             cols: 3,
             features: vec![1.0; 12],
+            duration_ms: 40,
             tokens: vec![1],
             text: None,
         }];
@@ -6406,6 +6693,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             WaveformAugmentConfig::default(),
             default_training_feature_extractor(),
         )
@@ -6418,6 +6706,93 @@ mod tests {
         assert_eq!(first.feature_lengths, vec![2, 3]);
         assert_eq!(second.batch_size, 1);
         assert_eq!(second.feature_lengths, vec![1]);
+    }
+
+    #[test]
+    fn streaming_loader_respects_adaptive_padded_duration_budget() {
+        let dir = std::env::temp_dir().join(format!(
+            "w2v_bert_uk_adaptive_duration_batch_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("train.jsonl"),
+            [
+                r#"{"id":"a","features":[[0.1,0.2],[0.3,0.4]],"duration_ms":2000,"tokens":[1]}"#,
+                r#"{"id":"b","features":[[0.1,0.2],[0.3,0.4],[0.5,0.6]],"duration_ms":3000,"tokens":[1]}"#,
+                r#"{"id":"c","features":[[0.1,0.2]],"duration_ms":1000,"tokens":[1]}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let mut loader = StreamingBatchLoader::new(
+            dir.join("train.jsonl"),
+            8,
+            Some(AdaptiveBatchConfig {
+                unit: AdaptiveBatchUnit::PaddedDurationMs,
+                budget: 6000,
+                max_samples: None,
+            }),
+            false,
+            4096,
+            2,
+            None,
+            None,
+            None,
+            None,
+            WaveformAugmentConfig::default(),
+            default_training_feature_extractor(),
+        )
+        .unwrap();
+
+        let first = loader.next_batch().unwrap().unwrap();
+        let second = loader.next_batch().unwrap().unwrap();
+
+        assert_eq!(first.batch_size, 2);
+        assert_eq!(first.feature_lengths, vec![2, 3]);
+        assert_eq!(second.batch_size, 1);
+        assert_eq!(second.feature_lengths, vec![1]);
+    }
+
+    #[test]
+    fn streaming_loader_filters_long_audio_duration() {
+        let dir = std::env::temp_dir().join(format!(
+            "w2v_bert_uk_duration_filter_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("train.jsonl"),
+            [
+                r#"{"id":"keep","features":[[0.1,0.2]],"duration_ms":19999,"tokens":[1]}"#,
+                r#"{"id":"drop","features":[[0.1,0.2]],"duration_ms":20001,"tokens":[1]}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let mut loader = StreamingBatchLoader::new(
+            dir.join("train.jsonl"),
+            2,
+            None,
+            false,
+            4096,
+            2,
+            None,
+            Some(20_000),
+            None,
+            None,
+            WaveformAugmentConfig::default(),
+            default_training_feature_extractor(),
+        )
+        .unwrap();
+
+        let batch = loader.next_batch().unwrap().unwrap();
+        assert_eq!(batch.ids, vec!["keep"]);
+        assert!(loader.next_batch().unwrap().is_none());
     }
 
     #[test]
@@ -6446,6 +6821,7 @@ mod tests {
             true,
             3,
             2,
+            None,
             None,
             None,
             None,
@@ -6487,6 +6863,7 @@ mod tests {
             2,
             None,
             None,
+            None,
             Some(index_path.clone()),
             WaveformAugmentConfig::default(),
             default_training_feature_extractor(),
@@ -6503,6 +6880,7 @@ mod tests {
             true,
             2,
             2,
+            None,
             None,
             None,
             Some(index_path),

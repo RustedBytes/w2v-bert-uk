@@ -111,6 +111,24 @@ Useful tokenizer options:
 | `--byte-fallback` | false | Enable byte fallback pieces. |
 | `--keep-corpus` | false | Keep `<model-prefix>.corpus.txt` after training. |
 
+## Extract Feature Parquet
+
+Use `extract-features` to preprocess Parquet/audio manifests into a new Parquet
+file containing flattened `features`, `tokens`, `rows`, `cols`, `duration_ms`,
+`id`, and `text` columns. The output is directly accepted by `--train-manifest`.
+
+```bash
+cargo run --release --bin train -- extract-features \
+  --input /path/to/audio-or-parquet \
+  --output data/features-w2v.parquet \
+  --architecture w2v-bert \
+  --tokenizer tokenizer.model \
+  --max-audio-duration-sec 20
+```
+
+Pass `--input` multiple times for multiple shards. Use `--max-samples` for a
+bounded preprocessing run.
+
 ## Build Modes
 
 The trainer defaults to CPU. GPU backends are selected at build time:
@@ -303,9 +321,10 @@ The loader streams records instead of loading the whole dataset into memory.
 | Argument | Default | Description |
 | --- | --- | --- |
 | `--batch-size <N>` | `8` | Maximum fixed batch size, or default max samples for adaptive batching. |
-| `--adaptive-batch-unit <UNIT>` | unset | Enables adaptive batching. Units: `samples`, `frames`, `padded-frames`, `feature-values`. |
+| `--adaptive-batch-unit <UNIT>` | unset | Enables adaptive batching. Units: `samples`, `frames`, `padded-frames`, `feature-values`, `duration-ms`, `padded-duration-ms`. |
 | `--adaptive-batch-budget <N>` | unset | Budget measured in the selected unit. Must be set with `--adaptive-batch-unit`. |
 | `--adaptive-batch-max-samples <N>` | `--batch-size` | Hard cap on samples per adaptive batch. |
+| `--max-audio-duration-sec <F>` | unset | Drop training and validation samples longer than this duration before batching. |
 | `--sort-by-length-desc` | false | Sort records by descending length within a bounded buffer. Useful for largest batches first. |
 | `--sort-buffer-size <N>` | `4096` | Metadata records to hold while sorting. |
 | `--dataset-index-dir <DIR>` | unset | Cache row offsets/lengths for sorted streaming. Requires `--sort-by-length-desc`. |
@@ -315,6 +334,16 @@ For large GPU runs, start with `feature-values`:
 ```bash
 --adaptive-batch-unit feature-values \
 --adaptive-batch-budget 40000 \
+--adaptive-batch-max-samples 2
+```
+
+For audio-backed manifests, `padded-duration-ms` often tracks GPU memory more
+directly because it budgets `batch_size * longest_sample_duration` after
+padding:
+
+```bash
+--adaptive-batch-unit padded-duration-ms \
+--adaptive-batch-budget 7000 \
 --adaptive-batch-max-samples 2
 ```
 
@@ -433,6 +462,11 @@ Inside the process, those visible GPUs are addressed as `0,1`.
 | `--log-every <N>` | `10` | Log every N optimizer steps. |
 | `--dry-run` | false | Forward/loss only; skip optimizer updates. Useful for smoke tests. |
 | `--max-train-samples <N>` | unset | Limit training samples. Useful for smoke tests. |
+| `--hf-upload-checkpoints` | false | Upload `checkpoint_latest/` and `checkpoint_latest.json` after each checkpoint save. |
+| `--hf-upload-repo-id <ID>` | unset | Hugging Face model repository for checkpoint uploads. Required with `--hf-upload-checkpoints`. |
+| `--hf-upload-revision <REV>` | unset | Optional branch/revision for checkpoint uploads. |
+| `--hf-upload-private` | false | Create/use a private Hugging Face model repo. |
+| `--hf-upload-checkpoint-format <FORMAT>` | `burn-bin` | Accepted values: `burn-bin`, `safetensors`. Rust training currently supports `burn-bin` only. |
 
 The trainer writes:
 

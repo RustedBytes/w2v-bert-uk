@@ -6,13 +6,17 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use env_logger::Env;
-use polars::prelude::{AnyValue, DataFrame, ParquetReader, SerReader};
+use polars::prelude::{
+    AnyValue, DataFrame, IntoColumn, IntoSeries, ListChunked, NamedFrom, ParquetReader,
+    ParquetWriter, SerReader, Series,
+};
 use serde_json::Value;
 use w2v_bert_uk::audio::WaveformAugmentConfig;
 use w2v_bert_uk::paraformer::ParaformerAlignmentMode;
 use w2v_bert_uk::train::{
     AdaptiveBatchConfig, AdaptiveBatchUnit, BurnTrainConfig, SpecAugmentConfig, TrainArchitecture,
-    TrainBackendKind, TrainPrecision, run_burn_training,
+    TrainBackendKind, TrainPrecision, extract_feature_records,
+    feature_extractor_for_train_architecture, run_burn_training,
 };
 
 #[derive(Parser)]
@@ -35,6 +39,8 @@ enum CommandArg {
     Run(RunArgs),
     /// Train a SentencePiece tokenizer from manifest transcripts or text files.
     Tokenizer(TokenizerArgs),
+    /// Extract audio features and token ids into a trainer-ready Parquet file.
+    ExtractFeatures(ExtractFeaturesArgs),
 }
 
 #[derive(ClapArgs)]
@@ -107,7 +113,7 @@ struct RunArgs {
     #[arg(long, default_value_t = 8)]
     batch_size: usize,
 
-    /// Adaptive batch unit: samples, frames, padded-frames, or feature-values.
+    /// Adaptive batch unit: samples, frames, padded-frames, feature-values, duration-ms, or padded-duration-ms.
     #[arg(long, value_enum)]
     adaptive_batch_unit: Option<AdaptiveBatchUnitArg>,
 
@@ -223,6 +229,10 @@ struct RunArgs {
     #[arg(long)]
     max_val_samples: Option<usize>,
 
+    /// Drop samples longer than this many seconds before batching.
+    #[arg(long)]
+    max_audio_duration_sec: Option<f64>,
+
     /// Optional SentencePiece tokenizer for validation CER/WER text decoding.
     #[arg(long)]
     tokenizer: Option<PathBuf>,
@@ -306,6 +316,26 @@ struct RunArgs {
     /// Shortcut for --precision f16.
     #[arg(long)]
     mixed_precision: bool,
+
+    /// Upload checkpoint_latest to Hugging Face after each checkpoint save.
+    #[arg(long)]
+    hf_upload_checkpoints: bool,
+
+    /// Hugging Face model repository id for checkpoint uploads.
+    #[arg(long)]
+    hf_upload_repo_id: Option<String>,
+
+    /// Checkpoint upload format. Rust training currently writes Burn .bin checkpoints.
+    #[arg(long, value_enum, default_value_t = HfCheckpointFormatArg::BurnBin)]
+    hf_upload_checkpoint_format: HfCheckpointFormatArg,
+
+    /// Optional Hugging Face branch/revision for checkpoint uploads.
+    #[arg(long)]
+    hf_upload_revision: Option<String>,
+
+    /// Create/use the Hugging Face repository as private.
+    #[arg(long)]
+    hf_upload_private: bool,
 }
 
 #[derive(ClapArgs)]
@@ -411,6 +441,37 @@ struct TokenizerArgs {
     sentencepiece_command: Option<PathBuf>,
 }
 
+#[derive(ClapArgs)]
+struct ExtractFeaturesArgs {
+    /// Input manifest, Parquet file, audio file, or directory. Can be passed multiple times.
+    #[arg(long = "input", required = true)]
+    inputs: Vec<PathBuf>,
+
+    /// Output Parquet file with id, text, rows, cols, duration_ms, features, and tokens.
+    #[arg(long)]
+    output: PathBuf,
+
+    /// Architecture/frontend used to extract features.
+    #[arg(long, value_enum, default_value_t = ArchitectureArg::W2vBert)]
+    architecture: ArchitectureArg,
+
+    /// Alias for --architecture w2v-bert.
+    #[arg(long)]
+    w2v_bert: bool,
+
+    /// SentencePiece tokenizer used when input rows have text but no token ids.
+    #[arg(long)]
+    tokenizer: Option<PathBuf>,
+
+    /// Drop samples longer than this many seconds before writing output.
+    #[arg(long)]
+    max_audio_duration_sec: Option<f64>,
+
+    /// Limit number of output records.
+    #[arg(long)]
+    max_samples: Option<usize>,
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum SentencePieceModelTypeArg {
     Unigram,
@@ -443,11 +504,20 @@ enum PrecisionArg {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
+enum HfCheckpointFormatArg {
+    #[value(alias = "burn_bin", alias = "bin")]
+    BurnBin,
+    Safetensors,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
 enum AdaptiveBatchUnitArg {
     Samples,
     Frames,
     PaddedFrames,
     FeatureValues,
+    DurationMs,
+    PaddedDurationMs,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -463,11 +533,20 @@ fn main() -> Result<()> {
     match cli.command {
         Some(CommandArg::Run(args)) => run_training(args),
         Some(CommandArg::Tokenizer(args)) => run_tokenizer_training(args),
+        Some(CommandArg::ExtractFeatures(args)) => run_feature_extraction(args),
         None => run_training(cli.run),
     }
 }
 
 fn run_training(args: RunArgs) -> Result<()> {
+    if matches!(
+        args.hf_upload_checkpoint_format,
+        HfCheckpointFormatArg::Safetensors
+    ) {
+        bail!(
+            "--hf-upload-checkpoint-format safetensors is not supported by Rust training yet; use burn-bin"
+        );
+    }
     let (train_manifest, val_manifest) = resolve_manifest_paths(&args)?;
     let adaptive_batch = resolve_adaptive_batch(&args)?;
     let precision = resolve_precision(&args);
@@ -518,6 +597,7 @@ fn run_training(args: RunArgs) -> Result<()> {
         validate_every_steps: args.validate_every_steps,
         max_train_samples: args.max_train_samples,
         max_val_samples: args.max_val_samples,
+        max_audio_duration_ms: duration_sec_to_ms(args.max_audio_duration_sec)?,
         tokenizer_path: args.tokenizer,
         val_beam_width: args.val_beam_width,
         val_n_best: args.val_n_best.unwrap_or(args.val_beam_width),
@@ -546,6 +626,10 @@ fn run_training(args: RunArgs) -> Result<()> {
         device_index: args.device_index,
         device_indices,
         precision,
+        hf_upload_checkpoints: args.hf_upload_checkpoints,
+        hf_upload_repo_id: args.hf_upload_repo_id,
+        hf_upload_revision: args.hf_upload_revision,
+        hf_upload_private: args.hf_upload_private,
     };
 
     let summary = run_burn_training(config)?;
@@ -580,6 +664,17 @@ fn resolve_precision(args: &RunArgs) -> TrainPrecision {
     }
 }
 
+fn duration_sec_to_ms(value: Option<f64>) -> Result<Option<usize>> {
+    value
+        .map(|seconds| {
+            if seconds <= 0.0 || !seconds.is_finite() {
+                bail!("--max-audio-duration-sec must be a finite value > 0");
+            }
+            Ok((seconds * 1000.0).ceil() as usize)
+        })
+        .transpose()
+}
+
 fn resolve_architecture(args: &RunArgs) -> TrainArchitecture {
     if args.zipformer {
         return TrainArchitecture::Zipformer;
@@ -598,6 +693,19 @@ fn resolve_architecture(args: &RunArgs) -> TrainArchitecture {
     }
 }
 
+fn resolve_extract_architecture(args: &ExtractFeaturesArgs) -> TrainArchitecture {
+    if args.w2v_bert {
+        TrainArchitecture::Wav2VecBert
+    } else {
+        match args.architecture {
+            ArchitectureArg::Squeezeformer => TrainArchitecture::Squeezeformer,
+            ArchitectureArg::Zipformer => TrainArchitecture::Zipformer,
+            ArchitectureArg::Paraformer => TrainArchitecture::Paraformer,
+            ArchitectureArg::W2vBert => TrainArchitecture::Wav2VecBert,
+        }
+    }
+}
+
 fn resolve_adaptive_batch(args: &RunArgs) -> Result<Option<AdaptiveBatchConfig>> {
     match (args.adaptive_batch_unit, args.adaptive_batch_budget) {
         (None, None) => Ok(None),
@@ -611,6 +719,8 @@ fn resolve_adaptive_batch(args: &RunArgs) -> Result<Option<AdaptiveBatchConfig>>
                     AdaptiveBatchUnitArg::Frames => AdaptiveBatchUnit::Frames,
                     AdaptiveBatchUnitArg::PaddedFrames => AdaptiveBatchUnit::PaddedFrames,
                     AdaptiveBatchUnitArg::FeatureValues => AdaptiveBatchUnit::FeatureValues,
+                    AdaptiveBatchUnitArg::DurationMs => AdaptiveBatchUnit::DurationMs,
+                    AdaptiveBatchUnitArg::PaddedDurationMs => AdaptiveBatchUnit::PaddedDurationMs,
                 },
                 budget,
                 max_samples: args.adaptive_batch_max_samples,
@@ -770,6 +880,100 @@ fn sentencepiece_model_type(model_type: SentencePieceModelTypeArg) -> &'static s
         SentencePieceModelTypeArg::Char => "char",
         SentencePieceModelTypeArg::Word => "word",
     }
+}
+
+fn run_feature_extraction(args: ExtractFeaturesArgs) -> Result<()> {
+    let max_audio_duration_ms = duration_sec_to_ms(args.max_audio_duration_sec)?;
+    let architecture = resolve_extract_architecture(&args);
+    let frontend = feature_extractor_for_train_architecture(architecture);
+    let mut records = Vec::new();
+    for input in &args.inputs {
+        let remaining = args
+            .max_samples
+            .map(|limit| limit.saturating_sub(records.len()));
+        if remaining == Some(0) {
+            break;
+        }
+        records.extend(extract_feature_records(
+            input,
+            remaining,
+            args.tokenizer.as_deref(),
+            &frontend,
+            max_audio_duration_ms,
+        )?);
+    }
+    if records.is_empty() {
+        bail!("no records were extracted");
+    }
+    write_feature_records_parquet(&records, &args.output)?;
+    println!(
+        "wrote {} feature records to {}",
+        records.len(),
+        args.output.display()
+    );
+    Ok(())
+}
+
+fn write_feature_records_parquet(
+    records: &[w2v_bert_uk::train::FeatureRecord],
+    output: &Path,
+) -> Result<()> {
+    if let Some(parent) = output.parent().filter(|path| !path.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let ids = records
+        .iter()
+        .map(|record| record.id.as_str())
+        .collect::<Vec<_>>();
+    let texts = records
+        .iter()
+        .map(|record| record.text.as_deref())
+        .collect::<Vec<_>>();
+    let rows = records
+        .iter()
+        .map(|record| record.rows as u32)
+        .collect::<Vec<_>>();
+    let cols = records
+        .iter()
+        .map(|record| record.cols as u32)
+        .collect::<Vec<_>>();
+    let duration_ms = records
+        .iter()
+        .map(|record| record.duration_ms as u64)
+        .collect::<Vec<_>>();
+    let feature_items = records
+        .iter()
+        .map(|record| Series::new("".into(), record.features.as_slice()))
+        .collect::<Vec<_>>();
+    let token_items = records
+        .iter()
+        .map(|record| Series::new("".into(), record.tokens.as_slice()))
+        .collect::<Vec<_>>();
+    let mut features = feature_items.iter().collect::<ListChunked>().into_series();
+    features.rename("features".into());
+    let mut tokens = token_items.iter().collect::<ListChunked>().into_series();
+    tokens.rename("tokens".into());
+
+    let mut df = DataFrame::new(
+        records.len(),
+        vec![
+            Series::new("id".into(), ids).into_column(),
+            Series::new("text".into(), texts).into_column(),
+            Series::new("rows".into(), rows).into_column(),
+            Series::new("cols".into(), cols).into_column(),
+            Series::new("duration_ms".into(), duration_ms).into_column(),
+            features.into_column(),
+            tokens.into_column(),
+        ],
+    )?;
+    let mut file = fs::File::create(output)
+        .with_context(|| format!("failed to create {}", output.display()))?;
+    ParquetWriter::new(&mut file)
+        .finish(&mut df)
+        .with_context(|| format!("failed to write parquet {}", output.display()))?;
+    Ok(())
 }
 
 fn write_tokenizer_corpus(inputs: &[PathBuf], corpus_path: &Path) -> Result<usize> {
