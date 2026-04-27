@@ -47,7 +47,7 @@ use crate::paraformer::{
 use crate::squeezeformer::{SqueezeformerCtc, SqueezeformerCtcConfig, SqueezeformerEncoderConfig};
 use crate::tokenizer::{load_sentencepiece_tokenizer, load_sentencepiece_transcript_tokenizer};
 use crate::wav2vec::{Wav2VecBertConfig, Wav2VecBertCtc, Wav2VecBertCtcConfig};
-use crate::zipformer::{ZipformerConfig, ZipformerCtc, ZipformerCtcConfig};
+use crate::zipformer::{ZipformerConfig, ZipformerCtc, ZipformerCtcConfig, ZipformerKernelBackend};
 use crate::{W2vBertEncoderConfig, normalize_spaces};
 
 #[derive(Clone, Copy, Debug)]
@@ -1007,7 +1007,7 @@ fn run_burn_training_inner<InnerBackend>(
     devices: &[InnerBackend::Device],
 ) -> Result<TrainSummary>
 where
-    InnerBackend: Backend,
+    InnerBackend: Backend + ZipformerKernelBackend,
 {
     type TrainBackend<InnerBackend> = burn_autodiff::Autodiff<InnerBackend>;
     let device = devices
@@ -1326,7 +1326,7 @@ impl<B: Backend> ValidCtc<B> for SqueezeformerCtc<B> {
     }
 }
 
-impl<B: AutodiffBackend> TrainableCtc<B> for ZipformerCtc<B> {
+impl<B: AutodiffBackend + ZipformerKernelBackend> TrainableCtc<B> for ZipformerCtc<B> {
     fn ctc_logits(
         &self,
         features: Tensor<B, 3>,
@@ -1336,7 +1336,7 @@ impl<B: AutodiffBackend> TrainableCtc<B> for ZipformerCtc<B> {
     }
 }
 
-impl<B: Backend> ValidCtc<B> for ZipformerCtc<B> {
+impl<B: Backend + ZipformerKernelBackend> ValidCtc<B> for ZipformerCtc<B> {
     fn ctc_logits(
         &self,
         features: Tensor<B, 3>,

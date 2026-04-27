@@ -4,7 +4,7 @@ use clap::{Parser, ValueEnum};
 use std::time::{Duration, Instant};
 use w2v_bert_uk::squeezeformer::{SqueezeformerCtcConfig, SqueezeformerEncoderConfig};
 use w2v_bert_uk::wav2vec::{Wav2VecBertConfig, Wav2VecBertCtcConfig};
-use w2v_bert_uk::zipformer::{ZipformerConfig, ZipformerCtcConfig};
+use w2v_bert_uk::zipformer::{ZipformerConfig, ZipformerCtcConfig, ZipformerKernelBackend};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum BenchBackend {
@@ -153,7 +153,7 @@ fn run_wgpu(_args: Args) -> Result<()> {
 
 fn run_backend_body<B>(args: &Args, backend_name: &str, device: &B::Device) -> Result<()>
 where
-    B: Backend,
+    B: Backend + ZipformerKernelBackend,
 {
     let input_dim = resolved_input_dim(args);
     let lengths = input_lengths(args.batch, args.frames);

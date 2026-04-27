@@ -1,4 +1,6 @@
 use burn::module::{Initializer, Module, Param};
+#[cfg(feature = "asr-cubecl-kernels")]
+use burn::tensor::Int;
 use burn::tensor::activation::{sigmoid, silu, softmax, tanh};
 use burn::tensor::ops::PadMode;
 use burn::tensor::{Bool, Tensor, TensorData, backend::Backend};
@@ -11,6 +13,175 @@ const DEFAULT_NUM_LAYERS: [usize; 6] = [2, 2, 3, 4, 3, 2];
 const DEFAULT_NUM_HEADS: [usize; 6] = [4, 4, 4, 8, 4, 4];
 const DEFAULT_FEEDFORWARD_DIM: [usize; 6] = [512, 768, 1024, 1536, 1024, 768];
 const DEFAULT_CNN_KERNELS: [usize; 6] = [31, 31, 15, 15, 15, 31];
+
+pub trait ZipformerKernelBackend: Backend + Sized {
+    fn relative_shift(input: Tensor<Self, 4>, seq_len: usize) -> Tensor<Self, 4> {
+        relative_shift_fallback(input, seq_len)
+    }
+
+    fn mask_time(input: Tensor<Self, 3>, lengths: &[usize]) -> Tensor<Self, 3> {
+        mask_time_fallback(input, lengths)
+    }
+
+    fn mask_add_time(
+        residual: Tensor<Self, 3>,
+        update: Tensor<Self, 3>,
+        lengths: &[usize],
+    ) -> Tensor<Self, 3> {
+        mask_time_fallback(residual + update, lengths)
+    }
+
+    fn glu_last_dim(input: Tensor<Self, 3>) -> Tensor<Self, 3> {
+        glu_last_dim_fallback(input)
+    }
+
+    fn attention_mask_4d(
+        lengths: &[usize],
+        heads: usize,
+        query_len: usize,
+        key_len: usize,
+        device: &Self::Device,
+    ) -> Tensor<Self, 4, Bool> {
+        attention_key_mask_4d_fallback(lengths, heads, query_len, key_len, device)
+    }
+
+    fn pairwise_downsample(
+        input: Tensor<Self, 3>,
+        lengths: &[usize],
+        weights: Tensor<Self, 1>,
+    ) -> (Tensor<Self, 3>, Vec<usize>) {
+        pairwise_downsample_fallback(input, lengths, weights)
+    }
+}
+
+impl ZipformerKernelBackend for burn_ndarray::NdArray<f32> {}
+
+impl<B, C> ZipformerKernelBackend for burn_autodiff::Autodiff<B, C>
+where
+    B: Backend,
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
+{
+}
+
+#[cfg(all(feature = "asr-cubecl-kernels", feature = "burn-cuda-backend"))]
+impl<F, I> ZipformerKernelBackend for burn_cuda::Cuda<F, I>
+where
+    F: burn_cubecl::FloatElement,
+    I: burn_cubecl::IntElement,
+{
+    fn relative_shift(input: Tensor<Self, 4>, seq_len: usize) -> Tensor<Self, 4> {
+        crate::cubecl_kernels::relative_shift(input, seq_len)
+    }
+
+    fn mask_time(input: Tensor<Self, 3>, lengths: &[usize]) -> Tensor<Self, 3> {
+        crate::cubecl_kernels::mask_time(input, lengths)
+    }
+
+    fn mask_add_time(
+        residual: Tensor<Self, 3>,
+        update: Tensor<Self, 3>,
+        lengths: &[usize],
+    ) -> Tensor<Self, 3> {
+        let lengths = lengths_tensor::<Self>(lengths, &residual.device());
+        crate::cubecl_kernels::residual_add_mask_time(residual, update, lengths)
+    }
+
+    fn glu_last_dim(input: Tensor<Self, 3>) -> Tensor<Self, 3> {
+        crate::cubecl_kernels::glu_last_dim(input)
+    }
+
+    fn attention_mask_4d(
+        lengths: &[usize],
+        heads: usize,
+        query_len: usize,
+        key_len: usize,
+        device: &Self::Device,
+    ) -> Tensor<Self, 4, Bool> {
+        let lengths = lengths_tensor::<Self>(lengths, device);
+        crate::cubecl_kernels::attention_mask_4d_with_lengths(lengths, heads, query_len, key_len)
+    }
+
+    fn pairwise_downsample(
+        input: Tensor<Self, 3>,
+        lengths: &[usize],
+        weights: Tensor<Self, 1>,
+    ) -> (Tensor<Self, 3>, Vec<usize>) {
+        let output_lengths = downsample_lengths(lengths, 2);
+        let length_tensor = lengths_tensor::<Self>(lengths, &input.device());
+        let output = crate::cubecl_kernels::pairwise_downsample(input, length_tensor, weights);
+        (Self::mask_time(output, &output_lengths), output_lengths)
+    }
+}
+
+#[cfg(all(feature = "asr-cubecl-kernels", feature = "burn-wgpu-backend"))]
+impl<F, I, BT> ZipformerKernelBackend for burn_wgpu::Wgpu<F, I, BT>
+where
+    F: burn_cubecl::FloatElement,
+    I: burn_cubecl::IntElement,
+    BT: burn_cubecl::element::BoolElement,
+{
+    fn relative_shift(input: Tensor<Self, 4>, seq_len: usize) -> Tensor<Self, 4> {
+        crate::cubecl_kernels::relative_shift(input, seq_len)
+    }
+
+    fn mask_time(input: Tensor<Self, 3>, lengths: &[usize]) -> Tensor<Self, 3> {
+        crate::cubecl_kernels::mask_time(input, lengths)
+    }
+
+    fn mask_add_time(
+        residual: Tensor<Self, 3>,
+        update: Tensor<Self, 3>,
+        lengths: &[usize],
+    ) -> Tensor<Self, 3> {
+        let lengths = lengths_tensor::<Self>(lengths, &residual.device());
+        crate::cubecl_kernels::residual_add_mask_time(residual, update, lengths)
+    }
+
+    fn glu_last_dim(input: Tensor<Self, 3>) -> Tensor<Self, 3> {
+        crate::cubecl_kernels::glu_last_dim(input)
+    }
+
+    fn attention_mask_4d(
+        lengths: &[usize],
+        heads: usize,
+        query_len: usize,
+        key_len: usize,
+        device: &Self::Device,
+    ) -> Tensor<Self, 4, Bool> {
+        let lengths = lengths_tensor::<Self>(lengths, device);
+        crate::cubecl_kernels::attention_mask_4d_with_lengths(lengths, heads, query_len, key_len)
+    }
+
+    fn pairwise_downsample(
+        input: Tensor<Self, 3>,
+        lengths: &[usize],
+        weights: Tensor<Self, 1>,
+    ) -> (Tensor<Self, 3>, Vec<usize>) {
+        let output_lengths = downsample_lengths(lengths, 2);
+        let length_tensor = lengths_tensor::<Self>(lengths, &input.device());
+        let output = crate::cubecl_kernels::pairwise_downsample(input, length_tensor, weights);
+        (Self::mask_time(output, &output_lengths), output_lengths)
+    }
+}
+
+#[cfg(all(feature = "burn-cuda-backend", not(feature = "asr-cubecl-kernels")))]
+impl<F, I> ZipformerKernelBackend for burn_cuda::Cuda<F, I>
+where
+    F: burn_cubecl::FloatElement,
+    I: burn_cubecl::IntElement,
+    burn_cuda::Cuda<F, I>: Backend,
+{
+}
+
+#[cfg(all(feature = "burn-wgpu-backend", not(feature = "asr-cubecl-kernels")))]
+impl<F, I, BT> ZipformerKernelBackend for burn_wgpu::Wgpu<F, I, BT>
+where
+    F: burn_cubecl::FloatElement,
+    I: burn_cubecl::IntElement,
+    BT: burn_cubecl::element::BoolElement,
+    burn_wgpu::Wgpu<F, I, BT>: Backend,
+{
+}
 
 #[derive(Clone, Debug)]
 pub struct ZipformerConfig {
@@ -386,7 +557,7 @@ struct MultiHeadAttentionWeights<B: Backend> {
     pos_head_dim: usize,
 }
 
-impl<B: Backend> MultiHeadAttentionWeights<B> {
+impl<B: ZipformerKernelBackend> MultiHeadAttentionWeights<B> {
     fn forward(
         &self,
         input: Tensor<B, 3>,
@@ -416,11 +587,11 @@ impl<B: Backend> MultiHeadAttentionWeights<B> {
             .forward(pos_emb.unsqueeze_dim::<3>(0))
             .reshape([1, seq_len * 2 - 1, self.num_heads, self.pos_head_dim])
             .swap_dims(1, 2);
-        let pos_scores = relative_shift(p_query.matmul(rel.swap_dims(2, 3)), seq_len);
+        let pos_scores = B::relative_shift(p_query.matmul(rel.swap_dims(2, 3)), seq_len);
         let mut scores = content_scores + pos_scores;
 
         let key_mask =
-            attention_key_mask_4d::<B>(lengths, self.num_heads, seq_len, seq_len, &scores.device());
+            B::attention_mask_4d(lengths, self.num_heads, seq_len, seq_len, &scores.device());
         let negative = Tensor::full(
             [batch_size, self.num_heads, seq_len, seq_len],
             -1.0e4,
@@ -546,7 +717,7 @@ impl<B: Backend> NonLinearAttention<B> {
     }
 }
 
-fn relative_shift<B: Backend>(input: Tensor<B, 4>, seq_len: usize) -> Tensor<B, 4> {
+fn relative_shift_fallback<B: Backend>(input: Tensor<B, 4>, seq_len: usize) -> Tensor<B, 4> {
     let [batch_size, n_heads, _, pos_len] = input.dims();
     let padded = input.pad([(0, 0), (0, 1)], PadMode::Constant(0.0));
     padded
@@ -651,7 +822,7 @@ struct ConvEmbed<B: Backend> {
     conv3_balancer: ActivationBalancer<B>,
 }
 
-impl<B: Backend> ConvEmbed<B> {
+impl<B: ZipformerKernelBackend> ConvEmbed<B> {
     fn forward(&self, input: Tensor<B, 3>, lengths: Vec<usize>) -> (Tensor<B, 3>, Vec<usize>) {
         let mut output = input.unsqueeze_dim::<4>(1);
         output = swoosh_r(self.conv1_balancer.forward(self.conv1.forward(output)));
@@ -684,7 +855,7 @@ impl<B: Backend> ConvEmbed<B> {
                 .min(time)
             })
             .collect();
-        (mask_time(output, &lengths), lengths)
+        (B::mask_time(output, &lengths), lengths)
     }
 }
 
@@ -739,7 +910,7 @@ struct ZipformerStack<B: Backend> {
     blocks: Vec<ZipformerBlock<B>>,
 }
 
-impl<B: Backend> ZipformerStack<B> {
+impl<B: ZipformerKernelBackend> ZipformerStack<B> {
     fn forward(&self, input: Tensor<B, 3>, lengths: &[usize]) -> Tensor<B, 3> {
         let target_len = input.dims()[1];
         let residual = input.clone();
@@ -756,7 +927,7 @@ impl<B: Backend> ZipformerStack<B> {
         } else {
             output
         };
-        mask_time(output, lengths)
+        B::mask_time(output, lengths)
     }
 }
 
@@ -852,7 +1023,7 @@ struct ZipformerBlock<B: Backend> {
     whiten: Whiten,
 }
 
-impl<B: Backend> ZipformerBlock<B> {
+impl<B: ZipformerKernelBackend> ZipformerBlock<B> {
     fn forward(
         &self,
         input: Tensor<B, 3>,
@@ -864,34 +1035,35 @@ impl<B: Backend> ZipformerBlock<B> {
             .forward(input.clone(), pos_emb, lengths);
 
         let residual = input.clone();
-        let mut output = mask_add_time(input.clone(), self.feed_forward1.forward(input), lengths);
-        output = mask_add_time(
+        let mut output =
+            B::mask_add_time(input.clone(), self.feed_forward1.forward(input), lengths);
+        output = B::mask_add_time(
             output.clone(),
             self.non_linear_attention
                 .forward(output.clone(), attn_weights.clone()),
             lengths,
         );
-        output = mask_add_time(
+        output = B::mask_add_time(
             output.clone(),
             self.self_attention1
                 .forward(output.clone(), attn_weights.clone()),
             lengths,
         );
-        output = mask_add_time(output.clone(), self.conv1.forward(output, lengths), lengths);
-        output = mask_add_time(output.clone(), self.feed_forward2.forward(output), lengths);
-        output = mask_time(self.mid_bypass.forward(residual.clone(), output), lengths);
+        output = B::mask_add_time(output.clone(), self.conv1.forward(output, lengths), lengths);
+        output = B::mask_add_time(output.clone(), self.feed_forward2.forward(output), lengths);
+        output = B::mask_time(self.mid_bypass.forward(residual.clone(), output), lengths);
 
-        output = mask_add_time(
+        output = B::mask_add_time(
             output.clone(),
             self.self_attention2.forward(output.clone(), attn_weights),
             lengths,
         );
-        output = mask_add_time(output.clone(), self.conv2.forward(output, lengths), lengths);
+        output = B::mask_add_time(output.clone(), self.conv2.forward(output, lengths), lengths);
         output = output.clone() + self.feed_forward3.forward(output);
         output = self
             .output_norm
             .forward(self.block_balancer.forward(output));
-        self.whiten.forward(mask_time(
+        self.whiten.forward(B::mask_time(
             self.output_bypass.forward(residual, output),
             lengths,
         ))
@@ -991,18 +1163,18 @@ struct ZipformerConvModule<B: Backend> {
     dropout: Dropout,
 }
 
-impl<B: Backend> ZipformerConvModule<B> {
+impl<B: ZipformerKernelBackend> ZipformerConvModule<B> {
     fn forward(&self, input: Tensor<B, 3>, lengths: &[usize]) -> Tensor<B, 3> {
         let [batch_size, seq_len, dim] = input.dims();
         let output = self.input_balancer.forward(self.input_proj.forward(input));
-        let output = glu_last_dim(output).swap_dims(1, 2);
+        let output = B::glu_last_dim(output).swap_dims(1, 2);
         let output = silu(self.depthwise.forward(output));
         let output = self.depthwise_balancer.forward(output.swap_dims(1, 2));
         let output = self
             .dropout
             .forward(self.output_proj.forward(swoosh_r(output)));
         let output = output.reshape([batch_size, seq_len, dim]);
-        mask_time(output, lengths)
+        B::mask_time(output, lengths)
     }
 }
 
@@ -1020,42 +1192,15 @@ impl<B: Backend> Downsample<B> {
             factor,
         }
     }
+}
 
+impl<B: ZipformerKernelBackend> Downsample<B> {
     fn forward(&self, input: Tensor<B, 3>, lengths: &[usize]) -> (Tensor<B, 3>, Vec<usize>) {
         if self.factor == 1 {
             return (input, lengths.to_vec());
         }
 
-        let [batch_size, seq_len, dim] = input.dims();
-        let output_len = ceil_divide(seq_len, self.factor);
-        let padded_len = output_len * self.factor;
-        let pad = padded_len - seq_len;
-        let output = if pad > 0 {
-            input.pad([(0, pad), (0, 0)], PadMode::Edge)
-        } else {
-            input
-        };
-
-        let window = output.reshape([batch_size, output_len, self.factor, dim]);
-        let weights = softmax(self.weights.val(), 0).reshape([1, 1, self.factor, 1]);
-        let mask = padded_sequence_mask::<B>(lengths, seq_len, padded_len, &window.device())
-            .float()
-            .reshape([batch_size, output_len, self.factor, 1]);
-        let masked_weights = weights * mask;
-        let denom = masked_weights
-            .clone()
-            .sum_dim(2)
-            .reshape([batch_size, output_len, 1])
-            .clamp_min(1.0e-8);
-        let output = (window * masked_weights)
-            .sum_dim(2)
-            .reshape([batch_size, output_len, dim])
-            / denom;
-        let lengths = lengths
-            .iter()
-            .map(|length| ceil_divide(*length, self.factor))
-            .collect::<Vec<_>>();
-        (mask_time(output, &lengths), lengths)
+        B::pairwise_downsample(input, lengths, self.weights.val())
     }
 }
 
@@ -1074,7 +1219,9 @@ impl<B: Backend> PairwiseDownsample<B> {
             factor,
         }
     }
+}
 
+impl<B: ZipformerKernelBackend> PairwiseDownsample<B> {
     fn forward(&self, input: Tensor<B, 3>, lengths: &[usize]) -> (Tensor<B, 3>, Vec<usize>) {
         let mut output = input;
         let mut output_lengths = lengths.to_vec();
@@ -1119,7 +1266,7 @@ pub struct ZipformerEncoder<B: Backend> {
     output_downsample: PairwiseDownsample<B>,
 }
 
-impl<B: Backend> ZipformerEncoder<B> {
+impl<B: ZipformerKernelBackend> ZipformerEncoder<B> {
     pub fn forward(
         &self,
         features: Tensor<B, 3>,
@@ -1129,7 +1276,7 @@ impl<B: Backend> ZipformerEncoder<B> {
         let mut outputs = Vec::with_capacity(self.stacks.len());
         for (index, stack) in self.stacks.iter().enumerate() {
             output = convert_num_channels(output, self.encoder_dim[index]);
-            output = mask_time(output, &lengths);
+            output = B::mask_time(output, &lengths);
             output = stack.forward(output, &lengths);
             outputs.push(output.clone());
         }
@@ -1146,7 +1293,7 @@ impl<B: Backend> ZipformerEncoder<B> {
             output = add_channel_prefix(output, piece);
         }
         let (output, lengths) = self.output_downsample.forward(output, &lengths);
-        (mask_time(output, &lengths), lengths)
+        (B::mask_time(output, &lengths), lengths)
     }
 }
 
@@ -1178,7 +1325,7 @@ pub struct ZipformerCtc<B: Backend> {
     classifier: Linear<B>,
 }
 
-impl<B: Backend> ZipformerCtc<B> {
+impl<B: ZipformerKernelBackend> ZipformerCtc<B> {
     pub fn forward(&self, features: Tensor<B, 3>) -> Tensor<B, 3> {
         let [batch_size, seq_len, _] = features.dims();
         self.forward_with_lengths(features, vec![seq_len; batch_size])
@@ -1236,6 +1383,22 @@ fn ceil_divide(value: usize, factor: usize) -> usize {
     }
 }
 
+fn downsample_lengths(lengths: &[usize], factor: usize) -> Vec<usize> {
+    lengths
+        .iter()
+        .map(|length| ceil_divide(*length, factor))
+        .collect()
+}
+
+#[cfg(feature = "asr-cubecl-kernels")]
+fn lengths_tensor<B: Backend>(lengths: &[usize], device: &B::Device) -> Tensor<B, 1, Int> {
+    let values = lengths
+        .iter()
+        .map(|length| i32::try_from(*length).expect("Zipformer lengths must fit in i32"))
+        .collect::<Vec<_>>();
+    Tensor::from_ints(values.as_slice(), device)
+}
+
 fn expand_stack_values(values: &[usize], num_stacks: usize) -> Vec<usize> {
     match values.len() {
         1 => vec![values[0]; num_stacks],
@@ -1258,7 +1421,7 @@ fn sequence_mask<B: Backend>(
     Tensor::from_data(TensorData::new(values, [lengths.len(), max_len]), device)
 }
 
-fn attention_key_mask_4d<B: Backend>(
+fn attention_key_mask_4d_fallback<B: Backend>(
     lengths: &[usize],
     heads: usize,
     query_len: usize,
@@ -1297,7 +1460,7 @@ fn padded_sequence_mask<B: Backend>(
     Tensor::from_data(TensorData::new(values, [lengths.len(), padded_len]), device)
 }
 
-fn mask_time<B: Backend>(input: Tensor<B, 3>, lengths: &[usize]) -> Tensor<B, 3> {
+fn mask_time_fallback<B: Backend>(input: Tensor<B, 3>, lengths: &[usize]) -> Tensor<B, 3> {
     let seq_len = input.dims()[1];
     let mask = sequence_mask::<B>(lengths, seq_len, &input.device())
         .float()
@@ -1305,19 +1468,45 @@ fn mask_time<B: Backend>(input: Tensor<B, 3>, lengths: &[usize]) -> Tensor<B, 3>
     input * mask
 }
 
-fn mask_add_time<B: Backend>(
-    residual: Tensor<B, 3>,
-    update: Tensor<B, 3>,
-    lengths: &[usize],
-) -> Tensor<B, 3> {
-    mask_time(residual + update, lengths)
-}
-
-fn glu_last_dim<B: Backend>(input: Tensor<B, 3>) -> Tensor<B, 3> {
+fn glu_last_dim_fallback<B: Backend>(input: Tensor<B, 3>) -> Tensor<B, 3> {
     let mut chunks = input.chunk(2, 2);
     let gate = chunks.remove(1);
     let value = chunks.remove(0);
     value * sigmoid(gate)
+}
+
+fn pairwise_downsample_fallback<B: Backend>(
+    input: Tensor<B, 3>,
+    lengths: &[usize],
+    weights: Tensor<B, 1>,
+) -> (Tensor<B, 3>, Vec<usize>) {
+    let [batch_size, seq_len, dim] = input.dims();
+    let output_len = ceil_divide(seq_len, 2);
+    let padded_len = output_len * 2;
+    let pad = padded_len - seq_len;
+    let output = if pad > 0 {
+        input.pad([(0, pad), (0, 0)], PadMode::Edge)
+    } else {
+        input
+    };
+
+    let window = output.reshape([batch_size, output_len, 2, dim]);
+    let weights = softmax(weights, 0).reshape([1, 1, 2, 1]);
+    let mask = padded_sequence_mask::<B>(lengths, seq_len, padded_len, &window.device())
+        .float()
+        .reshape([batch_size, output_len, 2, 1]);
+    let masked_weights = weights * mask;
+    let denom = masked_weights
+        .clone()
+        .sum_dim(2)
+        .reshape([batch_size, output_len, 1])
+        .clamp_min(1.0e-8);
+    let output = (window * masked_weights)
+        .sum_dim(2)
+        .reshape([batch_size, output_len, dim])
+        / denom;
+    let lengths = downsample_lengths(lengths, 2);
+    (mask_time_fallback(output, &lengths), lengths)
 }
 
 #[cfg(test)]
