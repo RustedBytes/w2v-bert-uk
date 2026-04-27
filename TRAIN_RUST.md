@@ -165,6 +165,10 @@ Burn's built-in matmul, convolution, softmax, and elementwise kernels:
 | `ZipformerSwooshL` | Zipformer | fused `x * sigmoid(x - 4)` |
 | `ZipformerSwooshR` | Zipformer | fused `x * sigmoid(x - 1)` |
 | `RelativeShift` | Squeezeformer, Zipformer | relative-position attention shift |
+| `MaskTime` / `MaskChannelTime` | Squeezeformer, Zipformer, W2V-BERT, Paraformer | fused length masking |
+| `SequenceMask` / `PaddingMask` / `AttentionMask` | Squeezeformer, Zipformer, W2V-BERT, Paraformer | mask construction from lengths |
+| `Glu` | Zipformer, W2V-BERT convolution modules | fused gated linear unit |
+| `PairwiseDownsample` | Zipformer | learned softmax pairwise downsample with mask normalization |
 
 Build with the feature when experimenting with direct CubeCL kernels:
 
@@ -194,6 +198,15 @@ COLAB_BASE_IMAGE=nvidia/cuda:12.4.1-devel-ubuntu20.04 \
 
 The default trainer path still uses portable Burn tensor operations unless code
 is explicitly routed through `w2v_bert_uk::cubecl_kernels`.
+
+Example CUDA benchmark run:
+
+```bash
+cargo run --release \
+  --features burn-cuda-backend,asr-cubecl-kernels \
+  --bin asr-kernel-bench -- \
+  --backend cuda --batch 8 --seq-len 512 --channels 512 --heads 8
+```
 
 ## Architecture And Feature Dimensions
 

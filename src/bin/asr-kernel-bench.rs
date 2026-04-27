@@ -94,7 +94,7 @@ mod bench {
     use super::{Args, BenchBackend};
     use crate::cubecl_kernels;
     use anyhow::{Result, bail};
-    use burn::tensor::activation::sigmoid;
+    use burn::tensor::activation::{sigmoid, softmax};
     use burn::tensor::ops::PadMode;
     use burn::tensor::{Bool, Int, Tensor, TensorData, backend::Backend};
     use std::time::{Duration, Instant};
@@ -261,6 +261,32 @@ mod bench {
                 },
                 || {
                     let _ = cubecl_kernels::mask_channel_time(channel_time.clone(), &lengths);
+                },
+                $device,
+            )?);
+
+            let downsample_weights = Tensor::<$backend_type, 1>::from_data(
+                TensorData::new(vec![0.25f32, -0.25], [2]),
+                $device,
+            );
+            cases.push(run_comparison_case::<$backend_type, _, _>(
+                "pairwise_downsample",
+                $args.iters,
+                $args.warmup,
+                $args.batch * $args.seq_len.div_ceil(2) * $args.channels,
+                || {
+                    let _ = standard_pairwise_downsample(
+                        activation.clone(),
+                        &lengths,
+                        downsample_weights.clone(),
+                    );
+                },
+                || {
+                    let _ = cubecl_kernels::pairwise_downsample(
+                        activation.clone(),
+                        lengths_tensor.clone(),
+                        downsample_weights.clone(),
+                    );
                 },
                 $device,
             )?);
@@ -506,6 +532,45 @@ mod bench {
         input * mask
     }
 
+    fn standard_pairwise_downsample<B: Backend>(
+        input: Tensor<B, 3>,
+        lengths: &[usize],
+        weights: Tensor<B, 1>,
+    ) -> Tensor<B, 3> {
+        let [batch_size, seq_len, channels] = input.dims();
+        let output_len = seq_len.div_ceil(2);
+        let padded_len = output_len * 2;
+        let pad = padded_len - seq_len;
+        let output = if pad > 0 {
+            input.pad([(0, pad), (0, 0)], PadMode::Edge)
+        } else {
+            input
+        };
+        let window = output.reshape([batch_size, output_len, 2, channels]);
+        let weights = softmax(weights, 0).reshape([1, 1, 2, 1]);
+        let mask =
+            standard_padded_sequence_mask::<B>(lengths, seq_len, padded_len, &window.device())
+                .float()
+                .reshape([batch_size, output_len, 2, 1]);
+        let masked_weights = weights * mask;
+        let denom = masked_weights
+            .clone()
+            .sum_dim(2)
+            .reshape([batch_size, output_len, 1])
+            .clamp_min(1.0e-8);
+        let output = (window * masked_weights)
+            .sum_dim(2)
+            .reshape([batch_size, output_len, channels])
+            / denom;
+        standard_mask_time(
+            output,
+            &lengths
+                .iter()
+                .map(|length| length.div_ceil(2))
+                .collect::<Vec<_>>(),
+        )
+    }
+
     fn standard_glu_last_dim<B: Backend>(input: Tensor<B, 3>) -> Tensor<B, 3> {
         let mut chunks = input.chunk(2, 2);
         let gate = chunks.remove(1);
@@ -527,5 +592,21 @@ mod bench {
                 seq_len.saturating_sub(trim).max(1)
             })
             .collect()
+    }
+
+    fn standard_padded_sequence_mask<B: Backend>(
+        lengths: &[usize],
+        original_len: usize,
+        padded_len: usize,
+        device: &B::Device,
+    ) -> Tensor<B, 2, Bool> {
+        let mut values = Vec::with_capacity(lengths.len() * padded_len);
+        for length in lengths {
+            for index in 0..padded_len {
+                let source_index = index.min(original_len.saturating_sub(1));
+                values.push(source_index < *length);
+            }
+        }
+        Tensor::from_data(TensorData::new(values, [lengths.len(), padded_len]), device)
     }
 }

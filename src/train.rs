@@ -6079,9 +6079,9 @@ fn cubecl_kernel_status(config: &BurnTrainConfig) -> &'static str {
     }
 
     match config.backend {
-        TrainBackendKind::Cpu => "inactive (cpu backend)",
-        TrainBackendKind::Cuda => "active (cuda)",
-        TrainBackendKind::Wgpu => "active (wgpu)",
+        TrainBackendKind::Cpu => "available, not routed (cpu backend)",
+        TrainBackendKind::Cuda => "available, explicit kernels only (cuda)",
+        TrainBackendKind::Wgpu => "available, explicit kernels only (wgpu)",
     }
 }
 
@@ -6239,8 +6239,7 @@ fn run_config_json(config: &BurnTrainConfig) -> Value {
         },
         "cubecl_kernels": {
             "compiled": cfg!(feature = "asr-cubecl-kernels"),
-            "active": cfg!(feature = "asr-cubecl-kernels")
-                && matches!(config.backend, TrainBackendKind::Cuda | TrainBackendKind::Wgpu),
+            "active": false,
             "status": cubecl_kernel_status(config),
         },
         "device_index": config.device_index,

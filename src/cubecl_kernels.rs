@@ -43,6 +43,8 @@ pub enum AsrKernelTarget {
     AttentionMask,
     /// Fuse `value * sigmoid(gate)` after splitting channels.
     Glu,
+    /// Zipformer learned pairwise downsample for `[batch, time, channels]`.
+    PairwiseDownsample,
 }
 
 /// Static analysis of the current ASR architectures and where custom CubeCL
@@ -57,6 +59,7 @@ pub const ASR_KERNEL_TARGETS: &[AsrKernelTarget] = &[
     AsrKernelTarget::PaddingMask,
     AsrKernelTarget::AttentionMask,
     AsrKernelTarget::Glu,
+    AsrKernelTarget::PairwiseDownsample,
 ];
 
 /// Fused Zipformer Swoosh-L activation for non-fusion CubeCL backends.
@@ -330,6 +333,29 @@ where
 {
     let primitive = into_float_cube(input);
     let output = glu_cube(primitive, GluLayout::BatchChannelsTime);
+    BurnTensor::from_primitive(TensorPrimitive::Float(output))
+}
+
+/// Fused Zipformer learned pairwise downsample for `[batch, time, channels]`.
+///
+/// `weights` is the two-logit parameter from one PositiveLoss/Rust downsample
+/// stage. The kernel applies softmax weights, edge padding for odd frame counts,
+/// and length-mask normalization in one pass.
+pub fn pairwise_downsample<R, F, I, BT>(
+    input: BurnTensor<AsrCubeBackend<R, F, I, BT>, 3>,
+    lengths: BurnTensor<AsrCubeBackend<R, F, I, BT>, 1, BurnInt>,
+    weights: BurnTensor<AsrCubeBackend<R, F, I, BT>, 1>,
+) -> BurnTensor<AsrCubeBackend<R, F, I, BT>, 3>
+where
+    R: CubeRuntime,
+    F: FloatElement,
+    I: IntElement,
+    BT: BoolElement,
+{
+    let input = into_float_cube(input);
+    let lengths = lengths.into_primitive();
+    let weights = into_float_cube(weights);
+    let output = pairwise_downsample_cube(input, lengths, weights);
     BurnTensor::from_primitive(TensorPrimitive::Float(output))
 }
 
@@ -641,6 +667,53 @@ fn glu_cube<R: CubeRuntime>(input: CubeTensor<R>, layout: GluLayout) -> CubeTens
     output
 }
 
+fn pairwise_downsample_cube<R: CubeRuntime>(
+    input: CubeTensor<R>,
+    lengths: CubeTensor<R>,
+    weights: CubeTensor<R>,
+) -> CubeTensor<R> {
+    let [batch, time, channels] = input.shape().dims();
+    assert_eq!(
+        lengths.shape().dims::<1>()[0],
+        batch,
+        "pairwise_downsample lengths must match input batch size"
+    );
+    assert_eq!(
+        weights.shape().dims::<1>()[0],
+        2,
+        "pairwise_downsample weights must have shape [2]"
+    );
+
+    let output_time = time.div_ceil(2);
+    let output_shape = Shape::new([batch, output_time, channels]);
+    let output = empty_device_dtype(
+        input.client.clone(),
+        input.device.clone(),
+        output_shape,
+        input.dtype,
+    );
+    let num_elems = output.meta.num_elements();
+    let cube_dim = CubeDim::new(&output.client, num_elems);
+    let cube_count = calculate_cube_count_elemwise(&output.client, num_elems, cube_dim);
+    let dtype = output.dtype;
+    let int_dtype = lengths.dtype;
+
+    pairwise_downsample_kernel::launch(
+        &output.client,
+        cube_count,
+        cube_dim,
+        input.into_tensor_arg(),
+        lengths.into_tensor_arg(),
+        weights.into_tensor_arg(),
+        output.clone().into_tensor_arg(),
+        PairwiseDownsampleArgsLaunch::new(batch, time, channels, output_time),
+        dtype.into(),
+        int_dtype.into(),
+    );
+
+    output
+}
+
 #[cube(launch)]
 fn swoosh_kernel<E: Float>(
     input: &Tensor<E>,
@@ -709,6 +782,18 @@ struct GluArgs {
     dim1: usize,
     #[cube(comptime)]
     dim2: usize,
+}
+
+#[derive(CubeLaunch, CubeType)]
+struct PairwiseDownsampleArgs {
+    #[cube(comptime)]
+    batch: usize,
+    #[cube(comptime)]
+    time: usize,
+    #[cube(comptime)]
+    channels: usize,
+    #[cube(comptime)]
+    output_time: usize,
 }
 
 #[cube(launch)]
@@ -936,5 +1021,59 @@ fn mask_channel_time_kernel<E: Float, I: Int>(
         output[pos] = input[pos];
     } else {
         output[pos] = E::new(0.0);
+    }
+}
+
+#[cube(launch)]
+fn pairwise_downsample_kernel<E: Float, I: Int>(
+    input: &Tensor<E>,
+    lengths: &Tensor<I>,
+    weights: &Tensor<E>,
+    output: &mut Tensor<E>,
+    args: &PairwiseDownsampleArgs,
+    #[define(E)] _dtype: StorageType,
+    #[define(I)] _int_dtype: StorageType,
+) {
+    let pos = ABSOLUTE_POS;
+    if pos >= output.len() {
+        terminate!();
+    }
+
+    let batch = comptime![args.batch];
+    let time = comptime![args.time];
+    let channels = comptime![args.channels];
+    let output_time = comptime![args.output_time];
+
+    let channel_index = pos % channels;
+    let output_time_index = (pos / channels) % output_time;
+    let batch_index = pos / (output_time * channels);
+
+    if batch_index >= batch {
+        terminate!();
+    }
+
+    let length = usize::cast_from(lengths[batch_index]);
+    let source0_time = output_time_index * 2;
+    let source1_raw = source0_time + 1;
+    let source1_time = source1_raw.min(time - 1);
+
+    let w0_exp = E::exp(weights[0]);
+    let w1_exp = E::exp(weights[1]);
+    let weight_sum = w0_exp + w1_exp;
+    let w0 = w0_exp / weight_sum;
+    let w1 = w1_exp / weight_sum;
+
+    let valid0 = source0_time < length;
+    let valid1 = source1_time < length;
+    let masked_w0 = if valid0 { w0 } else { E::new(0.0) };
+    let masked_w1 = if valid1 { w1 } else { E::new(0.0) };
+    let denom = masked_w0 + masked_w1;
+
+    if denom <= E::new(0.0) {
+        output[pos] = E::new(0.0);
+    } else {
+        let source0 = ((batch_index * time + source0_time) * channels) + channel_index;
+        let source1 = ((batch_index * time + source1_time) * channels) + channel_index;
+        output[pos] = (input[source0] * masked_w0 + input[source1] * masked_w1) / denom;
     }
 }
