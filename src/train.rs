@@ -5856,6 +5856,7 @@ struct TrainingTui {
     started: Instant,
     stdout: std::io::Stdout,
     architecture: String,
+    cubecl_kernel_status: String,
     output_dir: PathBuf,
     metrics: TuiMetrics,
 }
@@ -5869,6 +5870,7 @@ impl TrainingTui {
             started,
             stdout,
             architecture: architecture_name(&config.architecture).to_string(),
+            cubecl_kernel_status: cubecl_kernel_status(config).to_string(),
             output_dir: config.output_dir.clone(),
             metrics: TuiMetrics {
                 phase: "starting".to_string(),
@@ -5941,6 +5943,7 @@ impl TrainingTui {
             ResetColor,
             SetAttribute(Attribute::Reset),
             Print(format!("architecture: {}\n", self.architecture)),
+            Print(format!("cubecl kernels: {}\n", self.cubecl_kernel_status)),
             Print(format!("output: {}\n", self.output_dir.display())),
             Print(format!(
                 "elapsed: {:.1}s   phase: {}   event: {}\n\n",
@@ -5995,6 +5998,18 @@ impl TrainingTui {
         )
         .context("failed to draw training TUI")?;
         self.stdout.flush().context("failed to flush training TUI")
+    }
+}
+
+fn cubecl_kernel_status(config: &BurnTrainConfig) -> &'static str {
+    if !cfg!(feature = "asr-cubecl-kernels") {
+        return "inactive (feature off)";
+    }
+
+    match config.backend {
+        TrainBackendKind::Cpu => "inactive (cpu backend)",
+        TrainBackendKind::Cuda => "active (cuda)",
+        TrainBackendKind::Wgpu => "active (wgpu)",
     }
 }
 
@@ -6145,6 +6160,12 @@ fn run_config_json(config: &BurnTrainConfig) -> Value {
             TrainBackendKind::Cpu => "cpu",
             TrainBackendKind::Cuda => "cuda",
             TrainBackendKind::Wgpu => "wgpu",
+        },
+        "cubecl_kernels": {
+            "compiled": cfg!(feature = "asr-cubecl-kernels"),
+            "active": cfg!(feature = "asr-cubecl-kernels")
+                && matches!(config.backend, TrainBackendKind::Cuda | TrainBackendKind::Wgpu),
+            "status": cubecl_kernel_status(config),
         },
         "device_index": config.device_index,
         "device_indices": config.device_indices,
