@@ -104,7 +104,10 @@ start	end	score	text
 
 The `score` is the minimum mean frame log-probability window from the paper. By
 default the tool infers the CTC frame duration from `audio duration / CTC
-frames`; pass `--index-duration` if your model requires a fixed value.
+frames`; pass `--index-duration` if your model requires a fixed value. The
+aligner uses the reference moving-window table fill to keep memory bounded by
+`window_size * transcript_tokens`; tune `--min-window-size` and
+`--max-window-size` for long recordings.
 
 For Rust callers, `TranscriptionConfig` is split by processing stage:
 

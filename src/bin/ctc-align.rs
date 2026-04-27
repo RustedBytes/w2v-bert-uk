@@ -94,6 +94,14 @@ struct Args {
     #[arg(long, default_value_t = 30)]
     score_min_mean_over_l: usize,
 
+    /// Initial CTC segmentation window size in frames.
+    #[arg(long, default_value_t = 8000)]
+    min_window_size: usize,
+
+    /// Maximum CTC segmentation window size in frames.
+    #[arg(long, default_value_t = 100000)]
+    max_window_size: usize,
+
     /// Treat blank-state self transitions as zero-cost.
     #[arg(long)]
     blank_transition_cost_zero: bool,
@@ -208,6 +216,8 @@ fn main() -> Result<()> {
             blank_id: args.blank_id,
             index_duration,
             score_min_mean_over_l: args.score_min_mean_over_l,
+            min_window_size: args.min_window_size,
+            max_window_size: args.max_window_size,
             blank_transition_cost_zero: args.blank_transition_cost_zero,
             preamble_transition_cost_zero: !args.no_preamble_transition_cost_zero,
         },

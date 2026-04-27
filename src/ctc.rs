@@ -15,6 +15,8 @@ pub struct CtcAlignmentConfig {
     pub blank_id: u32,
     pub index_duration: f64,
     pub score_min_mean_over_l: usize,
+    pub min_window_size: usize,
+    pub max_window_size: usize,
     pub blank_transition_cost_zero: bool,
     pub preamble_transition_cost_zero: bool,
 }
@@ -25,6 +27,8 @@ impl Default for CtcAlignmentConfig {
             blank_id: 0,
             index_duration: 0.025,
             score_min_mean_over_l: 30,
+            min_window_size: 8000,
+            max_window_size: 100000,
             blank_transition_cost_zero: false,
             preamble_transition_cost_zero: true,
         }
@@ -234,60 +238,29 @@ pub fn align_token_sequences(
         }
     }
 
-    let (table, mut t, mut c) = fill_alignment_table(
+    let inputs = AlignmentInputs {
         log_probs,
-        frames,
         vocab_size,
-        &ground_truth,
+        ground_truth: &ground_truth,
         blank,
-        config.blank_transition_cost_zero,
-        config.preamble_transition_cost_zero,
-    );
+    };
+    let mut window_size = config.min_window_size.max(1).min(frames);
+    let max_window_size = config.max_window_size.max(window_size).min(frames);
+    let (timings, frame_log_probs, states) = loop {
+        let table = fill_alignment_table(&inputs, frames, window_size, config);
 
-    let mut timings = vec![0.0; ground_truth.len()];
-    let mut frame_log_probs = vec![0.0; frames];
-    let mut states = vec![None; frames];
-
-    while t != 0 || c != 0 {
-        if c == 0 {
-            frame_log_probs[t] = 0.0;
-            t = t.saturating_sub(1);
-            continue;
+        match backtrack_alignment(&table, &inputs, frames, config) {
+            Ok(alignment) => break alignment,
+            Err(BacktrackError::WindowTooSmall) if window_size < max_window_size => {
+                window_size = (window_size * 2).min(max_window_size);
+            }
+            Err(BacktrackError::WindowTooSmall) => {
+                bail!(
+                    "CTC alignment backtracking failed within max window size {max_window_size}; check transcript/audio alignment"
+                );
+            }
         }
-        if t == 0 {
-            bail!("CTC alignment backtracking reached the first frame before consuming all text");
-        }
-
-        let token = ground_truth[c] as usize;
-        let switch_prob =
-            table[(t - 1) * ground_truth.len() + (c - 1)] + log_probs[t * vocab_size + token];
-        let stay_prob = stay_transition_log_prob(
-            &table,
-            log_probs,
-            frames,
-            vocab_size,
-            ground_truth.len(),
-            &ground_truth,
-            t,
-            c,
-            blank,
-            config.blank_transition_cost_zero,
-            config.preamble_transition_cost_zero,
-        );
-
-        if switch_prob >= stay_prob {
-            timings[c] = t as f64 * config.index_duration;
-            frame_log_probs[t] = log_probs[t * vocab_size + token];
-            states[t] = Some(token as u32);
-            c -= 1;
-            t -= 1;
-        } else {
-            let stay_prob = stay_frame_log_prob(log_probs, vocab_size, &ground_truth, t, c, blank);
-            frame_log_probs[t] = stay_prob;
-            states[t] = None;
-            t -= 1;
-        }
-    }
+    };
 
     let segments = determine_utterance_segments(
         config,
@@ -349,98 +322,211 @@ fn prepare_token_list(utterances: &[Vec<u32>], blank_id: u32) -> (Vec<i64>, Vec<
     (ground_truth, utterance_begin_indices)
 }
 
-fn fill_alignment_table(
-    log_probs: &[f32],
-    frames: usize,
-    vocab_size: usize,
-    ground_truth: &[i64],
-    blank: usize,
-    blank_transition_cost_zero: bool,
-    preamble_transition_cost_zero: bool,
-) -> (Vec<f32>, usize, usize) {
-    let states = ground_truth.len();
-    let mut table = vec![f32::NEG_INFINITY; frames * states];
-    table[0] = 0.0;
+struct AlignmentTable {
+    values: Vec<f32>,
+    window_size: usize,
+    states: usize,
+    offsets: Vec<usize>,
+    best_t: usize,
+    best_c: usize,
+}
 
-    for t in 1..frames {
-        table[t * states] = if preamble_transition_cost_zero {
-            0.0
-        } else {
-            table[(t - 1) * states] + log_probs[t * vocab_size + blank]
-        };
+impl AlignmentTable {
+    fn get(&self, t: usize, c: usize) -> Option<f32> {
+        (t < self.window_size && c < self.states).then(|| self.values[t * self.states + c])
     }
 
-    for t in 1..frames {
-        for c in 1..states {
-            let token = ground_truth[c] as usize;
-            let switch_prob = table[(t - 1) * states + (c - 1)] + log_probs[t * vocab_size + token];
-            let stay_prob = stay_transition_log_prob(
-                &table,
-                log_probs,
-                frames,
-                vocab_size,
-                states,
-                ground_truth,
-                t,
-                c,
-                blank,
-                blank_transition_cost_zero,
-                preamble_transition_cost_zero,
-            );
-            table[t * states + c] = switch_prob.max(stay_prob);
+    fn set(&mut self, t: usize, c: usize, value: f32) {
+        self.values[t * self.states + c] = value;
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AlignmentInputs<'a> {
+    log_probs: &'a [f32],
+    vocab_size: usize,
+    ground_truth: &'a [i64],
+    blank: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BacktrackError {
+    WindowTooSmall,
+}
+
+fn fill_alignment_table(
+    inputs: &AlignmentInputs<'_>,
+    frames: usize,
+    window_size: usize,
+    config: &CtcAlignmentConfig,
+) -> AlignmentTable {
+    let states = inputs.ground_truth.len();
+    let window_size = window_size.min(frames).max(1);
+    let mut table = AlignmentTable {
+        values: vec![f32::NEG_INFINITY; window_size * states],
+        window_size,
+        states,
+        offsets: vec![0; states],
+        best_t: 0,
+        best_c: states - 1,
+    };
+
+    table.set(0, 0, 0.0);
+    let mean_offset = (frames - window_size) as f64 / states as f64;
+    let higher_offset = mean_offset.floor() as usize + 1;
+    let mut offset_sum = 0usize;
+    let mut last_arg_max = 0usize;
+
+    for c in 0..states {
+        if c > 0 {
+            let remaining_offset = frames.saturating_sub(window_size + offset_sum);
+            let offset = last_arg_max
+                .saturating_sub(window_size / 2)
+                .min(higher_offset)
+                .min(remaining_offset);
+            offset_sum += offset;
+        }
+        table.offsets[c] = offset_sum;
+
+        last_arg_max = 0;
+        let mut last_max = f32::NEG_INFINITY;
+        let first_t = usize::from(c == 0);
+        for t in first_t..window_size {
+            let stay_prob = stay_transition_log_prob(&table, inputs, t, c, config);
+            let switch_prob = switch_transition_log_prob(&table, inputs, t, c);
+            let value = stay_prob.max(switch_prob);
+            table.set(t, c, value);
+            if last_max < value {
+                last_max = value;
+                last_arg_max = t;
+            }
         }
     }
 
     let last_state = states - 1;
-    let best_t = (0..frames)
-        .max_by(|&a, &b| table[a * states + last_state].total_cmp(&table[b * states + last_state]))
-        .unwrap_or(frames - 1);
+    table.best_t = (0..window_size)
+        .max_by(|&a, &b| {
+            table
+                .get(a, last_state)
+                .unwrap_or(f32::NEG_INFINITY)
+                .total_cmp(&table.get(b, last_state).unwrap_or(f32::NEG_INFINITY))
+        })
+        .unwrap_or(window_size - 1);
+    table.best_c = last_state;
 
-    (table, best_t, last_state)
+    table
 }
 
-#[allow(clippy::too_many_arguments)]
 fn stay_transition_log_prob(
-    table: &[f32],
-    log_probs: &[f32],
-    _frames: usize,
-    vocab_size: usize,
-    states: usize,
-    ground_truth: &[i64],
+    table: &AlignmentTable,
+    inputs: &AlignmentInputs<'_>,
     t: usize,
     c: usize,
-    blank: usize,
-    blank_transition_cost_zero: bool,
-    preamble_transition_cost_zero: bool,
+    config: &CtcAlignmentConfig,
 ) -> f32 {
     if t == 0 {
         return f32::NEG_INFINITY;
     }
-    if preamble_transition_cost_zero && c == 0 {
+    if config.preamble_transition_cost_zero && c == 0 {
         return 0.0;
     }
-    if blank_transition_cost_zero && ground_truth[c] == blank as i64 {
-        return table[(t - 1) * states + c];
+    let Some(previous) = table.get(t - 1, c) else {
+        return f32::NEG_INFINITY;
+    };
+    if config.blank_transition_cost_zero && inputs.ground_truth[c] == inputs.blank as i64 {
+        return previous;
     }
 
-    table[(t - 1) * states + c]
-        + stay_frame_log_prob(log_probs, vocab_size, ground_truth, t, c, blank)
+    previous + stay_frame_log_prob(inputs, table.offsets[c] + t, c)
 }
 
-fn stay_frame_log_prob(
-    log_probs: &[f32],
-    vocab_size: usize,
-    ground_truth: &[i64],
+fn switch_transition_log_prob(
+    table: &AlignmentTable,
+    inputs: &AlignmentInputs<'_>,
     t: usize,
     c: usize,
-    blank: usize,
 ) -> f32 {
-    let token = ground_truth[c];
-    let blank_prob = log_probs[t * vocab_size + blank];
+    if c == 0 {
+        return f32::NEG_INFINITY;
+    }
+    let relative_offset = table.offsets[c] - table.offsets[c - 1];
+    let Some(previous_t) = t.checked_sub(1).map(|value| value + relative_offset) else {
+        return f32::NEG_INFINITY;
+    };
+    let Some(previous) = table.get(previous_t, c - 1) else {
+        return f32::NEG_INFINITY;
+    };
+    let token = inputs.ground_truth[c] as usize;
+    previous + inputs.log_probs[(table.offsets[c] + t) * inputs.vocab_size + token]
+}
+
+fn stay_frame_log_prob(inputs: &AlignmentInputs<'_>, t: usize, c: usize) -> f32 {
+    let token = inputs.ground_truth[c];
+    let blank_prob = inputs.log_probs[t * inputs.vocab_size + inputs.blank];
     if token < 0 {
         return blank_prob;
     }
-    blank_prob.max(log_probs[t * vocab_size + token as usize])
+    blank_prob.max(inputs.log_probs[t * inputs.vocab_size + token as usize])
+}
+
+type BacktrackOutput = (Vec<f64>, Vec<f32>, Vec<Option<u32>>);
+
+fn backtrack_alignment(
+    table: &AlignmentTable,
+    inputs: &AlignmentInputs<'_>,
+    frames: usize,
+    config: &CtcAlignmentConfig,
+) -> std::result::Result<BacktrackOutput, BacktrackError> {
+    let mut t = table.best_t;
+    let mut c = table.best_c;
+    let mut timings = vec![0.0; inputs.ground_truth.len()];
+    let mut frame_log_probs = vec![0.0; frames];
+    let mut states = vec![None; frames];
+
+    while t != 0 || c != 0 {
+        let global_t = table.offsets[c] + t;
+        if global_t >= frames {
+            return Err(BacktrackError::WindowTooSmall);
+        }
+        if c == 0 {
+            frame_log_probs[global_t] = 0.0;
+            t = t.checked_sub(1).ok_or(BacktrackError::WindowTooSmall)?;
+            continue;
+        }
+        if t == 0 {
+            return Err(BacktrackError::WindowTooSmall);
+        }
+
+        let token = inputs.ground_truth[c] as usize;
+        let relative_offset = table.offsets[c] - table.offsets[c - 1];
+        let previous_t = t - 1 + relative_offset;
+        let previous_switch = table
+            .get(previous_t, c - 1)
+            .ok_or(BacktrackError::WindowTooSmall)?;
+        let switch_prob = inputs.log_probs[global_t * inputs.vocab_size + token];
+        let est_switch_prob =
+            table.get(t, c).ok_or(BacktrackError::WindowTooSmall)? - previous_switch;
+        let switch_delta = (switch_prob - est_switch_prob).abs();
+
+        let stay_prob = stay_frame_log_prob(inputs, global_t, c);
+        let previous_stay = table.get(t - 1, c).ok_or(BacktrackError::WindowTooSmall)?;
+        let est_stay_prob = table.get(t, c).ok_or(BacktrackError::WindowTooSmall)? - previous_stay;
+        let stay_delta = (stay_prob - est_stay_prob).abs();
+
+        if stay_delta > switch_delta {
+            timings[c] = global_t as f64 * config.index_duration;
+            frame_log_probs[global_t] = switch_prob;
+            states[global_t] = Some(token as u32);
+            c -= 1;
+            t = previous_t;
+        } else {
+            frame_log_probs[global_t] = stay_prob;
+            states[global_t] = None;
+            t -= 1;
+        }
+    }
+
+    Ok((timings, frame_log_probs, states))
 }
 
 fn determine_utterance_segments(
@@ -668,5 +754,38 @@ mod tests {
         assert_eq!(result.segments.len(), 2);
         assert!(result.segments[0].start_seconds <= result.segments[0].end_seconds);
         assert!(result.segments[1].start_seconds <= result.segments[1].end_seconds);
+    }
+
+    #[test]
+    fn aligns_with_reference_style_window_offsets() {
+        let frames = 12;
+        let vocab_size = 4;
+        let mut log_probs = vec![-10.0; frames * vocab_size];
+        for frame in 0..frames {
+            log_probs[frame * vocab_size] = -0.1;
+        }
+        for (frame, token) in [(2, 1), (5, 2), (8, 3)] {
+            log_probs[frame * vocab_size + token] = 0.0;
+        }
+
+        let result = align_token_sequences(
+            &log_probs,
+            frames,
+            vocab_size,
+            &[vec![1, 2, 3]],
+            &["abc".to_string()],
+            &CtcAlignmentConfig {
+                index_duration: 1.0,
+                min_window_size: 6,
+                max_window_size: 6,
+                score_min_mean_over_l: 1,
+                ..CtcAlignmentConfig::default()
+            },
+        )
+        .expect("alignment should succeed with a moving window smaller than the audio");
+
+        assert!(result.states.contains(&Some(1)));
+        assert!(result.states.contains(&Some(2)));
+        assert!(result.states.contains(&Some(3)));
     }
 }
