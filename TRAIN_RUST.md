@@ -469,6 +469,7 @@ Inside the process, those visible GPUs are addressed as `0,1`.
 | Argument | Default | Description |
 | --- | --- | --- |
 | `--output-dir <DIR>` | `runs/burn` | Run directory. |
+| `--init-from <PATH>` | unset | Warm-start model weights from a Burn checkpoint/export or PositiveLoss `.safetensors` file without resuming optimizer state. |
 | `--resume-from <PATH>` | unset | Resume from checkpoint directory or `checkpoint.json`. |
 | `--log-every <N>` | `10` | Log every N optimizer steps. |
 | `--dry-run` | false | Forward/loss only; skip optimizer updates. Useful for smoke tests. |

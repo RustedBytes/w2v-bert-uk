@@ -316,6 +316,10 @@ struct RunArgs {
     #[arg(long)]
     resume_from: Option<PathBuf>,
 
+    /// Initialize model weights from a Burn checkpoint/export or PositiveLoss .safetensors file.
+    #[arg(long)]
+    init_from: Option<PathBuf>,
+
     /// Burn training backend: cpu, cuda, or wgpu.
     #[arg(long, value_enum, default_value_t = BackendArg::Cpu)]
     backend: BackendArg,
@@ -670,6 +674,7 @@ fn run_training(args: RunArgs) -> Result<()> {
         w2v_hf_model_dir: args.w2v_hf_model_dir,
         w2v_hf_load_weights: args.w2v_hf_load_weights,
         w2v_activation_checkpointing: args.w2v_activation_checkpointing,
+        init_from: args.init_from,
         resume_from: args.resume_from,
         backend: match args.backend {
             BackendArg::Cpu => TrainBackendKind::Cpu,

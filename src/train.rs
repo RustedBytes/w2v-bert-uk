@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
@@ -29,6 +29,8 @@ use kenlm::{Config as KenlmConfig, Model as KenlmModel};
 use polars::prelude::{AnyValue, DataFrame, ParquetReader, SerReader, Series};
 use rand::Rng;
 use rayon::prelude::*;
+use safetensors::SafeTensors;
+use safetensors::tensor::Dtype;
 use serde_json::{Value, json};
 use splintr::SentencePieceTokenizer;
 
@@ -165,6 +167,7 @@ pub struct BurnTrainConfig {
     pub w2v_hf_model_dir: Option<PathBuf>,
     pub w2v_hf_load_weights: bool,
     pub w2v_activation_checkpointing: bool,
+    pub init_from: Option<PathBuf>,
     pub resume_from: Option<PathBuf>,
     pub backend: TrainBackendKind,
     pub device_index: usize,
@@ -233,6 +236,7 @@ impl Default for BurnTrainConfig {
             w2v_hf_model_dir: None,
             w2v_hf_load_weights: false,
             w2v_activation_checkpointing: false,
+            init_from: None,
             resume_from: None,
             backend: TrainBackendKind::Cpu,
             device_index: 0,
@@ -1797,6 +1801,7 @@ where
     let mut optimizer = adamw_optimizer::<B, M>(config);
     let resume = load_resume_checkpoint(config)?;
     model = load_model_checkpoint(model, &resume, device)?;
+    model = load_initial_weights(model, config, &resume, device)?;
     optimizer = load_optimizer_checkpoint::<B, M, _>(optimizer, &resume, device)?;
     let mut ema_model = initialize_ema_model::<B, M>(&model, config);
     ema_model = load_ema_checkpoint::<B, M>(ema_model, &resume, device)?;
@@ -2162,6 +2167,7 @@ where
     let mut optimizer = adamw_optimizer::<B, ParaformerV2<B>>(config);
     let resume = load_resume_checkpoint(config)?;
     model = load_model_checkpoint(model, &resume, device)?;
+    model = load_initial_weights(model, config, &resume, device)?;
     optimizer = load_optimizer_checkpoint::<B, ParaformerV2<B>, _>(optimizer, &resume, device)?;
     let mut ema_model = initialize_ema_model::<B, ParaformerV2<B>>(&model, config);
     ema_model = load_ema_checkpoint::<B, ParaformerV2<B>>(ema_model, &resume, device)?;
@@ -2562,6 +2568,7 @@ where
     let mut optimizer = adamw_optimizer::<B, EnhancedParaformerV2<B>>(config);
     let resume = load_resume_checkpoint(config)?;
     model = load_model_checkpoint(model, &resume, device)?;
+    model = load_initial_weights(model, config, &resume, device)?;
     optimizer =
         load_optimizer_checkpoint::<B, EnhancedParaformerV2<B>, _>(optimizer, &resume, device)?;
     let mut ema_model = initialize_ema_model::<B, EnhancedParaformerV2<B>>(&model, config);
@@ -6203,6 +6210,7 @@ fn run_config_json(config: &BurnTrainConfig) -> Value {
         "w2v_hf_model_dir": config.w2v_hf_model_dir,
         "w2v_hf_load_weights": config.w2v_hf_load_weights,
         "w2v_activation_checkpointing": config.w2v_activation_checkpointing,
+        "init_from": config.init_from,
         "backend": match config.backend {
             TrainBackendKind::Cpu => "cpu",
             TrainBackendKind::Cuda => "cuda",
@@ -6357,6 +6365,7 @@ fn train_config_from_json(value: &Value) -> Result<BurnTrainConfig> {
         json_bool(value, "w2v_hf_load_weights").unwrap_or(config.w2v_hf_load_weights);
     config.w2v_activation_checkpointing = json_bool(value, "w2v_activation_checkpointing")
         .unwrap_or(config.w2v_activation_checkpointing);
+    config.init_from = json_path(value, "init_from");
     config.backend = value
         .get("backend")
         .and_then(Value::as_str)
@@ -6690,6 +6699,166 @@ fn resume_config_default_value(key: &str) -> Option<Value> {
         "lr_hold_epochs" => Some(json!(0)),
         "lr_decay_exponent" => Some(json!(0.0)),
         _ => None,
+    }
+}
+
+fn load_initial_weights<B, M>(
+    model: M,
+    config: &BurnTrainConfig,
+    resume: &Option<ResumeCheckpoint>,
+    device: &B::Device,
+) -> Result<M>
+where
+    B: AutodiffBackend,
+    M: AutodiffModule<B>,
+{
+    let Some(path) = &config.init_from else {
+        return Ok(model);
+    };
+    if resume.is_some() {
+        bail!("--init-from cannot be combined with --resume-from");
+    }
+    if is_safetensors_path(path) {
+        return load_safetensors_initial_weights(model, path, device);
+    }
+    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+    model
+        .load_file(resolve_model_checkpoint_base_path(path), &recorder, device)
+        .with_context(|| format!("failed to initialize model from {}", path.display()))
+}
+
+fn is_safetensors_path(path: &Path) -> bool {
+    path.extension().and_then(|value| value.to_str()) == Some("safetensors")
+}
+
+fn resolve_model_checkpoint_base_path(path: &Path) -> PathBuf {
+    if path.is_dir() {
+        checkpoint_base_path(path, "model")
+    } else if path.file_name().and_then(|value| value.to_str()) == Some("checkpoint.json") {
+        path.parent()
+            .map(|dir| checkpoint_base_path(dir, "model"))
+            .unwrap_or_else(|| path.with_file_name("model"))
+    } else if path.extension().and_then(|value| value.to_str()) == Some("bin") {
+        path.with_extension("")
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn load_safetensors_initial_weights<B, M>(model: M, path: &Path, device: &B::Device) -> Result<M>
+where
+    B: AutodiffBackend,
+    M: AutodiffModule<B>,
+{
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let tensors = SafeTensors::deserialize(&bytes)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    let mut weights = HashMap::new();
+    let mut skipped_dtype = 0usize;
+    for name in tensors.names() {
+        let view = tensors
+            .tensor(name)
+            .with_context(|| format!("failed to read tensor '{name}'"))?;
+        if view.dtype() != Dtype::F32 {
+            skipped_dtype += 1;
+            continue;
+        }
+        let shape = view.shape().to_vec();
+        let values = f32_values_from_safetensor(view.data())?;
+        let data = TensorData::new(values, shape);
+        for alias in safetensor_name_aliases(name) {
+            weights.entry(alias).or_insert_with(|| data.clone());
+        }
+    }
+
+    let mut collector = WarmStartPathCollector::<B> {
+        paths: HashMap::new(),
+        phantom: std::marker::PhantomData,
+    };
+    model.visit(&mut collector);
+    let mut mapper = WarmStartMapper::<B> {
+        weights,
+        paths: collector.paths,
+        device,
+        loaded: 0,
+        skipped_shape: 0,
+        phantom: std::marker::PhantomData,
+    };
+    let model = model.map(&mut mapper);
+    log::info!(
+        "initialized {} tensor(s) from {}, skipped_shape={}, skipped_dtype={}",
+        mapper.loaded,
+        path.display(),
+        mapper.skipped_shape,
+        skipped_dtype
+    );
+    Ok(model)
+}
+
+fn f32_values_from_safetensor(bytes: &[u8]) -> Result<Vec<f32>> {
+    if !bytes.len().is_multiple_of(std::mem::size_of::<f32>()) {
+        bail!("f32 safetensor byte length is not divisible by 4");
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
+}
+
+fn safetensor_name_aliases(name: &str) -> Vec<String> {
+    let mut aliases = vec![name.to_string()];
+    for prefix in ["module.", "model.", "model.model."] {
+        if let Some(stripped) = name.strip_prefix(prefix) {
+            aliases.push(stripped.to_string());
+        }
+    }
+    aliases.sort();
+    aliases.dedup();
+    aliases
+}
+
+struct WarmStartPathCollector<B: AutodiffBackend> {
+    paths: HashMap<ParamId, String>,
+    phantom: std::marker::PhantomData<B>,
+}
+
+impl<B: AutodiffBackend> ModuleVisitor<B> for WarmStartPathCollector<B> {
+    fn visit_float_with_path<const D: usize>(
+        &mut self,
+        path: &[String],
+        id: ParamId,
+        _tensor: &Tensor<B, D>,
+    ) {
+        self.paths.insert(id, path.join("."));
+    }
+}
+
+struct WarmStartMapper<'a, B: AutodiffBackend> {
+    weights: HashMap<String, TensorData>,
+    paths: HashMap<ParamId, String>,
+    device: &'a B::Device,
+    loaded: usize,
+    skipped_shape: usize,
+    phantom: std::marker::PhantomData<B>,
+}
+
+impl<B: AutodiffBackend> ModuleMapper<B> for WarmStartMapper<'_, B> {
+    fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
+        let (id, current, mapper) = param.consume();
+        let Some(path) = self.paths.get(&id) else {
+            return Param::from_mapped_value(id, current, mapper);
+        };
+        let Some(data) = self.weights.get(path).cloned() else {
+            return Param::from_mapped_value(id, current, mapper);
+        };
+        if data.shape.as_slice() != current.dims() {
+            self.skipped_shape += 1;
+            return Param::from_mapped_value(id, current, mapper);
+        }
+        let require_grad = current.is_require_grad();
+        let tensor = Tensor::<B, D>::from_data(data, self.device).set_require_grad(require_grad);
+        self.loaded += 1;
+        Param::from_mapped_value(id, tensor, mapper)
     }
 }
 
