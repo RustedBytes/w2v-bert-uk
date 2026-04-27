@@ -183,6 +183,10 @@ struct Args {
     /// Use Burn balanced autodiff checkpointing for W2V-BERT training.
     #[arg(long)]
     w2v_activation_checkpointing: bool,
+
+    /// Resume from a checkpoint directory or checkpoint.json file.
+    #[arg(long)]
+    resume_from: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -255,6 +259,7 @@ fn main() -> Result<()> {
         w2v_hf_model_dir: args.w2v_hf_model_dir,
         w2v_hf_load_weights: args.w2v_hf_load_weights,
         w2v_activation_checkpointing: args.w2v_activation_checkpointing,
+        resume_from: args.resume_from,
     };
 
     let summary = run_burn_training(config)?;

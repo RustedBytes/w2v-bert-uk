@@ -28,9 +28,9 @@
 - [x] Support Wav2Vec/W2V-BERT training.
 - [x] Add CTC training path for supported architectures.
 - [x] Add dry-run mode for trainer smoke tests.
-- [ ] Add real checkpoint save/load for model weights.
-- [ ] Add optimizer state checkpointing.
-- [ ] Add resume support with config validation.
+- [x] Add real checkpoint save/load for model weights.
+- [x] Add optimizer state checkpointing.
+- [x] Add resume support with config validation.
 - [ ] Add GPU backend/device selection.
 - [ ] Add mixed precision support.
 - [ ] Add gradient accumulation.

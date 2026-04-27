@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use burn::module::AutodiffModule;
+use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
 use burn::tensor::activation::log_softmax;
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{Int, Tensor, TensorData};
@@ -86,6 +87,7 @@ pub struct BurnTrainConfig {
     pub w2v_hf_model_dir: Option<PathBuf>,
     pub w2v_hf_load_weights: bool,
     pub w2v_activation_checkpointing: bool,
+    pub resume_from: Option<PathBuf>,
 }
 
 impl Default for BurnTrainConfig {
@@ -127,6 +129,7 @@ impl Default for BurnTrainConfig {
             w2v_hf_model_dir: None,
             w2v_hf_load_weights: false,
             w2v_activation_checkpointing: false,
+            resume_from: None,
         }
     }
 }
@@ -232,6 +235,18 @@ struct ValidationLanguageModel {
     word_bonus: f32,
     bos: bool,
     eos: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ResumeCheckpoint {
+    dir: PathBuf,
+    epoch: usize,
+    epoch_complete: bool,
+    global_step: usize,
+    last_train_loss: Option<f32>,
+    last_val_loss: Option<f32>,
+    last_val_cer: Option<f32>,
+    last_val_wer: Option<f32>,
 }
 
 impl ValidationDecoder {
@@ -569,15 +584,29 @@ where
     let mut optimizer = AdamWConfig::new()
         .with_weight_decay(config.weight_decay as f32)
         .init();
-    let mut global_step = 0usize;
-    let mut last_train_loss = None;
-    let mut last_val_loss = None;
-    let mut last_val_cer = None;
-    let mut last_val_wer = None;
+    let resume = load_resume_checkpoint(config)?;
+    model = load_model_checkpoint(model, &resume, device)?;
+    optimizer = load_optimizer_checkpoint::<B, M, _>(optimizer, &resume, device)?;
+    let mut global_step = resume
+        .as_ref()
+        .map_or(0, |checkpoint| checkpoint.global_step);
+    let mut last_train_loss = resume
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.last_train_loss);
+    let mut last_val_loss = resume
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.last_val_loss);
+    let mut last_val_cer = resume
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.last_val_cer);
+    let mut last_val_wer = resume
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.last_val_wer);
+    let start_epoch = resume_start_epoch(&resume);
     let decoder = ValidationDecoder::from_config(config)?;
     let started = Instant::now();
 
-    for epoch in 1..=config.epochs {
+    for epoch in start_epoch..=config.epochs {
         let mut train_batches = StreamingBatchLoader::new(
             config.train_manifest.clone(),
             config.batch_size,
@@ -615,9 +644,12 @@ where
                     last_val_loss = Some(val.loss);
                     last_val_cer = val.cer;
                     last_val_wer = val.wer;
-                    write_checkpoint_metadata(
+                    save_training_checkpoint::<B, M, _>(
+                        &model,
+                        &optimizer,
                         config,
                         epoch,
+                        false,
                         global_step,
                         last_train_loss,
                         last_val_loss,
@@ -638,9 +670,12 @@ where
             last_val_cer = val.cer;
             last_val_wer = val.wer;
         }
-        write_checkpoint_metadata(
+        save_training_checkpoint::<B, M, _>(
+            &model,
+            &optimizer,
             config,
             epoch,
+            true,
             global_step,
             last_train_loss,
             last_val_loss,
@@ -722,15 +757,29 @@ where
     let mut optimizer = AdamWConfig::new()
         .with_weight_decay(config.weight_decay as f32)
         .init();
-    let mut global_step = 0usize;
-    let mut last_train_loss = None;
-    let mut last_val_loss = None;
-    let mut last_val_cer = None;
-    let mut last_val_wer = None;
+    let resume = load_resume_checkpoint(config)?;
+    model = load_model_checkpoint(model, &resume, device)?;
+    optimizer = load_optimizer_checkpoint::<B, ParaformerV2<B>, _>(optimizer, &resume, device)?;
+    let mut global_step = resume
+        .as_ref()
+        .map_or(0, |checkpoint| checkpoint.global_step);
+    let mut last_train_loss = resume
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.last_train_loss);
+    let mut last_val_loss = resume
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.last_val_loss);
+    let mut last_val_cer = resume
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.last_val_cer);
+    let mut last_val_wer = resume
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.last_val_wer);
+    let start_epoch = resume_start_epoch(&resume);
     let decoder = ValidationDecoder::from_config(config)?;
     let started = Instant::now();
 
-    for epoch in 1..=config.epochs {
+    for epoch in start_epoch..=config.epochs {
         let mut train_batches = StreamingBatchLoader::new(
             config.train_manifest.clone(),
             config.batch_size,
@@ -770,9 +819,12 @@ where
                     last_val_loss = Some(val.loss);
                     last_val_cer = val.cer;
                     last_val_wer = val.wer;
-                    write_checkpoint_metadata(
+                    save_training_checkpoint::<B, ParaformerV2<B>, _>(
+                        &model,
+                        &optimizer,
                         config,
                         epoch,
+                        false,
                         global_step,
                         last_train_loss,
                         last_val_loss,
@@ -793,9 +845,12 @@ where
             last_val_cer = val.cer;
             last_val_wer = val.wer;
         }
-        write_checkpoint_metadata(
+        save_training_checkpoint::<B, ParaformerV2<B>, _>(
+            &model,
+            &optimizer,
             config,
             epoch,
+            true,
             global_step,
             last_train_loss,
             last_val_loss,
@@ -868,15 +923,30 @@ where
     let mut optimizer = AdamWConfig::new()
         .with_weight_decay(config.weight_decay as f32)
         .init();
-    let mut global_step = 0usize;
-    let mut last_train_loss = None;
-    let mut last_val_loss = None;
-    let mut last_val_cer = None;
-    let mut last_val_wer = None;
+    let resume = load_resume_checkpoint(config)?;
+    model = load_model_checkpoint(model, &resume, device)?;
+    optimizer =
+        load_optimizer_checkpoint::<B, EnhancedParaformerV2<B>, _>(optimizer, &resume, device)?;
+    let mut global_step = resume
+        .as_ref()
+        .map_or(0, |checkpoint| checkpoint.global_step);
+    let mut last_train_loss = resume
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.last_train_loss);
+    let mut last_val_loss = resume
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.last_val_loss);
+    let mut last_val_cer = resume
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.last_val_cer);
+    let mut last_val_wer = resume
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.last_val_wer);
+    let start_epoch = resume_start_epoch(&resume);
     let decoder = ValidationDecoder::from_config(config)?;
     let started = Instant::now();
 
-    for epoch in 1..=config.epochs {
+    for epoch in start_epoch..=config.epochs {
         let mut train_batches = StreamingBatchLoader::new(
             config.train_manifest.clone(),
             config.batch_size,
@@ -918,9 +988,12 @@ where
                     last_val_loss = Some(val.loss);
                     last_val_cer = val.cer;
                     last_val_wer = val.wer;
-                    write_checkpoint_metadata(
+                    save_training_checkpoint::<B, EnhancedParaformerV2<B>, _>(
+                        &model,
+                        &optimizer,
                         config,
                         epoch,
+                        false,
                         global_step,
                         last_train_loss,
                         last_val_loss,
@@ -941,9 +1014,12 @@ where
             last_val_cer = val.cer;
             last_val_wer = val.wer;
         }
-        write_checkpoint_metadata(
+        save_training_checkpoint::<B, EnhancedParaformerV2<B>, _>(
+            &model,
+            &optimizer,
             config,
             epoch,
+            true,
             global_step,
             last_train_loss,
             last_val_loss,
@@ -2109,79 +2185,306 @@ fn validate_config(config: &BurnTrainConfig) -> Result<()> {
 
 fn write_run_config(config: &BurnTrainConfig) -> Result<()> {
     let path = config.output_dir.join("training_config.json");
-    let architecture = match config.architecture {
-        TrainArchitecture::Squeezeformer => "squeezeformer",
-        TrainArchitecture::Zipformer => "zipformer",
-        TrainArchitecture::Paraformer => "paraformer",
-        TrainArchitecture::Wav2VecBert => "w2v_bert",
-    };
     fs::write(
         &path,
-        serde_json::to_string_pretty(&json!({
-            "architecture": architecture,
-            "train_manifest": config.train_manifest,
-            "val_manifest": config.val_manifest,
-            "variant": config.variant,
-            "input_dim": config.input_dim,
-            "vocab_size": config.vocab_size,
-            "blank_id": config.blank_id,
-            "d_model": config.d_model,
-            "num_layers": config.num_layers,
-            "num_heads": config.num_heads,
-            "batch_size": config.batch_size,
-            "adaptive_batch": config.adaptive_batch.map(|adaptive| json!({
-                "unit": match adaptive.unit {
-                    AdaptiveBatchUnit::Samples => "samples",
-                    AdaptiveBatchUnit::Frames => "frames",
-                    AdaptiveBatchUnit::PaddedFrames => "padded_frames",
-                    AdaptiveBatchUnit::FeatureValues => "feature_values",
-                },
-                "budget": adaptive.budget,
-                "max_samples": adaptive.max_samples,
-            })),
-            "sort_by_length_desc": config.sort_by_length_desc,
-            "sort_buffer_size": config.sort_buffer_size,
-            "epochs": config.epochs,
-            "learning_rate": config.learning_rate,
-            "weight_decay": config.weight_decay,
-            "tokenizer_path": config.tokenizer_path,
-            "val_beam_width": config.val_beam_width,
-            "val_n_best": config.val_n_best,
-            "val_lm_path": config.val_lm_path,
-            "val_lm_weight": config.val_lm_weight,
-            "val_lm_word_bonus": config.val_lm_word_bonus,
-            "val_lm_bos": config.val_lm_bos,
-            "val_lm_eos": config.val_lm_eos,
-            "w2v_hf_model_dir": config.w2v_hf_model_dir,
-            "w2v_hf_load_weights": config.w2v_hf_load_weights,
-            "w2v_activation_checkpointing": config.w2v_activation_checkpointing,
-        }))?,
+        serde_json::to_string_pretty(&run_config_json(config))?,
     )
     .with_context(|| format!("failed to write {}", path.display()))
 }
 
-fn write_checkpoint_metadata(
+fn architecture_name(architecture: &TrainArchitecture) -> &'static str {
+    match architecture {
+        TrainArchitecture::Squeezeformer => "squeezeformer",
+        TrainArchitecture::Zipformer => "zipformer",
+        TrainArchitecture::Paraformer => "paraformer",
+        TrainArchitecture::Wav2VecBert => "w2v_bert",
+    }
+}
+
+fn adaptive_batch_json(config: &BurnTrainConfig) -> Option<Value> {
+    config.adaptive_batch.map(|adaptive| {
+        json!({
+            "unit": match adaptive.unit {
+                AdaptiveBatchUnit::Samples => "samples",
+                AdaptiveBatchUnit::Frames => "frames",
+                AdaptiveBatchUnit::PaddedFrames => "padded_frames",
+                AdaptiveBatchUnit::FeatureValues => "feature_values",
+            },
+            "budget": adaptive.budget,
+            "max_samples": adaptive.max_samples,
+        })
+    })
+}
+
+fn run_config_json(config: &BurnTrainConfig) -> Value {
+    json!({
+        "architecture": architecture_name(&config.architecture),
+        "train_manifest": config.train_manifest,
+        "val_manifest": config.val_manifest,
+        "variant": config.variant,
+        "input_dim": config.input_dim,
+        "vocab_size": config.vocab_size,
+        "blank_id": config.blank_id,
+        "d_model": config.d_model,
+        "num_layers": config.num_layers,
+        "num_heads": config.num_heads,
+        "batch_size": config.batch_size,
+        "adaptive_batch": adaptive_batch_json(config),
+        "sort_by_length_desc": config.sort_by_length_desc,
+        "sort_buffer_size": config.sort_buffer_size,
+        "epochs": config.epochs,
+        "learning_rate": config.learning_rate,
+        "weight_decay": config.weight_decay,
+        "tokenizer_path": config.tokenizer_path,
+        "val_beam_width": config.val_beam_width,
+        "val_n_best": config.val_n_best,
+        "val_lm_path": config.val_lm_path,
+        "val_lm_weight": config.val_lm_weight,
+        "val_lm_word_bonus": config.val_lm_word_bonus,
+        "val_lm_bos": config.val_lm_bos,
+        "val_lm_eos": config.val_lm_eos,
+        "paraformer_alignment_mode": match config.paraformer_alignment_mode {
+            ParaformerAlignmentMode::Viterbi => "viterbi",
+            ParaformerAlignmentMode::Uniform => "uniform",
+            ParaformerAlignmentMode::Greedy => "greedy",
+        },
+        "paraformer_enhanced": config.paraformer_enhanced,
+        "w2v_hf_model_dir": config.w2v_hf_model_dir,
+        "w2v_hf_load_weights": config.w2v_hf_load_weights,
+        "w2v_activation_checkpointing": config.w2v_activation_checkpointing,
+    })
+}
+
+fn checkpoint_dir(config: &BurnTrainConfig) -> PathBuf {
+    config.output_dir.join("checkpoint_latest")
+}
+
+fn checkpoint_metadata_path(path: &Path) -> PathBuf {
+    if path.is_dir() {
+        path.join("checkpoint.json")
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn checkpoint_base_path(dir: &Path, stem: &str) -> PathBuf {
+    dir.join(stem)
+}
+
+fn checkpoint_file_path(dir: &Path, stem: &str) -> PathBuf {
+    dir.join(format!("{stem}.bin"))
+}
+
+fn save_training_checkpoint<B, M, O>(
+    model: &M,
+    optimizer: &O,
     config: &BurnTrainConfig,
     epoch: usize,
+    epoch_complete: bool,
     global_step: usize,
     train_loss: Option<f32>,
     val_loss: Option<f32>,
     val_cer: Option<f32>,
     val_wer: Option<f32>,
-) -> Result<()> {
-    let path = config.output_dir.join("checkpoint_latest.json");
-    fs::write(
-        &path,
-        serde_json::to_string_pretty(&json!({
-            "epoch": epoch,
-            "global_step": global_step,
-            "train_ctc_loss": train_loss,
-            "val_ctc_loss": val_loss,
-            "val_cer": val_cer,
-            "val_wer": val_wer,
-        }))?,
-    )
-    .with_context(|| format!("failed to write {}", path.display()))
+) -> Result<()>
+where
+    B: AutodiffBackend,
+    M: AutodiffModule<B>,
+    O: Optimizer<M, B>,
+{
+    let dir = checkpoint_dir(config);
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("failed to create checkpoint directory {}", dir.display()))?;
+    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+    model
+        .clone()
+        .save_file(checkpoint_base_path(&dir, "model"), &recorder)
+        .with_context(|| {
+            format!(
+                "failed to write {}",
+                checkpoint_file_path(&dir, "model").display()
+            )
+        })?;
+    recorder
+        .record(
+            optimizer.to_record(),
+            checkpoint_base_path(&dir, "optimizer"),
+        )
+        .with_context(|| {
+            format!(
+                "failed to write {}",
+                checkpoint_file_path(&dir, "optimizer").display()
+            )
+        })?;
+
+    let metadata = json!({
+        "epoch": epoch,
+        "epoch_complete": epoch_complete,
+        "global_step": global_step,
+        "train_ctc_loss": train_loss,
+        "val_ctc_loss": val_loss,
+        "val_cer": val_cer,
+        "val_wer": val_wer,
+        "checkpoint_dir": dir,
+        "model_path": checkpoint_file_path(&dir, "model"),
+        "optimizer_path": checkpoint_file_path(&dir, "optimizer"),
+        "training_config": run_config_json(config),
+    });
+    let path = checkpoint_metadata_path(&dir);
+    fs::write(&path, serde_json::to_string_pretty(&metadata)?)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+
+    let legacy_path = config.output_dir.join("checkpoint_latest.json");
+    fs::write(&legacy_path, serde_json::to_string_pretty(&metadata)?)
+        .with_context(|| format!("failed to write {}", legacy_path.display()))?;
+    Ok(())
+}
+
+fn load_resume_checkpoint(config: &BurnTrainConfig) -> Result<Option<ResumeCheckpoint>> {
+    let Some(path) = &config.resume_from else {
+        return Ok(None);
+    };
+    let metadata_path = checkpoint_metadata_path(path);
+    let metadata_text = fs::read_to_string(&metadata_path).with_context(|| {
+        format!(
+            "failed to read checkpoint metadata {}",
+            metadata_path.display()
+        )
+    })?;
+    let metadata: Value = serde_json::from_str(&metadata_text).with_context(|| {
+        format!(
+            "failed to parse checkpoint metadata {}",
+            metadata_path.display()
+        )
+    })?;
+    let saved_config = metadata
+        .get("training_config")
+        .context("checkpoint metadata does not contain training_config")?;
+    validate_resume_config(config, saved_config)?;
+    let dir = if path.is_dir() {
+        path.clone()
+    } else {
+        metadata_path
+            .parent()
+            .map(Path::to_path_buf)
+            .context("checkpoint metadata path has no parent directory")?
+    };
+    Ok(Some(ResumeCheckpoint {
+        dir,
+        epoch: metadata
+            .get("epoch")
+            .and_then(Value::as_u64)
+            .context("checkpoint metadata does not contain numeric epoch")? as usize,
+        epoch_complete: metadata
+            .get("epoch_complete")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        global_step: metadata
+            .get("global_step")
+            .and_then(Value::as_u64)
+            .context("checkpoint metadata does not contain numeric global_step")?
+            as usize,
+        last_train_loss: optional_f32(&metadata, "train_ctc_loss"),
+        last_val_loss: optional_f32(&metadata, "val_ctc_loss"),
+        last_val_cer: optional_f32(&metadata, "val_cer"),
+        last_val_wer: optional_f32(&metadata, "val_wer"),
+    }))
+}
+
+fn resume_start_epoch(resume: &Option<ResumeCheckpoint>) -> usize {
+    resume.as_ref().map_or(1, |checkpoint| {
+        if checkpoint.epoch_complete {
+            checkpoint.epoch + 1
+        } else {
+            checkpoint.epoch
+        }
+    })
+}
+
+fn optional_f32(metadata: &Value, key: &str) -> Option<f32> {
+    metadata
+        .get(key)
+        .and_then(Value::as_f64)
+        .map(|value| value as f32)
+}
+
+fn validate_resume_config(config: &BurnTrainConfig, saved_config: &Value) -> Result<()> {
+    let current = run_config_json(config);
+    for key in [
+        "architecture",
+        "variant",
+        "input_dim",
+        "vocab_size",
+        "blank_id",
+        "d_model",
+        "num_layers",
+        "num_heads",
+        "paraformer_alignment_mode",
+        "paraformer_enhanced",
+        "w2v_hf_model_dir",
+        "w2v_activation_checkpointing",
+    ] {
+        if current.get(key) != saved_config.get(key) {
+            bail!(
+                "resume checkpoint config mismatch for '{key}': current={:?} checkpoint={:?}",
+                current.get(key),
+                saved_config.get(key)
+            );
+        }
+    }
+    Ok(())
+}
+
+fn load_model_checkpoint<B, M>(
+    model: M,
+    resume: &Option<ResumeCheckpoint>,
+    device: &B::Device,
+) -> Result<M>
+where
+    B: AutodiffBackend,
+    M: AutodiffModule<B>,
+{
+    let Some(checkpoint) = resume else {
+        return Ok(model);
+    };
+    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+    model
+        .load_file(
+            checkpoint_base_path(&checkpoint.dir, "model"),
+            &recorder,
+            device,
+        )
+        .with_context(|| {
+            format!(
+                "failed to load {}",
+                checkpoint_file_path(&checkpoint.dir, "model").display()
+            )
+        })
+}
+
+fn load_optimizer_checkpoint<B, M, O>(
+    optimizer: O,
+    resume: &Option<ResumeCheckpoint>,
+    device: &B::Device,
+) -> Result<O>
+where
+    B: AutodiffBackend,
+    M: AutodiffModule<B>,
+    O: Optimizer<M, B>,
+{
+    let Some(checkpoint) = resume else {
+        return Ok(optimizer);
+    };
+    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+    let record = recorder
+        .load(checkpoint_base_path(&checkpoint.dir, "optimizer"), device)
+        .with_context(|| {
+            format!(
+                "failed to load {}",
+                checkpoint_file_path(&checkpoint.dir, "optimizer").display()
+            )
+        })?;
+    Ok(optimizer.load_record(record))
 }
 
 #[cfg(test)]
@@ -2340,6 +2643,19 @@ mod tests {
         assert_eq!(summary.token_error_rate, Some(1.0 / 3.0));
         assert_eq!(summary.cer, Some(2.0 / 5.0));
         assert_eq!(summary.wer, Some(1.0 / 3.0));
+    }
+
+    #[test]
+    fn resume_config_validation_rejects_model_shape_mismatch() {
+        let mut checkpoint_config = BurnTrainConfig::default();
+        checkpoint_config.vocab_size = 32;
+        let saved = run_config_json(&checkpoint_config);
+        assert!(validate_resume_config(&checkpoint_config, &saved).is_ok());
+
+        let mut current = checkpoint_config;
+        current.input_dim += 1;
+        let err = validate_resume_config(&current, &saved).unwrap_err();
+        assert!(err.to_string().contains("input_dim"));
     }
 
     #[test]
