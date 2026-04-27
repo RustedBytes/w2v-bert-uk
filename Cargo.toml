@@ -30,15 +30,19 @@ python = ["dep:pyo3", "pyo3/extension-module"]
 ruby = ["dep:magnus", "dep:rb-sys-build"]
 scala = ["dep:jni"]
 swift = ["dep:swift-bridge"]
+burn-cuda-backend = ["dep:burn-cuda"]
+burn-wgpu-backend = ["dep:burn-wgpu"]
 
 [dependencies]
 anyhow = "1.0"
 asr-features = { version = "0.1.1", features = ["frontend"] }
 burn = { package = "burn-core", version = "0.21.0-pre.3", default-features = false, features = ["std"] }
 burn-autodiff = { version = "0.21.0-pre.3", default-features = false, features = ["std"] }
+burn-cuda = { version = "0.21.0-pre.3", default-features = false, features = ["std"], optional = true }
 burn-ndarray = { version = "0.21.0-pre.3", default-features = false, features = ["std"] }
 burn-nn = { version = "0.21.0-pre.3", default-features = false, features = ["std"] }
 burn-optim = { version = "0.21.0-pre.3", default-features = false, features = ["std"] }
+burn-wgpu = { version = "0.21.0-pre.3", default-features = false, features = ["std"], optional = true }
 clap = { version = "4.6.1", features = ["derive"] }
 env_logger = "0.11"
 half = { version = "2.1", default-features = false }

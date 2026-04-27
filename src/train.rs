@@ -8,7 +8,7 @@ use burn::module::AutodiffModule;
 use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
 use burn::tensor::activation::log_softmax;
 use burn::tensor::backend::{AutodiffBackend, Backend};
-use burn::tensor::{Int, Tensor, TensorData};
+use burn::tensor::{FloatDType, Int, IntDType, Tensor, TensorData, set_default_dtypes};
 use burn_autodiff::checkpoint::strategy::BalancedCheckpointing;
 use burn_nn::loss::{CTCLossConfig, Reduction};
 use burn_optim::{AdamWConfig, GradientsParams, Optimizer};
@@ -33,6 +33,46 @@ pub enum TrainArchitecture {
     Zipformer,
     Paraformer,
     Wav2VecBert,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrainBackendKind {
+    Cpu,
+    Cuda,
+    Wgpu,
+}
+
+impl std::str::FromStr for TrainBackendKind {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "cpu" | "ndarray" => Ok(Self::Cpu),
+            "cuda" | "gpu" => Ok(Self::Cuda),
+            "wgpu" | "vulkan" | "metal" => Ok(Self::Wgpu),
+            other => bail!("unknown training backend '{other}'"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrainPrecision {
+    F32,
+    F16,
+    Bf16,
+}
+
+impl std::str::FromStr for TrainPrecision {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "f32" | "fp32" | "float32" => Ok(Self::F32),
+            "f16" | "fp16" | "float16" => Ok(Self::F16),
+            "bf16" | "bfloat16" => Ok(Self::Bf16),
+            other => bail!("unknown training precision '{other}'"),
+        }
+    }
 }
 
 impl std::str::FromStr for TrainArchitecture {
@@ -88,6 +128,9 @@ pub struct BurnTrainConfig {
     pub w2v_hf_load_weights: bool,
     pub w2v_activation_checkpointing: bool,
     pub resume_from: Option<PathBuf>,
+    pub backend: TrainBackendKind,
+    pub device_index: usize,
+    pub precision: TrainPrecision,
 }
 
 impl Default for BurnTrainConfig {
@@ -130,6 +173,9 @@ impl Default for BurnTrainConfig {
             w2v_hf_load_weights: false,
             w2v_activation_checkpointing: false,
             resume_from: None,
+            backend: TrainBackendKind::Cpu,
+            device_index: 0,
+            precision: TrainPrecision::F32,
         }
     }
 }
@@ -377,10 +423,6 @@ impl ValidationDecoder {
 }
 
 pub fn run_burn_training(config: BurnTrainConfig) -> Result<TrainSummary> {
-    type InnerBackend = burn_ndarray::NdArray<f32>;
-    type TrainBackend = burn_autodiff::Autodiff<InnerBackend>;
-
-    let device = Default::default();
     fs::create_dir_all(&config.output_dir).with_context(|| {
         format!(
             "failed to create output directory {}",
@@ -389,6 +431,70 @@ pub fn run_burn_training(config: BurnTrainConfig) -> Result<TrainSummary> {
     })?;
     validate_config(&config)?;
     write_run_config(&config)?;
+
+    match config.backend {
+        TrainBackendKind::Cpu => run_burn_training_cpu(config),
+        TrainBackendKind::Cuda => run_burn_training_cuda(config),
+        TrainBackendKind::Wgpu => run_burn_training_wgpu(config),
+    }
+}
+
+fn run_burn_training_cpu(config: BurnTrainConfig) -> Result<TrainSummary> {
+    if config.device_index != 0 {
+        bail!("cpu backend only supports --device-index 0");
+    }
+    type InnerBackend = burn_ndarray::NdArray<f32>;
+    let device = Default::default();
+    run_burn_training_inner::<InnerBackend>(&config, &device)
+}
+
+#[cfg(feature = "burn-cuda-backend")]
+fn run_burn_training_cuda(config: BurnTrainConfig) -> Result<TrainSummary> {
+    let device = burn_cuda::CudaDevice {
+        index: config.device_index,
+    };
+    match config.precision {
+        TrainPrecision::F32 => run_burn_training_inner::<burn_cuda::Cuda<f32>>(&config, &device),
+        TrainPrecision::F16 => {
+            run_burn_training_inner::<burn_cuda::Cuda<burn::tensor::f16>>(&config, &device)
+        }
+        TrainPrecision::Bf16 => {
+            run_burn_training_inner::<burn_cuda::Cuda<burn::tensor::bf16>>(&config, &device)
+        }
+    }
+}
+
+#[cfg(not(feature = "burn-cuda-backend"))]
+fn run_burn_training_cuda(_config: BurnTrainConfig) -> Result<TrainSummary> {
+    bail!("CUDA training requires building with --features burn-cuda-backend")
+}
+
+#[cfg(feature = "burn-wgpu-backend")]
+fn run_burn_training_wgpu(config: BurnTrainConfig) -> Result<TrainSummary> {
+    let device = burn_wgpu::WgpuDevice::DiscreteGpu(config.device_index);
+    match config.precision {
+        TrainPrecision::F32 => run_burn_training_inner::<burn_wgpu::Wgpu<f32>>(&config, &device),
+        TrainPrecision::F16 => {
+            run_burn_training_inner::<burn_wgpu::Wgpu<burn::tensor::f16>>(&config, &device)
+        }
+        TrainPrecision::Bf16 => bail!("BF16 training is not supported by Burn WGPU backend"),
+    }
+}
+
+#[cfg(not(feature = "burn-wgpu-backend"))]
+fn run_burn_training_wgpu(_config: BurnTrainConfig) -> Result<TrainSummary> {
+    bail!("WGPU training requires building with --features burn-wgpu-backend")
+}
+
+fn run_burn_training_inner<InnerBackend>(
+    config: &BurnTrainConfig,
+    device: &InnerBackend::Device,
+) -> Result<TrainSummary>
+where
+    InnerBackend: Backend,
+{
+    type TrainBackend<InnerBackend> = burn_autodiff::Autodiff<InnerBackend>;
+    configure_training_precision::<TrainBackend<InnerBackend>>(config, device)?;
 
     match config.architecture {
         TrainArchitecture::Squeezeformer => {
@@ -408,8 +514,8 @@ pub fn run_burn_training(config: BurnTrainConfig) -> Result<TrainSummary> {
                 encoder,
                 vocab_size: config.vocab_size,
             }
-            .init::<TrainBackend>(&device);
-            train_ctc_model(model, &config, &device)
+            .init::<TrainBackend<InnerBackend>>(device);
+            train_ctc_model(model, config, device)
         }
         TrainArchitecture::Zipformer => {
             let mut encoder = config
@@ -422,8 +528,8 @@ pub fn run_burn_training(config: BurnTrainConfig) -> Result<TrainSummary> {
                 encoder,
                 vocab_size: config.vocab_size,
             }
-            .init::<TrainBackend>(&device);
-            train_ctc_model(model, &config, &device)
+            .init::<TrainBackend<InnerBackend>>(device);
+            train_ctc_model(model, config, device)
         }
         TrainArchitecture::Paraformer => {
             if config.paraformer_enhanced {
@@ -448,8 +554,8 @@ pub fn run_burn_training(config: BurnTrainConfig) -> Result<TrainSummary> {
                         value.base.attention_heads = config.num_heads;
                         value
                     });
-                let model = model_config.init::<TrainBackend>(&device);
-                train_enhanced_paraformer_model(model, &config, &device)
+                let model = model_config.init::<TrainBackend<InnerBackend>>(device);
+                train_enhanced_paraformer_model(model, config, device)
             } else {
                 let model_config = config
                     .variant
@@ -472,20 +578,38 @@ pub fn run_burn_training(config: BurnTrainConfig) -> Result<TrainSummary> {
                         value.attention_heads = config.num_heads;
                         value
                     });
-                let model = model_config.init::<TrainBackend>(&device);
-                train_paraformer_model(model, &config, &device)
+                let model = model_config.init::<TrainBackend<InnerBackend>>(device);
+                train_paraformer_model(model, config, device)
             }
         }
         TrainArchitecture::Wav2VecBert => {
             if config.w2v_activation_checkpointing {
-                type CheckpointBackend =
+                type CheckpointBackend<InnerBackend> =
                     burn_autodiff::Autodiff<InnerBackend, BalancedCheckpointing>;
-                train_wav2vec_model::<CheckpointBackend>(&config, &device)
+                configure_training_precision::<CheckpointBackend<InnerBackend>>(config, device)?;
+                train_wav2vec_model::<CheckpointBackend<InnerBackend>>(config, device)
             } else {
-                train_wav2vec_model::<TrainBackend>(&config, &device)
+                train_wav2vec_model::<TrainBackend<InnerBackend>>(config, device)
             }
         }
     }
+}
+
+fn configure_training_precision<B>(config: &BurnTrainConfig, device: &B::Device) -> Result<()>
+where
+    B: Backend,
+{
+    let dtype = match config.precision {
+        TrainPrecision::F32 => FloatDType::F32,
+        TrainPrecision::F16 => FloatDType::F16,
+        TrainPrecision::Bf16 => FloatDType::BF16,
+    };
+    set_default_dtypes::<B>(device, dtype, IntDType::I64).with_context(|| {
+        format!(
+            "backend {:?} does not support {:?} precision on device index {}",
+            config.backend, config.precision, config.device_index
+        )
+    })
 }
 
 fn train_wav2vec_model<B>(config: &BurnTrainConfig, device: &B::Device) -> Result<TrainSummary>
@@ -2252,6 +2376,17 @@ fn run_config_json(config: &BurnTrainConfig) -> Value {
         "w2v_hf_model_dir": config.w2v_hf_model_dir,
         "w2v_hf_load_weights": config.w2v_hf_load_weights,
         "w2v_activation_checkpointing": config.w2v_activation_checkpointing,
+        "backend": match config.backend {
+            TrainBackendKind::Cpu => "cpu",
+            TrainBackendKind::Cuda => "cuda",
+            TrainBackendKind::Wgpu => "wgpu",
+        },
+        "device_index": config.device_index,
+        "precision": match config.precision {
+            TrainPrecision::F32 => "f32",
+            TrainPrecision::F16 => "f16",
+            TrainPrecision::Bf16 => "bf16",
+        },
     })
 }
 
@@ -2423,6 +2558,7 @@ fn validate_resume_config(config: &BurnTrainConfig, saved_config: &Value) -> Res
         "paraformer_enhanced",
         "w2v_hf_model_dir",
         "w2v_activation_checkpointing",
+        "precision",
     ] {
         if current.get(key) != saved_config.get(key) {
             bail!(

@@ -5,7 +5,8 @@ use clap::{Parser, ValueEnum};
 use env_logger::Env;
 use w2v_bert_uk::paraformer::ParaformerAlignmentMode;
 use w2v_bert_uk::train::{
-    AdaptiveBatchConfig, AdaptiveBatchUnit, BurnTrainConfig, TrainArchitecture, run_burn_training,
+    AdaptiveBatchConfig, AdaptiveBatchUnit, BurnTrainConfig, TrainArchitecture, TrainBackendKind,
+    TrainPrecision, run_burn_training,
 };
 
 #[derive(Parser)]
@@ -187,6 +188,22 @@ struct Args {
     /// Resume from a checkpoint directory or checkpoint.json file.
     #[arg(long)]
     resume_from: Option<PathBuf>,
+
+    /// Burn training backend: cpu, cuda, or wgpu.
+    #[arg(long, value_enum, default_value_t = BackendArg::Cpu)]
+    backend: BackendArg,
+
+    /// Device index for CUDA/WGPU backends.
+    #[arg(long, default_value_t = 0)]
+    device_index: usize,
+
+    /// Training float precision: f32, f16, or bf16.
+    #[arg(long, value_enum, default_value_t = PrecisionArg::F32)]
+    precision: PrecisionArg,
+
+    /// Shortcut for --precision f16.
+    #[arg(long)]
+    mixed_precision: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -196,6 +213,20 @@ enum ArchitectureArg {
     Paraformer,
     #[value(alias = "wav2vec", alias = "wav2vec-bert", alias = "w2v_bert")]
     W2vBert,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum BackendArg {
+    Cpu,
+    Cuda,
+    Wgpu,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum PrecisionArg {
+    F32,
+    F16,
+    Bf16,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -218,6 +249,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let (train_manifest, val_manifest) = resolve_manifest_paths(&args)?;
     let adaptive_batch = resolve_adaptive_batch(&args)?;
+    let precision = resolve_precision(&args);
     let config = BurnTrainConfig {
         architecture: resolve_architecture(&args),
         train_manifest,
@@ -260,6 +292,13 @@ fn main() -> Result<()> {
         w2v_hf_load_weights: args.w2v_hf_load_weights,
         w2v_activation_checkpointing: args.w2v_activation_checkpointing,
         resume_from: args.resume_from,
+        backend: match args.backend {
+            BackendArg::Cpu => TrainBackendKind::Cpu,
+            BackendArg::Cuda => TrainBackendKind::Cuda,
+            BackendArg::Wgpu => TrainBackendKind::Wgpu,
+        },
+        device_index: args.device_index,
+        precision,
     };
 
     let summary = run_burn_training(config)?;
@@ -273,6 +312,17 @@ fn main() -> Result<()> {
         summary.last_val_wer
     );
     Ok(())
+}
+
+fn resolve_precision(args: &Args) -> TrainPrecision {
+    if args.mixed_precision && matches!(args.precision, PrecisionArg::F32) {
+        return TrainPrecision::F16;
+    }
+    match args.precision {
+        PrecisionArg::F32 => TrainPrecision::F32,
+        PrecisionArg::F16 => TrainPrecision::F16,
+        PrecisionArg::Bf16 => TrainPrecision::Bf16,
+    }
 }
 
 fn resolve_architecture(args: &Args) -> TrainArchitecture {
