@@ -139,6 +139,14 @@ struct Args {
     /// Use enhanced Paraformer-v2 with shallow CTC, boundary, and refinement heads.
     #[arg(long)]
     paraformer_enhanced: bool,
+
+    /// Local Hugging Face W2V-BERT directory or config.json for Burn config loading.
+    #[arg(long)]
+    w2v_hf_model_dir: Option<PathBuf>,
+
+    /// Import compatible W2V-BERT tensors from .safetensors in --w2v-hf-model-dir.
+    #[arg(long)]
+    w2v_hf_load_weights: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -200,6 +208,8 @@ fn main() -> Result<()> {
             ParaformerAlignmentArg::Greedy => ParaformerAlignmentMode::Greedy,
         },
         paraformer_enhanced: args.paraformer_enhanced,
+        w2v_hf_model_dir: args.w2v_hf_model_dir,
+        w2v_hf_load_weights: args.w2v_hf_load_weights,
     };
 
     let summary = run_burn_training(config)?;

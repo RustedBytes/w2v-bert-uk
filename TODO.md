@@ -15,7 +15,9 @@
 - [ ] Re-check Zipformer balancer/whiten when upgrading Burn, and replace zero-forward penalties if a public generic custom-backward hook is available.
 - [x] Tighten Paraformer parity against the Python implementation, including predictor/alignment-specific training losses.
 - [x] Add enhanced Paraformer-v2 shallow CTC, boundary, and refinement heads.
-- [ ] Tighten Wav2Vec/W2V-BERT parity against the Python implementation.
+- [x] Tighten Wav2Vec/W2V-BERT parity against the Python implementation.
+- [x] Add Hugging Face W2V-BERT weight import/config loading for Burn.
+- [ ] Add W2V-BERT activation checkpointing
 
 ## Training
 

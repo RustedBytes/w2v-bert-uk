@@ -69,6 +69,8 @@ pub struct BurnTrainConfig {
     pub dry_run: bool,
     pub paraformer_alignment_mode: ParaformerAlignmentMode,
     pub paraformer_enhanced: bool,
+    pub w2v_hf_model_dir: Option<PathBuf>,
+    pub w2v_hf_load_weights: bool,
 }
 
 impl Default for BurnTrainConfig {
@@ -99,6 +101,8 @@ impl Default for BurnTrainConfig {
             dry_run: false,
             paraformer_alignment_mode: ParaformerAlignmentMode::Viterbi,
             paraformer_enhanced: false,
+            w2v_hf_model_dir: None,
+            w2v_hf_load_weights: false,
         }
     }
 }
@@ -262,14 +266,37 @@ pub fn run_burn_training(config: BurnTrainConfig) -> Result<TrainSummary> {
             }
         }
         TrainArchitecture::Wav2VecBert => {
-            let encoder = Wav2VecBertConfig::new(config.input_dim, config.d_model)
-                .with_layers(config.num_layers);
-            let model = Wav2VecBertCtcConfig {
-                encoder,
-                vocab_size: config.vocab_size,
+            let model_config = if let Some(path) = &config.w2v_hf_model_dir {
+                Wav2VecBertCtcConfig::from_huggingface_dir(path, Some(config.vocab_size))?
+            } else {
+                let encoder = Wav2VecBertConfig::new(config.input_dim, config.d_model)
+                    .with_layers(config.num_layers);
+                Wav2VecBertCtcConfig {
+                    encoder,
+                    vocab_size: config.vocab_size,
+                }
+            };
+            let mut train_config = config.clone();
+            train_config.input_dim = model_config.encoder.feature_dim;
+            train_config.d_model = model_config.encoder.hidden_size;
+            train_config.num_layers = model_config.encoder.num_hidden_layers;
+            train_config.num_heads = model_config.encoder.num_attention_heads;
+            let mut model = model_config.init::<TrainBackend>(&device);
+            if config.w2v_hf_load_weights {
+                let path = config
+                    .w2v_hf_model_dir
+                    .as_ref()
+                    .context("--w2v-hf-load-weights requires --w2v-hf-model-dir")?;
+                let report = model.load_huggingface_weights(path, &device)?;
+                log::info!(
+                    "loaded {} Hugging Face W2V-BERT tensors from {} file(s), skipped_missing={}, skipped_shape={}",
+                    report.loaded_count(),
+                    report.source_files.len(),
+                    report.skipped_missing.len(),
+                    report.skipped_shape.len()
+                );
             }
-            .init::<TrainBackend>(&device);
-            train_ctc_model(model, &config, &device)
+            train_ctc_model(model, &train_config, &device)
         }
     }
 }
@@ -1398,6 +1425,8 @@ fn write_run_config(config: &BurnTrainConfig) -> Result<()> {
             "epochs": config.epochs,
             "learning_rate": config.learning_rate,
             "weight_decay": config.weight_decay,
+            "w2v_hf_model_dir": config.w2v_hf_model_dir,
+            "w2v_hf_load_weights": config.w2v_hf_load_weights,
         }))?,
     )
     .with_context(|| format!("failed to write {}", path.display()))
