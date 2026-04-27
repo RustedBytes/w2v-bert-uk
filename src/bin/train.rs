@@ -17,7 +17,7 @@ use polars::prelude::{
     ParquetWriter, SerReader, Series,
 };
 use serde_json::Value;
-use w2v_bert_uk::audio::WaveformAugmentConfig;
+use w2v_bert_uk::audio::{FeatureExtractorConfig, WaveformAugmentConfig};
 use w2v_bert_uk::paraformer::ParaformerAlignmentMode;
 use w2v_bert_uk::train::{
     AdaptiveBatchConfig, AdaptiveBatchUnit, BurnTrainConfig, FeatureExtractionProgress,
@@ -458,7 +458,7 @@ struct ExtractFeaturesArgs {
     #[arg(long = "input", required = true)]
     inputs: Vec<PathBuf>,
 
-    /// Output Parquet file with id, text, rows, cols, duration_ms, features, and tokens.
+    /// Output Parquet file, or output directory when any input is a directory.
     #[arg(long)]
     output: PathBuf,
 
@@ -481,6 +481,10 @@ struct ExtractFeaturesArgs {
     /// Limit number of output records.
     #[arg(long)]
     max_samples: Option<usize>,
+
+    /// Number of Rayon worker threads used to decode audio and extract rows.
+    #[arg(long)]
+    jobs: Option<usize>,
 
     /// Show a live terminal UI while decoding audio and writing feature rows.
     #[arg(long)]
@@ -899,9 +903,27 @@ fn sentencepiece_model_type(model_type: SentencePieceModelTypeArg) -> &'static s
 }
 
 fn run_feature_extraction(args: ExtractFeaturesArgs) -> Result<()> {
+    if let Some(jobs) = args.jobs {
+        if jobs == 0 {
+            bail!("--jobs must be greater than 0");
+        }
+        return rayon::ThreadPoolBuilder::new()
+            .num_threads(jobs)
+            .build()
+            .context("failed to build Rayon thread pool")?
+            .install(|| run_feature_extraction_inner(args));
+    }
+    run_feature_extraction_inner(args)
+}
+
+fn run_feature_extraction_inner(args: ExtractFeaturesArgs) -> Result<()> {
     let max_audio_duration_ms = duration_sec_to_ms(args.max_audio_duration_sec)?;
     let architecture = resolve_extract_architecture(&args);
     let frontend = feature_extractor_for_train_architecture(architecture);
+    if args.inputs.iter().any(|input| input.is_dir()) {
+        return run_feature_extraction_to_directory(args, &frontend, max_audio_duration_ms);
+    }
+
     let mut records = Vec::new();
     let mut tui = if args.tui {
         Some(ExtractionTui::new(&args.output)?)
@@ -949,6 +971,90 @@ fn run_feature_extraction(args: ExtractFeaturesArgs) -> Result<()> {
         args.output.display()
     );
     Ok(())
+}
+
+fn run_feature_extraction_to_directory(
+    args: ExtractFeaturesArgs,
+    frontend: &FeatureExtractorConfig,
+    max_audio_duration_ms: Option<usize>,
+) -> Result<()> {
+    fs::create_dir_all(&args.output).with_context(|| {
+        format!(
+            "failed to create output directory {}",
+            args.output.display()
+        )
+    })?;
+    let mut total_records = 0usize;
+    let mut written = 0usize;
+    let mut tui = if args.tui {
+        Some(ExtractionTui::new(&args.output)?)
+    } else {
+        None
+    };
+
+    for (input_index, input) in args.inputs.iter().enumerate() {
+        let remaining = args
+            .max_samples
+            .map(|limit| limit.saturating_sub(total_records));
+        if remaining == Some(0) {
+            break;
+        }
+        let records = if let Some(tui) = tui.as_mut() {
+            extract_feature_records_with_progress(
+                input,
+                remaining,
+                args.tokenizer.as_deref(),
+                frontend,
+                max_audio_duration_ms,
+                |progress| tui.update(progress),
+            )?
+        } else {
+            extract_feature_records(
+                input,
+                remaining,
+                args.tokenizer.as_deref(),
+                frontend,
+                max_audio_duration_ms,
+            )?
+        };
+        if records.is_empty() {
+            continue;
+        }
+        total_records += records.len();
+        let output = directory_feature_output_path(&args.output, input, input_index);
+        write_feature_records_parquet(&records, &output)?;
+        written += 1;
+        println!(
+            "wrote {} feature records to {}",
+            records.len(),
+            output.display()
+        );
+    }
+
+    if total_records == 0 {
+        bail!("no records were extracted");
+    }
+    if let Some(tui) = tui.as_mut() {
+        tui.finish(total_records)?;
+    }
+    drop(tui);
+    println!(
+        "wrote {} feature records across {} parquet files in {}",
+        total_records,
+        written,
+        args.output.display()
+    );
+    Ok(())
+}
+
+fn directory_feature_output_path(output_dir: &Path, input: &Path, input_index: usize) -> PathBuf {
+    let stem = input
+        .file_stem()
+        .or_else(|| input.file_name())
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("features");
+    output_dir.join(format!("{input_index:04}-{stem}.parquet"))
 }
 
 struct ExtractionTui {

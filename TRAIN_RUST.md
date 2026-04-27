@@ -124,13 +124,16 @@ cargo run --release --bin train -- extract-features \
   --architecture w2v-bert \
   --tokenizer tokenizer.model \
   --max-audio-duration-sec 20 \
+  --jobs 8 \
   --tui
 ```
 
 Pass `--input` multiple times for multiple shards. Use `--max-samples` for a
-bounded preprocessing run. `--tui` opens a live terminal monitor for decoded
-records, skipped long samples, the current input shard, and the last extracted
-sample.
+bounded preprocessing run. Feature extraction uses Rayon; pass `--jobs` to set
+the worker count. `--tui` opens a live terminal monitor for decoded records,
+skipped long samples, the current input shard, and the last extracted sample.
+When any `--input` is a directory, `--output` is treated as an output directory
+and one numbered Parquet file is written per input.
 
 ## Build Modes
 

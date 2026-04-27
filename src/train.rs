@@ -28,6 +28,7 @@ use crossterm::{
 use kenlm::{Config as KenlmConfig, Model as KenlmModel};
 use polars::prelude::{AnyValue, DataFrame, ParquetReader, SerReader, Series};
 use rand::Rng;
+use rayon::prelude::*;
 use serde_json::{Value, json};
 use splintr::SentencePieceTokenizer;
 
@@ -3494,6 +3495,15 @@ pub struct FeatureExtractionProgress {
     pub last_duration_ms: Option<usize>,
 }
 
+enum ExtractedFeatureRecord {
+    Keep(FeatureRecord),
+    SkipDuration {
+        id: String,
+        rows: usize,
+        duration_ms: usize,
+    },
+}
+
 pub fn extract_feature_records_with_progress(
     path: &Path,
     limit: Option<usize>,
@@ -3539,38 +3549,60 @@ pub fn extract_feature_records_with_progress(
                 })
                 .collect()
         };
-        for raw in raw_lines {
+        let extracted = raw_lines
+            .par_iter()
+            .map(|raw| {
+                let record = raw.parse_record(
+                    tokenizer.as_ref(),
+                    &audio_decode,
+                    audio_frontend,
+                    WaveformAugmentConfig::default(),
+                )?;
+                if max_audio_duration_ms.is_some_and(|max| record.duration_ms > max) {
+                    Ok(ExtractedFeatureRecord::SkipDuration {
+                        id: record.id,
+                        rows: record.rows,
+                        duration_ms: record.duration_ms,
+                    })
+                } else {
+                    Ok(ExtractedFeatureRecord::Keep(record))
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        for extracted in extracted {
             if limit.is_some_and(|limit| records.len() >= limit) {
                 break;
             }
-            let record = raw.parse_record(
-                tokenizer.as_ref(),
-                &audio_decode,
-                audio_frontend,
-                WaveformAugmentConfig::default(),
-            )?;
-            if max_audio_duration_ms.is_some_and(|max| record.duration_ms > max) {
-                skipped_duration += 1;
-                on_progress(&FeatureExtractionProgress {
-                    input: file.clone(),
-                    records: records.len(),
-                    skipped_duration,
-                    last_id: Some(record.id),
-                    last_rows: Some(record.rows),
-                    last_duration_ms: Some(record.duration_ms),
-                })?;
-                continue;
+            match extracted {
+                ExtractedFeatureRecord::SkipDuration {
+                    id,
+                    rows,
+                    duration_ms,
+                } => {
+                    skipped_duration += 1;
+                    on_progress(&FeatureExtractionProgress {
+                        input: file.clone(),
+                        records: records.len(),
+                        skipped_duration,
+                        last_id: Some(id),
+                        last_rows: Some(rows),
+                        last_duration_ms: Some(duration_ms),
+                    })?;
+                }
+                ExtractedFeatureRecord::Keep(record) => {
+                    let progress = FeatureExtractionProgress {
+                        input: file.clone(),
+                        records: records.len() + 1,
+                        skipped_duration,
+                        last_id: Some(record.id.clone()),
+                        last_rows: Some(record.rows),
+                        last_duration_ms: Some(record.duration_ms),
+                    };
+                    records.push(record);
+                    on_progress(&progress)?;
+                }
             }
-            let progress = FeatureExtractionProgress {
-                input: file.clone(),
-                records: records.len() + 1,
-                skipped_duration,
-                last_id: Some(record.id.clone()),
-                last_rows: Some(record.rows),
-                last_duration_ms: Some(record.duration_ms),
-            };
-            records.push(record);
-            on_progress(&progress)?;
         }
     }
     if records.is_empty() {
