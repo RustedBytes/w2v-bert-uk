@@ -314,6 +314,7 @@ pub struct TrainBatch {
     pub max_frames: usize,
     pub feature_dim: usize,
     pub feature_lengths: Vec<usize>,
+    pub durations_ms: Vec<usize>,
     pub targets: Vec<i64>,
     pub max_target_len: usize,
     pub target_lengths: Vec<usize>,
@@ -1621,6 +1622,9 @@ fn average_metric_quintets(results: &[(GradientsParams, [f32; 5])]) -> [f32; 5] 
 struct BatchDiagnostics {
     batches: usize,
     samples: usize,
+    total_duration_ms: usize,
+    max_duration_ms: usize,
+    padded_duration_ms: usize,
     total_frames: usize,
     max_frames: usize,
     padded_frames: usize,
@@ -1637,6 +1641,12 @@ impl BatchDiagnostics {
         };
         for batch in batches {
             diagnostics.samples += batch.batch_size;
+            diagnostics.total_duration_ms += batch.durations_ms.iter().sum::<usize>();
+            diagnostics.max_duration_ms = diagnostics
+                .max_duration_ms
+                .max(batch.durations_ms.iter().copied().max().unwrap_or(0));
+            diagnostics.padded_duration_ms +=
+                batch.batch_size * batch.durations_ms.iter().copied().max().unwrap_or(0);
             diagnostics.total_frames += batch.feature_lengths.iter().sum::<usize>();
             diagnostics.max_frames = diagnostics.max_frames.max(batch.max_frames);
             diagnostics.padded_frames += batch.batch_size * batch.max_frames;
@@ -1651,6 +1661,11 @@ impl BatchDiagnostics {
         json!({
             "batches": self.batches,
             "samples": self.samples,
+            "total_duration_ms": self.total_duration_ms,
+            "max_duration_ms": self.max_duration_ms,
+            "padded_duration_ms": self.padded_duration_ms,
+            "duration_min": self.total_duration_ms as f64 / 60_000.0,
+            "padded_duration_min": self.padded_duration_ms as f64 / 60_000.0,
             "total_frames": self.total_frames,
             "max_frames": self.max_frames,
             "padded_frames": self.padded_frames,
@@ -3401,6 +3416,7 @@ fn make_batch(records: &[FeatureRecord], expected_dim: usize) -> Result<TrainBat
     let mut targets = vec![0i64; batch_size * max_target_len];
     let mut ids = Vec::with_capacity(batch_size);
     let mut feature_lengths = Vec::with_capacity(batch_size);
+    let mut durations_ms = Vec::with_capacity(batch_size);
     let mut target_lengths = Vec::with_capacity(batch_size);
     let mut reference_texts = Vec::with_capacity(batch_size);
 
@@ -3415,6 +3431,7 @@ fn make_batch(records: &[FeatureRecord], expected_dim: usize) -> Result<TrainBat
         }
         ids.push(record.id.clone());
         feature_lengths.push(record.rows);
+        durations_ms.push(record.duration_ms);
         target_lengths.push(record.tokens.len());
         reference_texts.push(record.text.clone());
         for row in 0..record.rows {
@@ -3434,6 +3451,7 @@ fn make_batch(records: &[FeatureRecord], expected_dim: usize) -> Result<TrainBat
         max_frames,
         feature_dim: expected_dim,
         feature_lengths,
+        durations_ms,
         targets,
         max_target_len,
         target_lengths,
@@ -5732,6 +5750,8 @@ struct TuiMetrics {
     val_wer: Option<f64>,
     learning_rate: Option<f64>,
     samples: Option<usize>,
+    duration_min: Option<f64>,
+    padded_duration_min: Option<f64>,
     max_frames: Option<usize>,
     padded_frames: Option<usize>,
     padding_ratio: Option<f64>,
@@ -5777,6 +5797,8 @@ impl TrainingTui {
                 self.metrics.step = json_usize(payload, "next_step");
                 if let Some(batch) = payload.get("batch") {
                     self.metrics.samples = json_usize(batch, "samples");
+                    self.metrics.duration_min = json_f64(batch, "duration_min");
+                    self.metrics.padded_duration_min = json_f64(batch, "padded_duration_min");
                     self.metrics.max_frames = json_usize(batch, "max_frames");
                     self.metrics.padded_frames = json_usize(batch, "padded_frames");
                     self.metrics.padding_ratio = json_f64(batch, "padding_ratio");
@@ -5842,6 +5864,11 @@ impl TrainingTui {
                 fmt_opt_usize(self.metrics.epoch),
                 fmt_opt_usize(self.metrics.step),
                 fmt_opt_f64(self.metrics.learning_rate, 8)
+            )),
+            Print(format!(
+                "  duration_min: {}   padded_duration_min: {}\n",
+                fmt_opt_f64(self.metrics.duration_min, 2),
+                fmt_opt_f64(self.metrics.padded_duration_min, 2)
             )),
             Print(format!(
                 "  samples: {}   max_frames: {}   padded_frames: {}   padding_ratio: {}\n",
