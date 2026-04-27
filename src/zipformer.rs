@@ -419,21 +419,15 @@ impl<B: Backend> MultiHeadAttentionWeights<B> {
         let pos_scores = relative_shift(p_query.matmul(rel.swap_dims(2, 3)), seq_len);
         let mut scores = content_scores + pos_scores;
 
-        let attn_mask =
-            attention_mask_4d::<B>(lengths, self.num_heads, seq_len, seq_len, &scores.device());
+        let key_mask =
+            attention_key_mask_4d::<B>(lengths, self.num_heads, seq_len, seq_len, &scores.device());
         let negative = Tensor::full(
             [batch_size, self.num_heads, seq_len, seq_len],
             -1.0e4,
             &scores.device(),
         );
-        scores = scores.mask_where(attn_mask.clone().bool_not(), negative);
-        let mut attn = softmax(scores, 3);
-        let zeros = Tensor::zeros(
-            [batch_size, self.num_heads, seq_len, seq_len],
-            &attn.device(),
-        );
-        attn = attn.mask_where(attn_mask.bool_not(), zeros);
-        self.dropout.forward(attn)
+        scores = scores.mask_where(key_mask.bool_not(), negative);
+        self.dropout.forward(softmax(scores, 3))
     }
 }
 
@@ -1264,7 +1258,7 @@ fn sequence_mask<B: Backend>(
     Tensor::from_data(TensorData::new(values, [lengths.len(), max_len]), device)
 }
 
-fn attention_mask_4d<B: Backend>(
+fn attention_key_mask_4d<B: Backend>(
     lengths: &[usize],
     heads: usize,
     query_len: usize,
@@ -1274,9 +1268,9 @@ fn attention_mask_4d<B: Backend>(
     let mut values = Vec::with_capacity(lengths.len() * heads * query_len * key_len);
     for length in lengths {
         for _ in 0..heads {
-            for query in 0..query_len {
+            for _ in 0..query_len {
                 for key in 0..key_len {
-                    values.push(query < *length && key < *length);
+                    values.push(key < *length);
                 }
             }
         }
