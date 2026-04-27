@@ -183,6 +183,7 @@ fn main() -> Result<()> {
         &AudioDecodeConfig {
             fallback_sample_rate: args.fallback_sample_rate,
             skip_decode_errors: !args.strict_audio_decode,
+            ffmpeg_fallback: true,
         },
         &encoder.w2v_bert.to_frontend_config(),
     )?;

@@ -302,6 +302,7 @@ fn config_from_jni(
         audio: AudioDecodeConfig {
             fallback_sample_rate: non_zero_jint(fallback_sample_rate, 16_000),
             skip_decode_errors: jboolean_to_bool(skip_decode_errors),
+            ffmpeg_fallback: true,
         },
         encoder: EncoderConfig {
             w2v_bert: W2vBertEncoderConfig {

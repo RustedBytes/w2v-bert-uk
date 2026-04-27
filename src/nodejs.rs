@@ -217,6 +217,7 @@ fn build_config(options: Option<TranscriptionOptions>) -> Result<TranscriptionCo
         audio: AudioDecodeConfig {
             fallback_sample_rate: options.fallback_sample_rate.unwrap_or(16_000),
             skip_decode_errors: options.skip_decode_errors.unwrap_or(true),
+            ffmpeg_fallback: true,
         },
         encoder: EncoderConfig {
             w2v_bert: W2vBertEncoderConfig {

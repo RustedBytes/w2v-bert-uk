@@ -554,6 +554,7 @@ fn build_config(
         audio: AudioDecodeConfig {
             fallback_sample_rate,
             skip_decode_errors,
+            ffmpeg_fallback: true,
         },
         encoder: EncoderConfig {
             w2v_bert: W2vBertEncoderConfig {

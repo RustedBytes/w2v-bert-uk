@@ -266,6 +266,7 @@ fn config_from_options(options: *const W2vBertUkOptions) -> anyhow::Result<Trans
         audio: AudioDecodeConfig {
             fallback_sample_rate: non_zero_u32(options.fallback_sample_rate, 16_000),
             skip_decode_errors: bool_or_default(options.skip_decode_errors, true),
+            ffmpeg_fallback: true,
         },
         encoder: EncoderConfig {
             w2v_bert: W2vBertEncoderConfig {

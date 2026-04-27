@@ -152,6 +152,7 @@ fn build_config(options: Option<RHash>) -> Result<TranscriptionConfig, Error> {
         audio: AudioDecodeConfig {
             fallback_sample_rate: hash_get(options, "fallback_sample_rate")?.unwrap_or(16_000),
             skip_decode_errors: hash_get(options, "skip_decode_errors")?.unwrap_or(true),
+            ffmpeg_fallback: true,
         },
         encoder: EncoderConfig {
             w2v_bert: W2vBertEncoderConfig {

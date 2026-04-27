@@ -186,6 +186,7 @@ fn main() -> Result<()> {
             audio: AudioDecodeConfig {
                 fallback_sample_rate: args.fallback_sample_rate,
                 skip_decode_errors: !args.strict_audio_decode,
+                ffmpeg_fallback: true,
             },
             encoder: EncoderConfig {
                 w2v_bert: W2vBertEncoderConfig {
