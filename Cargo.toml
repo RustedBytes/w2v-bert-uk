@@ -53,6 +53,7 @@ magnus = { version = "0.8.2", optional = true }
 napi = { version = "2.16.17", optional = true, default-features = false, features = ["napi4"] }
 napi-derive = { version = "2.16.13", optional = true }
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["api-24", "half", "ndarray", "std"] }
+polars = { version = "0.53", default-features = false, features = ["fmt", "polars-io", "parquet", "dtype-array", "dtype-struct"] }
 prost = "0.14"
 pyo3 = { version = "0.27.1", optional = true, features = ["abi3-py310"] }
 rand = "0.9"

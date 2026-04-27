@@ -113,6 +113,20 @@ pub fn audio_bytes_to_w2v_bert_features_with_config(
     samples_to_w2v_bert_features(samples, sample_rate, decode_start, frontend_config)
 }
 
+pub fn audio_bytes_to_w2v_bert_features_with_augmentation(
+    audio_bytes: impl Into<Vec<u8>>,
+    format_hint: Option<&str>,
+    decode_config: &AudioDecodeConfig,
+    frontend_config: &asr_features::W2vBertFrontendConfig,
+    augment: WaveformAugmentConfig,
+) -> Result<AudioFeatures> {
+    let decode_start = Instant::now();
+    let (mut samples, sample_rate) =
+        decode_audio_bytes_to_mono_f32(audio_bytes.into(), format_hint, decode_config)?;
+    apply_waveform_augmentation(&mut samples, augment);
+    samples_to_w2v_bert_features(samples, sample_rate, decode_start, frontend_config)
+}
+
 fn samples_to_w2v_bert_features(
     samples: Vec<f32>,
     sample_rate: u32,

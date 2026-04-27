@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
@@ -19,13 +20,15 @@ use burn_optim::{
     adaptor::OptimizerAdaptor, grad_clipping::GradientClippingConfig,
 };
 use kenlm::{Config as KenlmConfig, Model as KenlmModel};
+use polars::prelude::{AnyValue, DataFrame, ParquetReader, SerReader, Series};
 use rand::Rng;
 use serde_json::{Value, json};
 use splintr::SentencePieceTokenizer;
 
 use crate::audio::{
-    AudioDecodeConfig, WaveformAugmentConfig, audio_file_to_w2v_bert_features_with_augmentation,
-    audio_file_to_w2v_bert_features_with_config,
+    AudioDecodeConfig, WaveformAugmentConfig, audio_bytes_to_w2v_bert_features_with_augmentation,
+    audio_bytes_to_w2v_bert_features_with_config,
+    audio_file_to_w2v_bert_features_with_augmentation, audio_file_to_w2v_bert_features_with_config,
 };
 use crate::ctc::{CtcCandidate, threaded_ctc_beam_search_decode_n_best};
 use crate::paraformer::{
@@ -3273,6 +3276,7 @@ pub struct StreamingBatchLoader {
     audio_frontend: asr_features::W2vBertFrontendConfig,
     waveform_augment: WaveformAugmentConfig,
     pending: Option<FeatureRecord>,
+    raw_pending: VecDeque<RawManifestLine>,
     sort_buffer: Vec<FeatureRecordMetadata>,
     index_records: Vec<FeatureRecordMetadata>,
     index_cursor: usize,
@@ -3347,6 +3351,7 @@ impl StreamingBatchLoader {
             audio_frontend: W2vBertEncoderConfig::default().to_frontend_config(),
             waveform_augment,
             pending: None,
+            raw_pending: VecDeque::new(),
             sort_buffer: Vec::new(),
             index_records,
             index_cursor: 0,
@@ -3483,12 +3488,22 @@ impl StreamingBatchLoader {
 
     fn next_raw_line(&mut self) -> Result<Option<RawManifestLine>> {
         loop {
+            if let Some(raw) = self.raw_pending.pop_front() {
+                return Ok(Some(raw));
+            }
             if self.current.is_none() {
                 if self.file_index >= self.files.len() {
                     return Ok(None);
                 }
                 let path = self.files[self.file_index].clone();
                 self.file_index += 1;
+                if is_audio_dataset_file(&path) {
+                    return Ok(Some(RawManifestLine::from_audio_path(path)));
+                }
+                if is_parquet_file(&path) {
+                    self.raw_pending = parquet_raw_lines(&path)?.into();
+                    continue;
+                }
                 self.current = Some(CurrentManifestFile::open(path)?);
             }
 
@@ -3532,6 +3547,20 @@ struct RawManifestLine {
 }
 
 impl RawManifestLine {
+    fn from_audio_path(path: PathBuf) -> Self {
+        let base_dir = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        Self {
+            manifest_path: path,
+            base_dir,
+            byte_offset: 0,
+            line_number: 1,
+            line: String::new(),
+        }
+    }
+
     fn parse_record(
         &self,
         tokenizer: Option<&SentencePieceTokenizer>,
@@ -3539,6 +3568,27 @@ impl RawManifestLine {
         audio_frontend: &asr_features::W2vBertFrontendConfig,
         waveform_augment: WaveformAugmentConfig,
     ) -> Result<FeatureRecord> {
+        if is_parquet_file(&self.manifest_path) {
+            return parse_parquet_record(
+                &self.manifest_path,
+                self.line_number.saturating_sub(1),
+                &self.base_dir,
+                tokenizer,
+                audio_decode,
+                audio_frontend,
+                waveform_augment,
+            );
+        }
+        if is_audio_dataset_file(&self.manifest_path) {
+            return parse_raw_audio_record(
+                &self.manifest_path,
+                &self.base_dir,
+                tokenizer,
+                audio_decode,
+                audio_frontend,
+                waveform_augment,
+            );
+        }
         if self.line.starts_with('{') {
             parse_json_record(
                 &self.line,
@@ -3555,6 +3605,20 @@ impl RawManifestLine {
     }
 
     fn parse_metadata(&self) -> Result<FeatureRecordMetadata> {
+        if is_parquet_file(&self.manifest_path) {
+            let (id, rows) = parse_parquet_raw_line_metadata(&self.line)?;
+            return Ok(FeatureRecordMetadata {
+                manifest_path: self.manifest_path.clone(),
+                base_dir: self.base_dir.clone(),
+                byte_offset: self.byte_offset,
+                line_number: self.line_number,
+                id,
+                rows,
+            });
+        }
+        if is_audio_dataset_file(&self.manifest_path) {
+            return Ok(raw_audio_metadata(&self.manifest_path, &self.base_dir));
+        }
         let (id, rows) = if self.line.starts_with('{') {
             parse_json_record_metadata(&self.line, self.line_number)?
         } else {
@@ -3579,6 +3643,27 @@ impl FeatureRecordMetadata {
         audio_frontend: &asr_features::W2vBertFrontendConfig,
         waveform_augment: WaveformAugmentConfig,
     ) -> Result<FeatureRecord> {
+        if is_parquet_file(&self.manifest_path) {
+            return parse_parquet_record(
+                &self.manifest_path,
+                self.line_number.saturating_sub(1),
+                &self.base_dir,
+                tokenizer,
+                audio_decode,
+                audio_frontend,
+                waveform_augment,
+            );
+        }
+        if is_audio_dataset_file(&self.manifest_path) {
+            return parse_raw_audio_record(
+                &self.manifest_path,
+                &self.base_dir,
+                tokenizer,
+                audio_decode,
+                audio_frontend,
+                waveform_augment,
+            );
+        }
         let mut reader =
             BufReader::new(fs::File::open(&self.manifest_path).with_context(|| {
                 format!("failed to open manifest {}", self.manifest_path.display())
@@ -3637,12 +3722,19 @@ fn manifest_files(path: &Path) -> Result<Vec<PathBuf>> {
         files.retain(|path| is_manifest_file(path));
         files.sort();
         if files.is_empty() {
-            bail!(
-                "manifest directory {} contains no .jsonl/.json files",
-                path.display()
-            );
+            collect_raw_audio_files(path, &mut files)?;
+            files.sort();
+            if files.is_empty() {
+                bail!(
+                    "manifest directory {} contains no .jsonl/.json files or raw audio files",
+                    path.display()
+                );
+            }
         }
         return Ok(files);
+    }
+    if !path.exists() {
+        bail!("manifest path does not exist: {}", path.display());
     }
     Ok(vec![path.to_path_buf()])
 }
@@ -3652,7 +3744,46 @@ fn is_manifest_file(path: &Path) -> bool {
         && path
             .extension()
             .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| matches!(extension, "jsonl" | "json"))
+            .map(|extension| extension.to_ascii_lowercase())
+            .is_some_and(|extension| matches!(extension.as_str(), "jsonl" | "json" | "parquet"))
+}
+
+fn is_parquet_file(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("parquet"))
+}
+
+fn is_audio_dataset_file(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .is_some_and(|extension| {
+                matches!(
+                    extension.as_str(),
+                    "wav" | "flac" | "mp3" | "ogg" | "opus" | "m4a" | "aac" | "webm"
+                )
+            })
+}
+
+fn collect_raw_audio_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(dir)
+        .with_context(|| format!("failed to read audio directory {}", dir.display()))?
+    {
+        let path = entry
+            .with_context(|| format!("failed to read entry in {}", dir.display()))?
+            .path();
+        if path.is_dir() {
+            collect_raw_audio_files(&path, files)?;
+        } else if is_audio_dataset_file(&path) {
+            files.push(path);
+        }
+    }
+    Ok(())
 }
 
 fn dataset_index_path(config: &BurnTrainConfig, split: &str) -> Option<PathBuf> {
@@ -3717,6 +3848,32 @@ fn load_dataset_index_if_fresh(
 fn build_dataset_index(files: &[PathBuf]) -> Result<Vec<FeatureRecordMetadata>> {
     let mut records = Vec::new();
     for path in files {
+        if is_parquet_file(path) {
+            records.extend(
+                parquet_raw_lines(path)?
+                    .into_iter()
+                    .map(|raw| {
+                        let (id, rows) = parse_parquet_raw_line_metadata(&raw.line)?;
+                        Ok(FeatureRecordMetadata {
+                            manifest_path: raw.manifest_path,
+                            base_dir: raw.base_dir,
+                            byte_offset: raw.byte_offset,
+                            line_number: raw.line_number,
+                            id,
+                            rows,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            );
+            continue;
+        }
+        if is_audio_dataset_file(path) {
+            records.push(raw_audio_metadata(
+                path,
+                path.parent().unwrap_or_else(|| Path::new(".")),
+            ));
+            continue;
+        }
         let mut current = CurrentManifestFile::open(path.clone())?;
         loop {
             let mut line = String::new();
@@ -3823,6 +3980,529 @@ fn sort_index_records(records: &mut [FeatureRecordMetadata]) {
     });
 }
 
+fn parquet_raw_lines(path: &Path) -> Result<Vec<RawManifestLine>> {
+    let df = read_parquet_dataframe(path)?;
+    let base_dir = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let mut lines = Vec::with_capacity(df.height());
+    for row in 0..df.height() {
+        let id = parquet_row_id(&df, row, path, &base_dir)?;
+        let rows = parquet_row_count_hint(&df, row).unwrap_or(usize::MAX);
+        lines.push(RawManifestLine {
+            manifest_path: path.to_path_buf(),
+            base_dir: base_dir.clone(),
+            byte_offset: row as u64,
+            line_number: row + 1,
+            line: format!("{id}\t{rows}"),
+        });
+    }
+    Ok(lines)
+}
+
+fn parse_parquet_raw_line_metadata(line: &str) -> Result<(String, usize)> {
+    let mut parts = line.splitn(2, '\t');
+    let id = parts.next().unwrap_or_default().to_string();
+    let rows = parts
+        .next()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(usize::MAX);
+    Ok((id, rows))
+}
+
+fn parse_parquet_record(
+    path: &Path,
+    row: usize,
+    base_dir: &Path,
+    tokenizer: Option<&SentencePieceTokenizer>,
+    audio_decode: &AudioDecodeConfig,
+    audio_frontend: &asr_features::W2vBertFrontendConfig,
+    waveform_augment: WaveformAugmentConfig,
+) -> Result<FeatureRecord> {
+    let df = read_parquet_dataframe(path)?;
+    if row >= df.height() {
+        bail!(
+            "parquet row {} is out of bounds for {} rows in {}",
+            row,
+            df.height(),
+            path.display()
+        );
+    }
+    let id = parquet_row_id(&df, row, path, base_dir)?;
+    let text = parquet_optional_string(
+        &df,
+        row,
+        &["text", "transcript", "sentence", "normalized_text"],
+    )?;
+    let tokens = match parquet_optional_tokens(&df, row)? {
+        Some(tokens) => tokens,
+        None => {
+            parse_record_tokens(&json!({}), text.as_deref(), tokenizer, &id).with_context(|| {
+                format!("parquet row '{id}' needs tokens or transcript text plus tokenizer_path")
+            })?
+        }
+    };
+
+    if let Some((features, rows, cols)) = parquet_optional_features(&df, row, &id)? {
+        return Ok(FeatureRecord {
+            id,
+            rows,
+            cols,
+            features,
+            tokens,
+            text,
+        });
+    }
+
+    if let Some((bytes, hint)) = parquet_optional_audio_bytes(&df, row)? {
+        let audio = if waveform_augment.is_enabled() {
+            audio_bytes_to_w2v_bert_features_with_augmentation(
+                bytes,
+                hint.as_deref(),
+                audio_decode,
+                audio_frontend,
+                waveform_augment,
+            )?
+        } else {
+            audio_bytes_to_w2v_bert_features_with_config(
+                bytes,
+                hint.as_deref(),
+                audio_decode,
+                audio_frontend,
+            )?
+        };
+        return Ok(FeatureRecord {
+            id,
+            rows: audio.features.rows,
+            cols: audio.features.cols,
+            features: audio.features.values,
+            tokens,
+            text,
+        });
+    }
+
+    if let Some(audio_path) =
+        parquet_optional_string(&df, row, &["audio_path", "path", "file", "file_path"])?
+    {
+        let audio_path = resolve_path(base_dir, &audio_path);
+        let audio = if waveform_augment.is_enabled() {
+            audio_file_to_w2v_bert_features_with_augmentation(
+                audio_path,
+                audio_decode,
+                audio_frontend,
+                waveform_augment,
+            )?
+        } else {
+            audio_file_to_w2v_bert_features_with_config(audio_path, audio_decode, audio_frontend)?
+        };
+        return Ok(FeatureRecord {
+            id,
+            rows: audio.features.rows,
+            cols: audio.features.cols,
+            features: audio.features.values,
+            tokens,
+            text,
+        });
+    }
+
+    bail!("parquet row '{id}' is missing features or audio bytes/path")
+}
+
+fn read_parquet_dataframe(path: &Path) -> Result<DataFrame> {
+    let file = fs::File::open(path)
+        .with_context(|| format!("failed to open parquet file {}", path.display()))?;
+    ParquetReader::new(file)
+        .finish()
+        .with_context(|| format!("failed to read parquet file {}", path.display()))
+}
+
+fn parquet_row_id(df: &DataFrame, row: usize, path: &Path, base_dir: &Path) -> Result<String> {
+    if let Some(id) = parquet_optional_string(
+        df,
+        row,
+        &["id", "utt_id", "utterance_id", "key", "sample_id"],
+    )? {
+        return Ok(id);
+    }
+    if let Some(id) =
+        parquet_optional_string(df, row, &["audio_path", "path", "file", "file_path"])?
+    {
+        return Ok(Path::new(&id)
+            .with_extension("")
+            .to_string_lossy()
+            .replace('\\', "/"));
+    }
+    let file_id = path
+        .strip_prefix(base_dir)
+        .unwrap_or(path)
+        .with_extension("")
+        .to_string_lossy()
+        .replace('\\', "/");
+    Ok(format!("{file_id}-{row}"))
+}
+
+fn parquet_row_count_hint(df: &DataFrame, row: usize) -> Option<usize> {
+    parquet_optional_usize(df, row, &["rows", "num_frames", "frames", "feature_rows"])
+        .ok()
+        .flatten()
+        .or_else(|| {
+            parquet_optional_features(df, row, "metadata")
+                .ok()
+                .flatten()
+                .map(|(_, rows, _)| rows)
+        })
+}
+
+fn parquet_optional_string(df: &DataFrame, row: usize, names: &[&str]) -> Result<Option<String>> {
+    for name in names {
+        if let Ok(column) = df.column(name) {
+            match column.get(row)? {
+                AnyValue::String(value) => return Ok(Some(value.to_string())),
+                AnyValue::StringOwned(value) => return Ok(Some(value.to_string())),
+                AnyValue::Null => {}
+                other => return Ok(Some(other.to_string())),
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn parquet_optional_usize(df: &DataFrame, row: usize, names: &[&str]) -> Result<Option<usize>> {
+    for name in names {
+        if let Ok(column) = df.column(name) {
+            let value = column.get(row)?;
+            if matches!(value, AnyValue::Null) {
+                continue;
+            }
+            return anyvalue_to_i64(value)
+                .and_then(|value| usize::try_from(value).ok())
+                .map(Some)
+                .ok_or_else(|| {
+                    anyhow!("parquet column '{name}' must contain non-negative integers")
+                });
+        }
+    }
+    Ok(None)
+}
+
+fn parquet_optional_tokens(df: &DataFrame, row: usize) -> Result<Option<Vec<i64>>> {
+    for name in ["tokens", "target", "targets", "labels", "label_ids"] {
+        if let Ok(column) = df.column(name) {
+            let value = column.get(row)?;
+            if matches!(value, AnyValue::Null) {
+                continue;
+            }
+            return Ok(Some(anyvalue_to_i64_vec(value).with_context(|| {
+                format!("failed to parse parquet token column '{name}'")
+            })?));
+        }
+    }
+    Ok(None)
+}
+
+fn parquet_optional_features(
+    df: &DataFrame,
+    row: usize,
+    id: &str,
+) -> Result<Option<(Vec<f32>, usize, usize)>> {
+    for name in [
+        "features",
+        "input_features",
+        "feature",
+        "fbank",
+        "filterbank",
+    ] {
+        if let Ok(column) = df.column(name) {
+            let value = column.get(row)?;
+            if matches!(value, AnyValue::Null) {
+                continue;
+            }
+            let (features, inferred) = anyvalue_to_f32_matrix(value)
+                .with_context(|| format!("failed to parse parquet feature column '{name}'"))?;
+            let (rows, cols) = if let Some(shape) = inferred {
+                shape
+            } else {
+                let rows = parquet_optional_usize(
+                    df,
+                    row,
+                    &["rows", "num_frames", "frames", "feature_rows"],
+                )?
+                .ok_or_else(|| anyhow!("parquet row '{id}' flat features require rows"))?;
+                let cols =
+                    parquet_optional_usize(df, row, &["cols", "feature_dim", "num_features"])?
+                        .ok_or_else(|| anyhow!("parquet row '{id}' flat features require cols"))?;
+                (rows, cols)
+            };
+            if features.len() != rows * cols {
+                bail!(
+                    "parquet row '{id}' feature shape {rows}x{cols} implies {} values, got {}",
+                    rows * cols,
+                    features.len()
+                );
+            }
+            return Ok(Some((features, rows, cols)));
+        }
+    }
+    Ok(None)
+}
+
+fn parquet_optional_audio_bytes(
+    df: &DataFrame,
+    row: usize,
+) -> Result<Option<(Vec<u8>, Option<String>)>> {
+    if let Ok(column) = df.column("audio") {
+        if let Ok(audio) = column.struct_() {
+            let bytes = audio
+                .field_by_name("bytes")
+                .ok()
+                .and_then(|series| anyvalue_to_bytes(series.get(row).ok()?).ok().flatten());
+            let hint = audio
+                .field_by_name("path")
+                .ok()
+                .and_then(|series| anyvalue_to_string(series.get(row).ok()?))
+                .and_then(|path| audio_format_hint_from_path(&path));
+            if let Some(bytes) = bytes {
+                return Ok(Some((bytes, hint)));
+            }
+        }
+        if let Some(bytes) = anyvalue_to_bytes(column.get(row)?)? {
+            return Ok(Some((bytes, None)));
+        }
+    }
+    for name in ["audio_bytes", "bytes", "wav", "audio_data"] {
+        if let Ok(column) = df.column(name) {
+            if let Some(bytes) = anyvalue_to_bytes(column.get(row)?)? {
+                return Ok(Some((bytes, None)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn anyvalue_to_string(value: AnyValue<'_>) -> Option<String> {
+    match value {
+        AnyValue::String(value) => Some(value.to_string()),
+        AnyValue::StringOwned(value) => Some(value.to_string()),
+        AnyValue::Null => None,
+        other => Some(other.to_string()),
+    }
+}
+
+fn anyvalue_to_bytes(value: AnyValue<'_>) -> Result<Option<Vec<u8>>> {
+    match value {
+        AnyValue::Binary(bytes) => Ok(Some(bytes.to_vec())),
+        AnyValue::BinaryOwned(bytes) => Ok(Some(bytes)),
+        AnyValue::Null => Ok(None),
+        other => bail!("expected binary parquet audio bytes, got {other:?}"),
+    }
+}
+
+fn audio_format_hint_from_path(path: &str) -> Option<String> {
+    Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_string)
+}
+
+fn anyvalue_to_i64_vec(value: AnyValue<'_>) -> Result<Vec<i64>> {
+    match value {
+        AnyValue::List(series) | AnyValue::Array(series, _) => series
+            .iter()
+            .map(anyvalue_to_i64_result)
+            .collect::<Result<Vec<_>>>(),
+        AnyValue::String(value) => parse_token_string(value),
+        AnyValue::StringOwned(value) => parse_token_string(value.as_str()),
+        other => anyvalue_to_i64_result(other).map(|value| vec![value]),
+    }
+}
+
+fn anyvalue_to_i64_result(value: AnyValue<'_>) -> Result<i64> {
+    anyvalue_to_i64(value).ok_or_else(|| anyhow!("expected integer value"))
+}
+
+fn anyvalue_to_i64(value: AnyValue<'_>) -> Option<i64> {
+    match value {
+        AnyValue::Int8(value) => Some(i64::from(value)),
+        AnyValue::Int16(value) => Some(i64::from(value)),
+        AnyValue::Int32(value) => Some(i64::from(value)),
+        AnyValue::Int64(value) => Some(value),
+        AnyValue::UInt8(value) => Some(i64::from(value)),
+        AnyValue::UInt16(value) => Some(i64::from(value)),
+        AnyValue::UInt32(value) => Some(i64::from(value)),
+        AnyValue::UInt64(value) => i64::try_from(value).ok(),
+        _ => None,
+    }
+}
+
+fn anyvalue_to_f32_matrix(value: AnyValue<'_>) -> Result<(Vec<f32>, Option<(usize, usize)>)> {
+    match value {
+        AnyValue::List(series) | AnyValue::Array(series, _) => series_to_f32_matrix(&series),
+        other => anyvalue_to_f32(other)
+            .map(|value| (vec![value], None))
+            .ok_or_else(|| anyhow!("expected numeric feature list")),
+    }
+}
+
+fn series_to_f32_matrix(series: &Series) -> Result<(Vec<f32>, Option<(usize, usize)>)> {
+    if series.is_empty() {
+        return Ok((Vec::new(), Some((0, 0))));
+    }
+    let first = series.get(0)?;
+    if matches!(first, AnyValue::List(_) | AnyValue::Array(_, _)) {
+        let rows = series.len();
+        let mut cols = None;
+        let mut values = Vec::new();
+        for item in series.iter() {
+            let row = anyvalue_to_f32_vec(item)?;
+            if let Some(expected) = cols {
+                if row.len() != expected {
+                    bail!("ragged nested parquet features");
+                }
+            } else {
+                cols = Some(row.len());
+            }
+            values.extend(row);
+        }
+        Ok((values, Some((rows, cols.unwrap_or(0)))))
+    } else {
+        Ok((anyvalue_to_f32_vec(AnyValue::List(series.clone()))?, None))
+    }
+}
+
+fn anyvalue_to_f32_vec(value: AnyValue<'_>) -> Result<Vec<f32>> {
+    match value {
+        AnyValue::List(series) | AnyValue::Array(series, _) => series
+            .iter()
+            .map(anyvalue_to_f32_result)
+            .collect::<Result<Vec<_>>>(),
+        other => anyvalue_to_f32_result(other).map(|value| vec![value]),
+    }
+}
+
+fn anyvalue_to_f32_result(value: AnyValue<'_>) -> Result<f32> {
+    anyvalue_to_f32(value).ok_or_else(|| anyhow!("expected numeric value"))
+}
+
+fn anyvalue_to_f32(value: AnyValue<'_>) -> Option<f32> {
+    match value {
+        AnyValue::Float32(value) => Some(value),
+        AnyValue::Float64(value) => Some(value as f32),
+        AnyValue::Int8(value) => Some(f32::from(value)),
+        AnyValue::Int16(value) => Some(f32::from(value)),
+        AnyValue::Int32(value) => Some(value as f32),
+        AnyValue::Int64(value) => Some(value as f32),
+        AnyValue::UInt8(value) => Some(f32::from(value)),
+        AnyValue::UInt16(value) => Some(f32::from(value)),
+        AnyValue::UInt32(value) => Some(value as f32),
+        AnyValue::UInt64(value) => Some(value as f32),
+        _ => None,
+    }
+}
+
+fn raw_audio_metadata(path: &Path, base_dir: &Path) -> FeatureRecordMetadata {
+    FeatureRecordMetadata {
+        manifest_path: path.to_path_buf(),
+        base_dir: base_dir.to_path_buf(),
+        byte_offset: 0,
+        line_number: 1,
+        id: raw_audio_id(path, base_dir),
+        rows: read_raw_audio_rows_sidecar(path).unwrap_or(usize::MAX),
+    }
+}
+
+fn parse_raw_audio_record(
+    path: &Path,
+    base_dir: &Path,
+    tokenizer: Option<&SentencePieceTokenizer>,
+    audio_decode: &AudioDecodeConfig,
+    audio_frontend: &asr_features::W2vBertFrontendConfig,
+    waveform_augment: WaveformAugmentConfig,
+) -> Result<FeatureRecord> {
+    let id = raw_audio_id(path, base_dir);
+    let text = read_raw_audio_text_sidecar(path)?;
+    let tokens = match read_raw_audio_tokens_sidecar(path)? {
+        Some(tokens) => tokens,
+        None => parse_record_tokens(&json!({}), text.as_deref(), tokenizer, &id).with_context(
+            || {
+                format!(
+                    "raw audio file {} requires a .tokens sidecar or transcript sidecar plus tokenizer_path",
+                    path.display()
+                )
+            },
+        )?,
+    };
+    let audio = if waveform_augment.is_enabled() {
+        audio_file_to_w2v_bert_features_with_augmentation(
+            path,
+            audio_decode,
+            audio_frontend,
+            waveform_augment,
+        )?
+    } else {
+        audio_file_to_w2v_bert_features_with_config(path, audio_decode, audio_frontend)?
+    };
+    Ok(FeatureRecord {
+        id,
+        rows: audio.features.rows,
+        cols: audio.features.cols,
+        features: audio.features.values,
+        tokens,
+        text,
+    })
+}
+
+fn raw_audio_id(path: &Path, base_dir: &Path) -> String {
+    path.strip_prefix(base_dir)
+        .unwrap_or(path)
+        .with_extension("")
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn read_raw_audio_text_sidecar(path: &Path) -> Result<Option<String>> {
+    for extension in ["txt", "lab", "transcript"] {
+        let sidecar = path.with_extension(extension);
+        if sidecar.exists() {
+            let text = fs::read_to_string(&sidecar)
+                .with_context(|| {
+                    format!("failed to read transcript sidecar {}", sidecar.display())
+                })?
+                .trim()
+                .to_string();
+            if text.is_empty() {
+                bail!("transcript sidecar {} is empty", sidecar.display());
+            }
+            return Ok(Some(text));
+        }
+    }
+    Ok(None)
+}
+
+fn read_raw_audio_tokens_sidecar(path: &Path) -> Result<Option<Vec<i64>>> {
+    for extension in ["tokens", "tok"] {
+        let sidecar = path.with_extension(extension);
+        if sidecar.exists() {
+            return parse_token_string(
+                &fs::read_to_string(&sidecar).with_context(|| {
+                    format!("failed to read token sidecar {}", sidecar.display())
+                })?,
+            )
+            .map(Some);
+        }
+    }
+    Ok(None)
+}
+
+fn read_raw_audio_rows_sidecar(path: &Path) -> Option<usize> {
+    ["rows", "frames"].into_iter().find_map(|extension| {
+        let sidecar = path.with_extension(extension);
+        fs::read_to_string(sidecar)
+            .ok()
+            .and_then(|text| text.trim().parse::<usize>().ok())
+    })
+}
+
 fn file_signature(path: &Path) -> Result<(u64, u64)> {
     let metadata =
         fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
@@ -3857,6 +4537,31 @@ fn adaptive_cost<'a>(
 }
 
 fn load_manifest_file(path: &Path, limit: Option<usize>) -> Result<Vec<FeatureRecord>> {
+    if is_parquet_file(path) {
+        let raws = parquet_raw_lines(path)?;
+        let mut records = Vec::new();
+        for raw in raws.into_iter().take(limit.unwrap_or(usize::MAX)) {
+            records.push(raw.parse_record(
+                None,
+                &AudioDecodeConfig::default(),
+                &W2vBertEncoderConfig::default().to_frontend_config(),
+                WaveformAugmentConfig::default(),
+            )?);
+        }
+        return Ok(records);
+    }
+
+    if is_audio_dataset_file(path) {
+        return Ok(vec![parse_raw_audio_record(
+            path,
+            path.parent().unwrap_or_else(|| Path::new(".")),
+            None,
+            &AudioDecodeConfig::default(),
+            &W2vBertEncoderConfig::default().to_frontend_config(),
+            WaveformAugmentConfig::default(),
+        )?]);
+    }
+
     let text = fs::read_to_string(path)
         .with_context(|| format!("failed to read manifest {}", path.display()))?;
     let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
@@ -5176,6 +5881,60 @@ mod tests {
         assert!(record.rows > 0);
         assert!(record.cols > 0);
         assert_eq!(record.features.len(), record.rows * record.cols);
+    }
+
+    #[test]
+    fn raw_audio_directory_loads_with_token_sidecars() {
+        let dir = std::env::temp_dir().join(format!(
+            "w2v_bert_uk_raw_audio_dataset_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("nested")).unwrap();
+        let audio_path = dir.join("nested").join("sample.wav");
+        fs::write(
+            &audio_path,
+            mono_pcm_wav_bytes(16_000, &vec![0_i16; 16_000]),
+        )
+        .unwrap();
+        fs::write(audio_path.with_extension("tokens"), "1 2 3").unwrap();
+        fs::write(audio_path.with_extension("txt"), "hello").unwrap();
+
+        let mut loader = StreamingBatchLoader::new(
+            dir.clone(),
+            1,
+            None,
+            false,
+            4096,
+            160,
+            None,
+            None,
+            None,
+            WaveformAugmentConfig::default(),
+        )
+        .unwrap();
+        let batch = loader.next_batch().unwrap().unwrap();
+
+        assert_eq!(batch.ids, vec!["sample"]);
+        assert_eq!(batch.target_lengths, vec![3]);
+        assert_eq!(batch.reference_texts, vec![Some("hello".to_string())]);
+        assert!(batch.feature_lengths[0] > 0);
+    }
+
+    #[test]
+    fn parquet_folder_discovers_local_testdata_metadata() {
+        let path = Path::new("testdata");
+        if !path.exists() {
+            return;
+        }
+
+        let files = manifest_files(path).unwrap();
+        assert!(files.iter().any(|path| is_parquet_file(path)));
+        let parquet = files.iter().find(|path| is_parquet_file(path)).unwrap();
+        let raw_rows = parquet_raw_lines(parquet).unwrap();
+        assert!(!raw_rows.is_empty());
+        let metadata = raw_rows[0].parse_metadata().unwrap();
+        assert!(!metadata.id.is_empty());
     }
 
     #[test]

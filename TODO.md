@@ -38,6 +38,7 @@
 - [x] Add learning-rate scheduler with warmup/hold/decay.
 - [x] Add EMA model tracking.
 - [x] Add multi-GPU training support.
+- [x] Add parquet files as an alternative to manifest-based data loading.
 
 ## Data Loading
 
@@ -49,7 +50,7 @@
 - [x] Add adaptive batching.
 - [x] Add largest-batches-first sorting.
 - [x] Make sorting metadata-only so large inline features are not buffered in memory.
-- [ ] Add raw audio dataset loading.
+- [x] Add raw audio dataset loading.
 - [x] Add feature extraction from audio.
 - [x] Add tokenizer-driven transcript-to-token conversion.
 - [x] Add dataset cache/index support.
