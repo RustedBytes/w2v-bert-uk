@@ -25,6 +25,8 @@ pub mod audio;
 #[path = "csharp.rs"]
 mod c_abi;
 pub mod ctc;
+#[cfg(feature = "asr-cubecl-kernels")]
+pub mod cubecl_kernels;
 #[cfg(feature = "java")]
 mod java;
 #[cfg(feature = "kotlin")]

@@ -128,6 +128,28 @@ CUDA supports `--precision f32`, `--precision f16`, and `--precision bf16` when
 the device/backend supports them. `--mixed-precision` is a shortcut for
 `--precision f16`. WGPU does not support BF16 in this trainer.
 
+### Optional ASR CubeCL Kernels
+
+The crate has an experimental `asr-cubecl-kernels` feature with custom CubeCL
+kernels for architecture-specific hot spots that are not already covered by
+Burn's built-in matmul, convolution, softmax, and elementwise kernels:
+
+| Kernel target | Architectures | Operation |
+| --- | --- | --- |
+| `ZipformerSwooshL` | Zipformer | fused `x * sigmoid(x - 4)` |
+| `ZipformerSwooshR` | Zipformer | fused `x * sigmoid(x - 1)` |
+| `RelativeShift` | Squeezeformer, Zipformer | relative-position attention shift |
+
+Build with the feature when experimenting with direct CubeCL kernels:
+
+```bash
+cargo check --features asr-cubecl-kernels
+cargo run --release --features burn-cuda-backend,asr-cubecl-kernels --bin train -- ...
+```
+
+The default trainer path still uses portable Burn tensor operations unless code
+is explicitly routed through `w2v_bert_uk::cubecl_kernels`.
+
 ## Architecture And Feature Dimensions
 
 Raw audio and Parquet audio bytes are feature-extracted according to
