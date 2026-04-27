@@ -109,9 +109,37 @@ struct Args {
     #[arg(long, default_value_t = 1.0e-3)]
     learning_rate: f64,
 
+    /// Linear warmup optimizer steps before reaching --learning-rate.
+    #[arg(long, default_value_t = 0)]
+    lr_warmup_steps: usize,
+
+    /// Optimizer steps to hold --learning-rate after warmup.
+    #[arg(long, default_value_t = 0)]
+    lr_hold_steps: usize,
+
+    /// Linear decay optimizer steps after warmup/hold.
+    #[arg(long, default_value_t = 0)]
+    lr_decay_steps: usize,
+
+    /// Final learning rate after decay.
+    #[arg(long, default_value_t = 0.0)]
+    lr_min: f64,
+
     /// AdamW weight decay.
     #[arg(long, default_value_t = 1.0e-2)]
     weight_decay: f64,
+
+    /// Number of micro-batches to accumulate before each optimizer step.
+    #[arg(long, default_value_t = 1)]
+    gradient_accumulation_steps: usize,
+
+    /// Clip gradients by L2 norm before optimizer updates.
+    #[arg(long)]
+    gradient_clip_norm: Option<f32>,
+
+    /// Clip gradient values elementwise before optimizer updates.
+    #[arg(long)]
+    gradient_clip_value: Option<f32>,
 
     /// Log every N optimizer steps.
     #[arg(long, default_value_t = 10)]
@@ -268,7 +296,14 @@ fn main() -> Result<()> {
         sort_buffer_size: args.sort_buffer_size,
         epochs: args.epochs,
         learning_rate: args.learning_rate,
+        lr_warmup_steps: args.lr_warmup_steps,
+        lr_hold_steps: args.lr_hold_steps,
+        lr_decay_steps: args.lr_decay_steps,
+        lr_min: args.lr_min,
         weight_decay: args.weight_decay,
+        gradient_accumulation_steps: args.gradient_accumulation_steps,
+        gradient_clip_norm: args.gradient_clip_norm,
+        gradient_clip_value: args.gradient_clip_value,
         log_every: args.log_every,
         validate_every_steps: args.validate_every_steps,
         max_train_samples: args.max_train_samples,

@@ -33,9 +33,9 @@
 - [x] Add resume support with config validation.
 - [x] Add GPU backend/device selection.
 - [x] Add mixed precision support + BF16.
-- [ ] Add gradient accumulation.
-- [ ] Add gradient clipping.
-- [ ] Add learning-rate scheduler with warmup/hold/decay.
+- [x] Add gradient accumulation.
+- [x] Add gradient clipping.
+- [x] Add learning-rate scheduler with warmup/hold/decay.
 - [ ] Add EMA model tracking.
 - [ ] Add distributed training support.
 - [ ] Add multi-GPU training support.

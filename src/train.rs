@@ -4,14 +4,17 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
-use burn::module::AutodiffModule;
+use burn::module::{AutodiffModule, ModuleVisitor, Param};
 use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
 use burn::tensor::activation::log_softmax;
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{FloatDType, Int, IntDType, Tensor, TensorData, set_default_dtypes};
 use burn_autodiff::checkpoint::strategy::BalancedCheckpointing;
 use burn_nn::loss::{CTCLossConfig, Reduction};
-use burn_optim::{AdamWConfig, GradientsParams, Optimizer};
+use burn_optim::{
+    AdamW, AdamWConfig, GradientsAccumulator, GradientsParams, Optimizer,
+    adaptor::OptimizerAdaptor, grad_clipping::GradientClippingConfig,
+};
 use kenlm::{Config as KenlmConfig, Model as KenlmModel};
 use serde_json::{Value, json};
 use splintr::SentencePieceTokenizer;
@@ -108,7 +111,14 @@ pub struct BurnTrainConfig {
     pub sort_buffer_size: usize,
     pub epochs: usize,
     pub learning_rate: f64,
+    pub lr_warmup_steps: usize,
+    pub lr_hold_steps: usize,
+    pub lr_decay_steps: usize,
+    pub lr_min: f64,
     pub weight_decay: f64,
+    pub gradient_accumulation_steps: usize,
+    pub gradient_clip_norm: Option<f32>,
+    pub gradient_clip_value: Option<f32>,
     pub log_every: usize,
     pub validate_every_steps: Option<usize>,
     pub max_train_samples: Option<usize>,
@@ -153,7 +163,14 @@ impl Default for BurnTrainConfig {
             sort_buffer_size: 4096,
             epochs: 10,
             learning_rate: 1.0e-3,
+            lr_warmup_steps: 0,
+            lr_hold_steps: 0,
+            lr_decay_steps: 0,
+            lr_min: 0.0,
             weight_decay: 1.0e-2,
+            gradient_accumulation_steps: 1,
+            gradient_clip_norm: None,
+            gradient_clip_value: None,
             log_every: 10,
             validate_every_steps: None,
             max_train_samples: None,
@@ -696,6 +713,117 @@ impl<B: AutodiffBackend> TrainableCtc<B> for ParaformerV2<B> {
     }
 }
 
+fn adamw_optimizer<B, M>(config: &BurnTrainConfig) -> OptimizerAdaptor<AdamW, M, B>
+where
+    B: AutodiffBackend,
+    M: AutodiffModule<B>,
+{
+    let mut optimizer = AdamWConfig::new()
+        .with_weight_decay(config.weight_decay as f32)
+        .init();
+    if let Some(clipping) = gradient_clipping_config(config) {
+        optimizer = optimizer.with_grad_clipping(clipping.init());
+    }
+    optimizer
+}
+
+fn gradient_clipping_config(config: &BurnTrainConfig) -> Option<GradientClippingConfig> {
+    config
+        .gradient_clip_norm
+        .map(GradientClippingConfig::Norm)
+        .or_else(|| {
+            config
+                .gradient_clip_value
+                .map(GradientClippingConfig::Value)
+        })
+}
+
+fn scheduled_learning_rate(config: &BurnTrainConfig, optimizer_step: usize) -> f64 {
+    let base = config.learning_rate;
+    let min_lr = config.lr_min;
+    let step = optimizer_step.max(1);
+
+    if config.lr_warmup_steps > 0 && step <= config.lr_warmup_steps {
+        return base * step as f64 / config.lr_warmup_steps as f64;
+    }
+
+    let after_warmup = step.saturating_sub(config.lr_warmup_steps);
+    if config.lr_hold_steps > 0 && after_warmup <= config.lr_hold_steps {
+        return base;
+    }
+
+    if config.lr_decay_steps == 0 {
+        return base;
+    }
+
+    let decay_step = after_warmup.saturating_sub(config.lr_hold_steps);
+    if decay_step >= config.lr_decay_steps {
+        return min_lr;
+    }
+
+    let progress = decay_step as f64 / config.lr_decay_steps as f64;
+    min_lr + (base - min_lr) * (1.0 - progress)
+}
+
+fn scale_gradients<B, M>(module: &M, grads: GradientsParams, scale: f64) -> GradientsParams
+where
+    B: AutodiffBackend,
+    M: AutodiffModule<B>,
+{
+    let mut visitor = GradientsScaler::<B> {
+        grads_in: grads,
+        grads_out: GradientsParams::new(),
+        scale,
+        phantom: std::marker::PhantomData,
+    };
+    module.visit(&mut visitor);
+    visitor.grads_out
+}
+
+struct GradientsScaler<B: AutodiffBackend> {
+    grads_in: GradientsParams,
+    grads_out: GradientsParams,
+    scale: f64,
+    phantom: std::marker::PhantomData<B>,
+}
+
+impl<B: AutodiffBackend> ModuleVisitor<B> for GradientsScaler<B> {
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+        if let Some(grad) = self.grads_in.remove::<B::InnerBackend, D>(param.id) {
+            self.grads_out
+                .register::<B::InnerBackend, D>(param.id, grad.mul_scalar(self.scale));
+        }
+    }
+}
+
+fn maybe_step_accumulated<B, M, O>(
+    model: M,
+    optimizer: &mut O,
+    accumulator: &mut GradientsAccumulator<M>,
+    accumulated_batches: &mut usize,
+    optimizer_step: &mut usize,
+    config: &BurnTrainConfig,
+    force: bool,
+) -> (M, Option<f64>)
+where
+    B: AutodiffBackend,
+    M: AutodiffModule<B>,
+    O: Optimizer<M, B>,
+{
+    if *accumulated_batches == 0
+        || (!force && *accumulated_batches < config.gradient_accumulation_steps)
+    {
+        return (model, None);
+    }
+
+    let grads = accumulator.grads();
+    let grads = scale_gradients::<B, M>(&model, grads, 1.0 / *accumulated_batches as f64);
+    *accumulated_batches = 0;
+    *optimizer_step += 1;
+    let lr = scheduled_learning_rate(config, *optimizer_step);
+    (optimizer.step(lr, model, grads), Some(lr))
+}
+
 fn train_ctc_model<B, M>(
     mut model: M,
     config: &BurnTrainConfig,
@@ -705,9 +833,7 @@ where
     B: AutodiffBackend,
     M: TrainableCtc<B>,
 {
-    let mut optimizer = AdamWConfig::new()
-        .with_weight_decay(config.weight_decay as f32)
-        .init();
+    let mut optimizer = adamw_optimizer::<B, M>(config);
     let resume = load_resume_checkpoint(config)?;
     model = load_model_checkpoint(model, &resume, device)?;
     optimizer = load_optimizer_checkpoint::<B, M, _>(optimizer, &resume, device)?;
@@ -729,6 +855,8 @@ where
     let start_epoch = resume_start_epoch(&resume);
     let decoder = ValidationDecoder::from_config(config)?;
     let started = Instant::now();
+    let mut accumulator = GradientsAccumulator::<M>::new();
+    let mut accumulated_batches = 0usize;
 
     for epoch in start_epoch..=config.epochs {
         let mut train_batches = StreamingBatchLoader::new(
@@ -747,18 +875,40 @@ where
 
             if !config.dry_run {
                 let grads = GradientsParams::from_grads(loss.backward(), &model);
-                model = optimizer.step(config.learning_rate, model, grads);
-            }
-
-            global_step += 1;
-            if global_step == 1 || global_step % config.log_every == 0 {
-                println!(
-                    "epoch={epoch} step={global_step} train_ctc_loss={loss_value:.6} elapsed_sec={:.1}",
-                    started.elapsed().as_secs_f64()
+                accumulator.accumulate::<B>(&model, grads);
+                accumulated_batches += 1;
+                let (next_model, lr) = maybe_step_accumulated::<B, M, _>(
+                    model,
+                    &mut optimizer,
+                    &mut accumulator,
+                    &mut accumulated_batches,
+                    &mut global_step,
+                    config,
+                    false,
                 );
+                model = next_model;
+                if let Some(lr) = lr {
+                    if global_step == 1 || global_step % config.log_every == 0 {
+                        println!(
+                            "epoch={epoch} step={global_step} lr={lr:.8} train_ctc_loss={loss_value:.6} elapsed_sec={:.1}",
+                            started.elapsed().as_secs_f64()
+                        );
+                    }
+                }
+            } else {
+                global_step += 1;
+                if global_step == 1 || global_step % config.log_every == 0 {
+                    println!(
+                        "epoch={epoch} step={global_step} train_ctc_loss={loss_value:.6} elapsed_sec={:.1}",
+                        started.elapsed().as_secs_f64()
+                    );
+                }
             }
 
-            if let (Some(_), Some(every)) = (&config.val_manifest, config.validate_every_steps) {
+            if global_step > 0
+                && (config.dry_run || accumulated_batches == 0)
+                && let (Some(_), Some(every)) = (&config.val_manifest, config.validate_every_steps)
+            {
                 if every > 0 && global_step % every == 0 {
                     let val = evaluate_ctc_model::<B, M>(&model, config, device, &decoder)?;
                     println!(
@@ -781,6 +931,25 @@ where
                         last_val_wer,
                     )?;
                 }
+            }
+        }
+
+        if !config.dry_run {
+            let (next_model, lr) = maybe_step_accumulated::<B, M, _>(
+                model,
+                &mut optimizer,
+                &mut accumulator,
+                &mut accumulated_batches,
+                &mut global_step,
+                config,
+                true,
+            );
+            model = next_model;
+            if let Some(lr) = lr {
+                println!(
+                    "epoch={epoch} step={global_step} lr={lr:.8} flushed_accumulated_gradients=true elapsed_sec={:.1}",
+                    started.elapsed().as_secs_f64()
+                );
             }
         }
 
@@ -878,9 +1047,7 @@ fn train_paraformer_model<B>(
 where
     B: AutodiffBackend,
 {
-    let mut optimizer = AdamWConfig::new()
-        .with_weight_decay(config.weight_decay as f32)
-        .init();
+    let mut optimizer = adamw_optimizer::<B, ParaformerV2<B>>(config);
     let resume = load_resume_checkpoint(config)?;
     model = load_model_checkpoint(model, &resume, device)?;
     optimizer = load_optimizer_checkpoint::<B, ParaformerV2<B>, _>(optimizer, &resume, device)?;
@@ -902,6 +1069,8 @@ where
     let start_epoch = resume_start_epoch(&resume);
     let decoder = ValidationDecoder::from_config(config)?;
     let started = Instant::now();
+    let mut accumulator = GradientsAccumulator::<ParaformerV2<B>>::new();
+    let mut accumulated_batches = 0usize;
 
     for epoch in start_epoch..=config.epochs {
         let mut train_batches = StreamingBatchLoader::new(
@@ -922,18 +1091,40 @@ where
 
             if !config.dry_run {
                 let grads = GradientsParams::from_grads(loss_output.loss.backward(), &model);
-                model = optimizer.step(config.learning_rate, model, grads);
-            }
-
-            global_step += 1;
-            if global_step == 1 || global_step % config.log_every == 0 {
-                println!(
-                    "epoch={epoch} step={global_step} train_loss={loss_value:.6} train_ctc_loss={ctc_value:.6} train_ce_loss={ce_value:.6} elapsed_sec={:.1}",
-                    started.elapsed().as_secs_f64()
+                accumulator.accumulate::<B>(&model, grads);
+                accumulated_batches += 1;
+                let (next_model, lr) = maybe_step_accumulated::<B, ParaformerV2<B>, _>(
+                    model,
+                    &mut optimizer,
+                    &mut accumulator,
+                    &mut accumulated_batches,
+                    &mut global_step,
+                    config,
+                    false,
                 );
+                model = next_model;
+                if let Some(lr) = lr {
+                    if global_step == 1 || global_step % config.log_every == 0 {
+                        println!(
+                            "epoch={epoch} step={global_step} lr={lr:.8} train_loss={loss_value:.6} train_ctc_loss={ctc_value:.6} train_ce_loss={ce_value:.6} elapsed_sec={:.1}",
+                            started.elapsed().as_secs_f64()
+                        );
+                    }
+                }
+            } else {
+                global_step += 1;
+                if global_step == 1 || global_step % config.log_every == 0 {
+                    println!(
+                        "epoch={epoch} step={global_step} train_loss={loss_value:.6} train_ctc_loss={ctc_value:.6} train_ce_loss={ce_value:.6} elapsed_sec={:.1}",
+                        started.elapsed().as_secs_f64()
+                    );
+                }
             }
 
-            if let (Some(_), Some(every)) = (&config.val_manifest, config.validate_every_steps) {
+            if global_step > 0
+                && (config.dry_run || accumulated_batches == 0)
+                && let (Some(_), Some(every)) = (&config.val_manifest, config.validate_every_steps)
+            {
                 if every > 0 && global_step % every == 0 {
                     let val = evaluate_paraformer_model(&model, config, device, &decoder)?;
                     println!(
@@ -956,6 +1147,25 @@ where
                         last_val_wer,
                     )?;
                 }
+            }
+        }
+
+        if !config.dry_run {
+            let (next_model, lr) = maybe_step_accumulated::<B, ParaformerV2<B>, _>(
+                model,
+                &mut optimizer,
+                &mut accumulator,
+                &mut accumulated_batches,
+                &mut global_step,
+                config,
+                true,
+            );
+            model = next_model;
+            if let Some(lr) = lr {
+                println!(
+                    "epoch={epoch} step={global_step} lr={lr:.8} flushed_accumulated_gradients=true elapsed_sec={:.1}",
+                    started.elapsed().as_secs_f64()
+                );
             }
         }
 
@@ -1044,9 +1254,7 @@ fn train_enhanced_paraformer_model<B>(
 where
     B: AutodiffBackend,
 {
-    let mut optimizer = AdamWConfig::new()
-        .with_weight_decay(config.weight_decay as f32)
-        .init();
+    let mut optimizer = adamw_optimizer::<B, EnhancedParaformerV2<B>>(config);
     let resume = load_resume_checkpoint(config)?;
     model = load_model_checkpoint(model, &resume, device)?;
     optimizer =
@@ -1069,6 +1277,8 @@ where
     let start_epoch = resume_start_epoch(&resume);
     let decoder = ValidationDecoder::from_config(config)?;
     let started = Instant::now();
+    let mut accumulator = GradientsAccumulator::<EnhancedParaformerV2<B>>::new();
+    let mut accumulated_batches = 0usize;
 
     for epoch in start_epoch..=config.epochs {
         let mut train_batches = StreamingBatchLoader::new(
@@ -1091,18 +1301,40 @@ where
 
             if !config.dry_run {
                 let grads = GradientsParams::from_grads(loss_output.loss.backward(), &model);
-                model = optimizer.step(config.learning_rate, model, grads);
-            }
-
-            global_step += 1;
-            if global_step == 1 || global_step % config.log_every == 0 {
-                println!(
-                    "epoch={epoch} step={global_step} train_loss={loss_value:.6} train_ctc_loss={ctc_value:.6} train_shallow_ctc_loss={shallow_value:.6} train_ce_loss={ce_value:.6} train_boundary_loss={boundary_value:.6} elapsed_sec={:.1}",
-                    started.elapsed().as_secs_f64()
+                accumulator.accumulate::<B>(&model, grads);
+                accumulated_batches += 1;
+                let (next_model, lr) = maybe_step_accumulated::<B, EnhancedParaformerV2<B>, _>(
+                    model,
+                    &mut optimizer,
+                    &mut accumulator,
+                    &mut accumulated_batches,
+                    &mut global_step,
+                    config,
+                    false,
                 );
+                model = next_model;
+                if let Some(lr) = lr {
+                    if global_step == 1 || global_step % config.log_every == 0 {
+                        println!(
+                            "epoch={epoch} step={global_step} lr={lr:.8} train_loss={loss_value:.6} train_ctc_loss={ctc_value:.6} train_shallow_ctc_loss={shallow_value:.6} train_ce_loss={ce_value:.6} train_boundary_loss={boundary_value:.6} elapsed_sec={:.1}",
+                            started.elapsed().as_secs_f64()
+                        );
+                    }
+                }
+            } else {
+                global_step += 1;
+                if global_step == 1 || global_step % config.log_every == 0 {
+                    println!(
+                        "epoch={epoch} step={global_step} train_loss={loss_value:.6} train_ctc_loss={ctc_value:.6} train_shallow_ctc_loss={shallow_value:.6} train_ce_loss={ce_value:.6} train_boundary_loss={boundary_value:.6} elapsed_sec={:.1}",
+                        started.elapsed().as_secs_f64()
+                    );
+                }
             }
 
-            if let (Some(_), Some(every)) = (&config.val_manifest, config.validate_every_steps) {
+            if global_step > 0
+                && (config.dry_run || accumulated_batches == 0)
+                && let (Some(_), Some(every)) = (&config.val_manifest, config.validate_every_steps)
+            {
                 if every > 0 && global_step % every == 0 {
                     let val = evaluate_enhanced_paraformer_model(&model, config, device, &decoder)?;
                     println!(
@@ -1125,6 +1357,25 @@ where
                         last_val_wer,
                     )?;
                 }
+            }
+        }
+
+        if !config.dry_run {
+            let (next_model, lr) = maybe_step_accumulated::<B, EnhancedParaformerV2<B>, _>(
+                model,
+                &mut optimizer,
+                &mut accumulator,
+                &mut accumulated_batches,
+                &mut global_step,
+                config,
+                true,
+            );
+            model = next_model;
+            if let Some(lr) = lr {
+                println!(
+                    "epoch={epoch} step={global_step} lr={lr:.8} flushed_accumulated_gradients=true elapsed_sec={:.1}",
+                    started.elapsed().as_secs_f64()
+                );
             }
         }
 
@@ -2289,6 +2540,27 @@ fn validate_config(config: &BurnTrainConfig) -> Result<()> {
     if config.epochs == 0 {
         bail!("epochs must be > 0");
     }
+    if config.learning_rate < 0.0 {
+        bail!("learning_rate must be >= 0");
+    }
+    if config.lr_min < 0.0 {
+        bail!("lr_min must be >= 0");
+    }
+    if config.gradient_accumulation_steps == 0 {
+        bail!("gradient_accumulation_steps must be > 0");
+    }
+    if config.log_every == 0 {
+        bail!("log_every must be > 0");
+    }
+    if config.gradient_clip_norm.is_some() && config.gradient_clip_value.is_some() {
+        bail!("set at most one of gradient_clip_norm or gradient_clip_value");
+    }
+    if matches!(config.gradient_clip_norm, Some(value) if value <= 0.0) {
+        bail!("gradient_clip_norm must be > 0 when set");
+    }
+    if matches!(config.gradient_clip_value, Some(value) if value <= 0.0) {
+        bail!("gradient_clip_value must be > 0 when set");
+    }
     if config.input_dim == 0 || config.vocab_size == 0 {
         bail!("input_dim and vocab_size must be > 0");
     }
@@ -2358,7 +2630,14 @@ fn run_config_json(config: &BurnTrainConfig) -> Value {
         "sort_buffer_size": config.sort_buffer_size,
         "epochs": config.epochs,
         "learning_rate": config.learning_rate,
+        "lr_warmup_steps": config.lr_warmup_steps,
+        "lr_hold_steps": config.lr_hold_steps,
+        "lr_decay_steps": config.lr_decay_steps,
+        "lr_min": config.lr_min,
         "weight_decay": config.weight_decay,
+        "gradient_accumulation_steps": config.gradient_accumulation_steps,
+        "gradient_clip_norm": config.gradient_clip_norm,
+        "gradient_clip_value": config.gradient_clip_value,
         "tokenizer_path": config.tokenizer_path,
         "val_beam_width": config.val_beam_width,
         "val_n_best": config.val_n_best,
@@ -2559,6 +2838,11 @@ fn validate_resume_config(config: &BurnTrainConfig, saved_config: &Value) -> Res
         "w2v_hf_model_dir",
         "w2v_activation_checkpointing",
         "precision",
+        "gradient_accumulation_steps",
+        "lr_warmup_steps",
+        "lr_hold_steps",
+        "lr_decay_steps",
+        "lr_min",
     ] {
         if current.get(key) != saved_config.get(key) {
             bail!(
@@ -2792,6 +3076,24 @@ mod tests {
         current.input_dim += 1;
         let err = validate_resume_config(&current, &saved).unwrap_err();
         assert!(err.to_string().contains("input_dim"));
+    }
+
+    #[test]
+    fn scheduler_warmup_hold_decay_sequence() {
+        let config = BurnTrainConfig {
+            learning_rate: 1.0,
+            lr_warmup_steps: 2,
+            lr_hold_steps: 1,
+            lr_decay_steps: 2,
+            lr_min: 0.1,
+            ..BurnTrainConfig::default()
+        };
+
+        let values = (1..=6)
+            .map(|step| scheduled_learning_rate(&config, step))
+            .collect::<Vec<_>>();
+
+        assert_eq!(values, vec![0.5, 1.0, 1.0, 0.55, 0.1, 0.1]);
     }
 
     #[test]
