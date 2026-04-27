@@ -167,6 +167,9 @@ pub struct BurnTrainConfig {
     pub w2v_hf_model_dir: Option<PathBuf>,
     pub w2v_hf_load_weights: bool,
     pub w2v_activation_checkpointing: bool,
+    pub w2v_num_adapter_layers: usize,
+    pub w2v_adapter_stride: usize,
+    pub w2v_adapter_kernel_size: usize,
     pub init_from: Option<PathBuf>,
     pub resume_from: Option<PathBuf>,
     pub backend: TrainBackendKind,
@@ -236,6 +239,9 @@ impl Default for BurnTrainConfig {
             w2v_hf_model_dir: None,
             w2v_hf_load_weights: false,
             w2v_activation_checkpointing: false,
+            w2v_num_adapter_layers: 0,
+            w2v_adapter_stride: 2,
+            w2v_adapter_kernel_size: 3,
             init_from: None,
             resume_from: None,
             backend: TrainBackendKind::Cpu,
@@ -1234,6 +1240,12 @@ fn build_wav2vec_model<B: Backend>(
         }
     };
     model_config.encoder.activation_checkpointing = config.w2v_activation_checkpointing;
+    if config.w2v_num_adapter_layers > 0 {
+        model_config.encoder = model_config
+            .encoder
+            .with_adapter(config.w2v_adapter_stride, config.w2v_num_adapter_layers)
+            .with_adapter_kernel_size(config.w2v_adapter_kernel_size);
+    }
     Ok(model_config.init::<B>(device))
 }
 
@@ -1255,6 +1267,12 @@ where
         }
     };
     model_config.encoder.activation_checkpointing = config.w2v_activation_checkpointing;
+    if config.w2v_num_adapter_layers > 0 {
+        model_config.encoder = model_config
+            .encoder
+            .with_adapter(config.w2v_adapter_stride, config.w2v_num_adapter_layers)
+            .with_adapter_kernel_size(config.w2v_adapter_kernel_size);
+    }
     let mut train_config = config.clone();
     train_config.input_dim = model_config.encoder.feature_dim;
     train_config.d_model = model_config.encoder.hidden_size;
@@ -6938,6 +6956,12 @@ fn should_transpose_warm_start_2d(path: &str) -> bool {
             || path.contains("feature_projection.projection.")
             || path.contains(".attention.")
             || path.contains(".mha.")
+            || path.contains(".linear_q.")
+            || path.contains(".linear_k.")
+            || path.contains(".linear_v.")
+            || path.contains(".linear_out.")
+            || path.contains(".intermediate_dense.")
+            || path.contains(".output_dense.")
             || path.contains(".feed_forward.")
             || path.contains(".pwff.")
             || path.contains("time_recovery.projection."))
@@ -7000,6 +7024,12 @@ fn wav2vec_positiveloss_alias(path: &str) -> Option<String> {
             "wav2vec2_bert.feature_projection.projection.{suffix}"
         ));
     }
+    if path == "encoder.masked_spec_embed" {
+        return Some("wav2vec2_bert.masked_spec_embed".to_string());
+    }
+    if let Some(suffix) = path.strip_prefix("encoder.adapter.layers.") {
+        return Some(wav2vec_direct_alias("wav2vec2_bert.adapter.layers", suffix));
+    }
 
     let parts = path.split('.').collect::<Vec<_>>();
     if parts.len() < 6 || parts[0] != "encoder" || parts[1] != "encoder" || parts[2] != "layers" {
@@ -7008,6 +7038,26 @@ fn wav2vec_positiveloss_alias(path: &str) -> Option<String> {
     let layer = parts[3];
     let rest = &parts[4..];
     match rest {
+        ["self_attn", tail @ ..] => Some(wav2vec_direct_alias(
+            &format!("wav2vec2_bert.encoder.layers.{layer}.self_attn"),
+            &tail.join("."),
+        )),
+        ["ffn1", tail @ ..] => Some(wav2vec_direct_alias(
+            &format!("wav2vec2_bert.encoder.layers.{layer}.ffn1"),
+            &tail.join("."),
+        )),
+        ["ffn2", tail @ ..] => Some(wav2vec_direct_alias(
+            &format!("wav2vec2_bert.encoder.layers.{layer}.ffn2"),
+            &tail.join("."),
+        )),
+        ["conv_module", tail @ ..] => Some(wav2vec_direct_alias(
+            &format!("wav2vec2_bert.encoder.layers.{layer}.conv_module"),
+            &tail.join("."),
+        )),
+        [norm, suffix] if norm.ends_with("_layer_norm") => Some(format!(
+            "wav2vec2_bert.encoder.layers.{layer}.{norm}.{}",
+            layer_norm_suffix_alias(suffix)
+        )),
         ["mha", projection, tail @ ..] => {
             let projection = match *projection {
                 "query" => "linear_q",
@@ -7038,6 +7088,19 @@ fn wav2vec_positiveloss_alias(path: &str) -> Option<String> {
             layer_norm_suffix_alias(suffix)
         )),
         _ => None,
+    }
+}
+
+fn wav2vec_direct_alias(prefix: &str, suffix: &str) -> String {
+    let suffix = suffix
+        .split('.')
+        .map(layer_norm_suffix_alias)
+        .collect::<Vec<_>>()
+        .join(".");
+    if suffix.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}.{suffix}")
     }
 }
 

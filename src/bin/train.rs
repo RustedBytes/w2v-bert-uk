@@ -313,6 +313,18 @@ struct RunArgs {
     #[arg(long)]
     w2v_activation_checkpointing: bool,
 
+    /// Number of W2V-BERT adapter layers after the Conformer encoder.
+    #[arg(long, default_value_t = 0)]
+    w2v_num_adapter_layers: usize,
+
+    /// W2V-BERT adapter convolution stride.
+    #[arg(long, default_value_t = 2)]
+    w2v_adapter_stride: usize,
+
+    /// W2V-BERT adapter convolution kernel size.
+    #[arg(long, default_value_t = 3)]
+    w2v_adapter_kernel_size: usize,
+
     /// Resume from a checkpoint directory or checkpoint.json file.
     #[arg(long)]
     resume_from: Option<PathBuf>,
@@ -675,6 +687,9 @@ fn run_training(args: RunArgs) -> Result<()> {
         w2v_hf_model_dir: args.w2v_hf_model_dir,
         w2v_hf_load_weights: args.w2v_hf_load_weights,
         w2v_activation_checkpointing: args.w2v_activation_checkpointing,
+        w2v_num_adapter_layers: args.w2v_num_adapter_layers,
+        w2v_adapter_stride: args.w2v_adapter_stride,
+        w2v_adapter_kernel_size: args.w2v_adapter_kernel_size,
         init_from: args.init_from,
         resume_from: args.resume_from,
         backend: match args.backend {

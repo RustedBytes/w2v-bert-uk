@@ -4,15 +4,15 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use burn::module::Module;
-use burn::module::Param;
-use burn::tensor::activation::{gelu, log_softmax};
+use burn::module::{Initializer, Param};
+use burn::tensor::activation::{gelu, log_softmax, sigmoid, softmax};
 use burn::tensor::ops::PadMode;
 use burn::tensor::{Bool, Int, Tensor, TensorData, backend::Backend};
 use burn_nn::conv::{Conv1d, Conv1dConfig};
 use burn_nn::loss::{CTCLossConfig, Reduction};
-use burn_nn::transformer::{TransformerEncoder, TransformerEncoderConfig, TransformerEncoderInput};
 use burn_nn::{
-    Dropout, DropoutConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig, PaddingConfig1d,
+    Dropout, DropoutConfig, Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear,
+    LinearConfig, PaddingConfig1d,
 };
 use safetensors::SafeTensors;
 use safetensors::tensor::{Dtype, TensorView};
@@ -30,11 +30,16 @@ pub struct Wav2VecBertConfig {
     pub num_attention_heads: usize,
     pub conv_pos_kernel_size: usize,
     pub conv_pos_groups: usize,
+    pub conv_depthwise_kernel_size: usize,
+    pub left_max_position_embeddings: usize,
+    pub right_max_position_embeddings: usize,
     pub dropout: f64,
     pub sample_rate: usize,
     pub model_config: Map<String, Value>,
     pub add_adapter: bool,
     pub adapter_stride: usize,
+    pub adapter_kernel_size: usize,
+    pub output_hidden_size: usize,
     pub num_adapter_layers: usize,
     pub activation_checkpointing: bool,
 }
@@ -50,11 +55,16 @@ impl Default for Wav2VecBertConfig {
             num_attention_heads: 16,
             conv_pos_kernel_size: 128,
             conv_pos_groups: 16,
+            conv_depthwise_kernel_size: 31,
+            left_max_position_embeddings: 72,
+            right_max_position_embeddings: 0,
             dropout: 0.1,
             sample_rate: 16_000,
             model_config: Map::new(),
             add_adapter: false,
             adapter_stride: 2,
+            adapter_kernel_size: 3,
+            output_hidden_size: 1024,
             num_adapter_layers: 0,
             activation_checkpointing: false,
         }
@@ -154,6 +164,30 @@ impl Wav2VecBertConfig {
         {
             self.conv_pos_groups = groups;
         }
+        if let Some(kernel_size) = self
+            .model_config
+            .get("conv_depthwise_kernel_size")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+        {
+            self.conv_depthwise_kernel_size = kernel_size;
+        }
+        if let Some(left) = self
+            .model_config
+            .get("left_max_position_embeddings")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+        {
+            self.left_max_position_embeddings = left;
+        }
+        if let Some(right) = self
+            .model_config
+            .get("right_max_position_embeddings")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+        {
+            self.right_max_position_embeddings = right;
+        }
         if let Some(dropout) = self
             .model_config
             .get("hidden_dropout")
@@ -176,6 +210,24 @@ impl Wav2VecBertConfig {
             .map(|value| value as usize)
         {
             self.adapter_stride = stride.max(1);
+        }
+        if let Some(kernel_size) = self
+            .model_config
+            .get("adapter_kernel_size")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+        {
+            self.adapter_kernel_size = kernel_size;
+        }
+        if let Some(output_hidden_size) = self
+            .model_config
+            .get("output_hidden_size")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+        {
+            self.output_hidden_size = output_hidden_size;
+        } else {
+            self.output_hidden_size = self.hidden_size;
         }
         if let Some(layers) = self
             .model_config
@@ -277,6 +329,11 @@ impl Wav2VecBertConfig {
         self
     }
 
+    pub fn with_adapter_kernel_size(mut self, adapter_kernel_size: usize) -> Self {
+        self.adapter_kernel_size = adapter_kernel_size.max(1);
+        self
+    }
+
     pub fn with_activation_checkpointing(mut self, activation_checkpointing: bool) -> Self {
         self.activation_checkpointing = activation_checkpointing;
         self
@@ -306,30 +363,30 @@ impl Wav2VecBertConfig {
                 dropout: DropoutConfig::new(self.dropout).init(),
                 feature_dim: self.feature_dim,
             },
-            positional_conv: Conv1dConfig::new(
-                self.hidden_size,
-                self.hidden_size,
-                self.conv_pos_kernel_size,
-            )
-            .with_groups(self.conv_pos_groups.min(self.hidden_size).max(1))
-            .with_padding(PaddingConfig1d::Explicit(
-                self.conv_pos_kernel_size / 2,
-                self.conv_pos_kernel_size / 2,
-            ))
+            masked_spec_embed: Initializer::Uniform { min: 0.0, max: 1.0 }
+                .init([self.hidden_size], device),
+            encoder: Wav2VecBertEncoderConfig {
+                hidden_size: self.hidden_size,
+                intermediate_size: self.intermediate_size,
+                num_attention_heads: self.num_attention_heads,
+                num_hidden_layers: self.num_hidden_layers,
+                conv_depthwise_kernel_size: self.conv_depthwise_kernel_size,
+                left_max_position_embeddings: self.left_max_position_embeddings,
+                right_max_position_embeddings: self.right_max_position_embeddings,
+                dropout: self.dropout,
+            }
             .init(device),
-            encoder: TransformerEncoderConfig::new(
-                self.hidden_size,
-                self.intermediate_size,
-                self.num_attention_heads,
-                self.num_hidden_layers,
-            )
-            .with_dropout(self.dropout)
-            .with_norm_first(true)
-            .init(device),
-            final_norm: LayerNormConfig::new(self.hidden_size).init(device),
-            add_adapter: self.add_adapter,
-            adapter_stride: self.adapter_stride.max(1),
-            num_adapter_layers: self.num_adapter_layers,
+            adapter: self.add_adapter.then(|| {
+                Wav2VecBertAdapterConfig {
+                    hidden_size: self.hidden_size,
+                    intermediate_size: self.intermediate_size,
+                    num_attention_heads: self.num_attention_heads,
+                    num_adapter_layers: self.num_adapter_layers,
+                    adapter_stride: self.adapter_stride.max(1),
+                    adapter_kernel_size: self.adapter_kernel_size.max(1),
+                }
+                .init(device)
+            }),
         }
     }
 }
@@ -352,12 +409,9 @@ impl<B: Backend> Wav2VecFeatureProjection<B> {
 #[derive(Module, Debug)]
 pub struct Wav2VecBertModel<B: Backend> {
     feature_projection: Wav2VecFeatureProjection<B>,
-    positional_conv: Conv1d<B>,
-    encoder: TransformerEncoder<B>,
-    final_norm: LayerNorm<B>,
-    add_adapter: bool,
-    adapter_stride: usize,
-    num_adapter_layers: usize,
+    masked_spec_embed: Param<Tensor<B, 1>>,
+    encoder: Wav2VecBertEncoder<B>,
+    adapter: Option<Wav2VecBertAdapter<B>>,
 }
 
 impl<B: Backend> Wav2VecBertModel<B> {
@@ -374,30 +428,525 @@ impl<B: Backend> Wav2VecBertModel<B> {
         );
         let lengths = clamp_lengths(&lengths, input_features.dims()[1]);
         let mut hidden = self.feature_projection.forward(input_features);
-        let [batch_size, seq_len, hidden_size] = hidden.dims();
-        let pos = self
-            .positional_conv
-            .forward(hidden.clone().swap_dims(1, 2))
-            .slice_dim(2, 0..seq_len)
-            .swap_dims(1, 2)
-            .reshape([batch_size, seq_len, hidden_size]);
-        hidden = hidden + gelu(pos);
         hidden = mask_time(hidden, &lengths);
-        let mask = padding_mask::<B>(&lengths, seq_len, &device);
-        let encoded = self
-            .encoder
-            .forward(TransformerEncoderInput::new(hidden).mask_pad(mask));
-        let mut encoded = mask_time(encoded, &lengths);
+        let mut encoded = self.encoder.forward(hidden, &lengths, &device);
         let mut output_lengths = lengths;
-        if self.add_adapter {
-            for _ in 0..self.num_adapter_layers {
-                (encoded, output_lengths) =
-                    downsample_time(encoded, &output_lengths, self.adapter_stride);
-            }
+        if let Some(adapter) = &self.adapter {
+            (encoded, output_lengths) = adapter.forward(encoded, &output_lengths);
         }
         output_lengths = clamp_lengths(&output_lengths, encoded.dims()[1]);
-        let encoded = self.final_norm.forward(mask_time(encoded, &output_lengths));
-        (encoded, output_lengths)
+        (mask_time(encoded, &output_lengths), output_lengths)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Wav2VecBertEncoderConfig {
+    hidden_size: usize,
+    intermediate_size: usize,
+    num_attention_heads: usize,
+    num_hidden_layers: usize,
+    conv_depthwise_kernel_size: usize,
+    left_max_position_embeddings: usize,
+    right_max_position_embeddings: usize,
+    dropout: f64,
+}
+
+impl Wav2VecBertEncoderConfig {
+    fn init<B: Backend>(&self, device: &B::Device) -> Wav2VecBertEncoder<B> {
+        Wav2VecBertEncoder {
+            layers: (0..self.num_hidden_layers)
+                .map(|_| {
+                    Wav2VecBertEncoderLayerConfig {
+                        hidden_size: self.hidden_size,
+                        intermediate_size: self.intermediate_size,
+                        num_attention_heads: self.num_attention_heads,
+                        conv_depthwise_kernel_size: self.conv_depthwise_kernel_size,
+                        left_max_position_embeddings: self.left_max_position_embeddings,
+                        right_max_position_embeddings: self.right_max_position_embeddings,
+                        dropout: self.dropout,
+                    }
+                    .init(device)
+                })
+                .collect(),
+            dropout: DropoutConfig::new(self.dropout).init(),
+        }
+    }
+}
+
+#[derive(Module, Debug)]
+struct Wav2VecBertEncoder<B: Backend> {
+    layers: Vec<Wav2VecBertEncoderLayer<B>>,
+    dropout: Dropout,
+}
+
+impl<B: Backend> Wav2VecBertEncoder<B> {
+    fn forward(
+        &self,
+        hidden_states: Tensor<B, 3>,
+        lengths: &[usize],
+        device: &B::Device,
+    ) -> Tensor<B, 3> {
+        let mut hidden_states = self.dropout.forward(mask_time(hidden_states, lengths));
+        for layer in &self.layers {
+            hidden_states = layer.forward(hidden_states, lengths, device);
+        }
+        mask_time(hidden_states, lengths)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Wav2VecBertEncoderLayerConfig {
+    hidden_size: usize,
+    intermediate_size: usize,
+    num_attention_heads: usize,
+    conv_depthwise_kernel_size: usize,
+    left_max_position_embeddings: usize,
+    right_max_position_embeddings: usize,
+    dropout: f64,
+}
+
+impl Wav2VecBertEncoderLayerConfig {
+    fn init<B: Backend>(&self, device: &B::Device) -> Wav2VecBertEncoderLayer<B> {
+        Wav2VecBertEncoderLayer {
+            ffn1_layer_norm: LayerNormConfig::new(self.hidden_size).init(device),
+            ffn1: Wav2VecBertFeedForwardConfig {
+                hidden_size: self.hidden_size,
+                intermediate_size: self.intermediate_size,
+                dropout: self.dropout,
+            }
+            .init(device),
+            self_attn_layer_norm: LayerNormConfig::new(self.hidden_size).init(device),
+            self_attn_dropout: DropoutConfig::new(self.dropout).init(),
+            self_attn: Wav2VecBertSelfAttentionConfig {
+                hidden_size: self.hidden_size,
+                num_attention_heads: self.num_attention_heads,
+                left_max_position_embeddings: self.left_max_position_embeddings,
+                right_max_position_embeddings: self.right_max_position_embeddings,
+                use_relative_key: true,
+                dropout: self.dropout,
+            }
+            .init(device),
+            conv_module: Wav2VecBertConvolutionModuleConfig {
+                hidden_size: self.hidden_size,
+                kernel_size: self.conv_depthwise_kernel_size,
+                dropout: self.dropout,
+            }
+            .init(device),
+            ffn2_layer_norm: LayerNormConfig::new(self.hidden_size).init(device),
+            ffn2: Wav2VecBertFeedForwardConfig {
+                hidden_size: self.hidden_size,
+                intermediate_size: self.intermediate_size,
+                dropout: self.dropout,
+            }
+            .init(device),
+            final_layer_norm: LayerNormConfig::new(self.hidden_size).init(device),
+        }
+    }
+}
+
+#[derive(Module, Debug)]
+struct Wav2VecBertEncoderLayer<B: Backend> {
+    ffn1_layer_norm: LayerNorm<B>,
+    ffn1: Wav2VecBertFeedForward<B>,
+    self_attn_layer_norm: LayerNorm<B>,
+    self_attn_dropout: Dropout,
+    self_attn: Wav2VecBertSelfAttention<B>,
+    conv_module: Wav2VecBertConvolutionModule<B>,
+    ffn2_layer_norm: LayerNorm<B>,
+    ffn2: Wav2VecBertFeedForward<B>,
+    final_layer_norm: LayerNorm<B>,
+}
+
+impl<B: Backend> Wav2VecBertEncoderLayer<B> {
+    fn forward(
+        &self,
+        hidden_states: Tensor<B, 3>,
+        lengths: &[usize],
+        device: &B::Device,
+    ) -> Tensor<B, 3> {
+        let residual = hidden_states.clone();
+        let hidden_states = self
+            .ffn1
+            .forward(self.ffn1_layer_norm.forward(hidden_states))
+            * 0.5
+            + residual;
+
+        let residual = hidden_states.clone();
+        let hidden_states = self.self_attn.forward(
+            self.self_attn_layer_norm.forward(hidden_states),
+            lengths,
+            device,
+        );
+        let hidden_states = self.self_attn_dropout.forward(hidden_states) + residual;
+
+        let residual = hidden_states.clone();
+        let hidden_states = self.conv_module.forward(hidden_states, lengths) + residual;
+
+        let residual = hidden_states.clone();
+        let hidden_states = self
+            .ffn2
+            .forward(self.ffn2_layer_norm.forward(hidden_states))
+            * 0.5
+            + residual;
+        self.final_layer_norm.forward(hidden_states)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Wav2VecBertFeedForwardConfig {
+    hidden_size: usize,
+    intermediate_size: usize,
+    dropout: f64,
+}
+
+impl Wav2VecBertFeedForwardConfig {
+    fn init<B: Backend>(&self, device: &B::Device) -> Wav2VecBertFeedForward<B> {
+        Wav2VecBertFeedForward {
+            intermediate_dense: LinearConfig::new(self.hidden_size, self.intermediate_size)
+                .init(device),
+            intermediate_dropout: DropoutConfig::new(self.dropout).init(),
+            output_dense: LinearConfig::new(self.intermediate_size, self.hidden_size).init(device),
+            output_dropout: DropoutConfig::new(self.dropout).init(),
+        }
+    }
+}
+
+#[derive(Module, Debug)]
+struct Wav2VecBertFeedForward<B: Backend> {
+    intermediate_dense: Linear<B>,
+    intermediate_dropout: Dropout,
+    output_dense: Linear<B>,
+    output_dropout: Dropout,
+}
+
+impl<B: Backend> Wav2VecBertFeedForward<B> {
+    fn forward(&self, hidden_states: Tensor<B, 3>) -> Tensor<B, 3> {
+        let hidden_states = gelu(self.intermediate_dense.forward(hidden_states));
+        let hidden_states = self.intermediate_dropout.forward(hidden_states);
+        self.output_dropout
+            .forward(self.output_dense.forward(hidden_states))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Wav2VecBertSelfAttentionConfig {
+    hidden_size: usize,
+    num_attention_heads: usize,
+    left_max_position_embeddings: usize,
+    right_max_position_embeddings: usize,
+    use_relative_key: bool,
+    dropout: f64,
+}
+
+impl Wav2VecBertSelfAttentionConfig {
+    fn init<B: Backend>(&self, device: &B::Device) -> Wav2VecBertSelfAttention<B> {
+        let head_size = self.hidden_size / self.num_attention_heads;
+        let num_positions =
+            self.left_max_position_embeddings + self.right_max_position_embeddings + 1;
+        Wav2VecBertSelfAttention {
+            linear_q: LinearConfig::new(self.hidden_size, self.hidden_size).init(device),
+            linear_k: LinearConfig::new(self.hidden_size, self.hidden_size).init(device),
+            linear_v: LinearConfig::new(self.hidden_size, self.hidden_size).init(device),
+            linear_out: LinearConfig::new(self.hidden_size, self.hidden_size).init(device),
+            distance_embedding: self
+                .use_relative_key
+                .then(|| EmbeddingConfig::new(num_positions, head_size).init(device)),
+            dropout: DropoutConfig::new(self.dropout).init(),
+            num_heads: self.num_attention_heads,
+            head_size,
+            left_max_position_embeddings: self.left_max_position_embeddings,
+            right_max_position_embeddings: self.right_max_position_embeddings,
+        }
+    }
+}
+
+#[derive(Module, Debug)]
+struct Wav2VecBertSelfAttention<B: Backend> {
+    linear_q: Linear<B>,
+    linear_k: Linear<B>,
+    linear_v: Linear<B>,
+    linear_out: Linear<B>,
+    distance_embedding: Option<Embedding<B>>,
+    dropout: Dropout,
+    num_heads: usize,
+    head_size: usize,
+    left_max_position_embeddings: usize,
+    right_max_position_embeddings: usize,
+}
+
+impl<B: Backend> Wav2VecBertSelfAttention<B> {
+    fn forward(
+        &self,
+        hidden_states: Tensor<B, 3>,
+        lengths: &[usize],
+        device: &B::Device,
+    ) -> Tensor<B, 3> {
+        let [batch_size, seq_len, hidden_size] = hidden_states.dims();
+        let query = self.project_heads(self.linear_q.forward(hidden_states.clone()));
+        let key = self.project_heads(self.linear_k.forward(hidden_states.clone()));
+        let value = self.project_heads(self.linear_v.forward(hidden_states));
+        let mut scores = query.clone().matmul(key.swap_dims(2, 3)) / (self.head_size as f64).sqrt();
+
+        if let Some(distance_embedding) = &self.distance_embedding {
+            let positions = relative_key_positions::<B>(
+                seq_len,
+                self.left_max_position_embeddings,
+                self.right_max_position_embeddings,
+                device,
+            );
+            let positional =
+                distance_embedding
+                    .forward(positions)
+                    .reshape([seq_len, seq_len, self.head_size]);
+            let query_flat =
+                query
+                    .clone()
+                    .reshape([batch_size * self.num_heads, seq_len, self.head_size]);
+            let positional = positional
+                .unsqueeze_dim::<4>(0)
+                .repeat_dim(0, batch_size * self.num_heads);
+            let relative_scores = query_flat
+                .unsqueeze_dim::<4>(2)
+                .matmul(positional.swap_dims(2, 3))
+                .reshape([batch_size, self.num_heads, seq_len, seq_len]);
+            scores = scores + relative_scores / (self.head_size as f64).sqrt();
+        }
+
+        let mask = padding_mask::<B>(lengths, seq_len, device)
+            .unsqueeze_dim::<4>(1)
+            .repeat_dim(1, self.num_heads);
+        let negative = Tensor::full(
+            [batch_size, self.num_heads, seq_len, seq_len],
+            -1.0e9,
+            device,
+        );
+        scores = scores.mask_where(mask.bool_not(), negative);
+
+        let attn = self.dropout.forward(softmax(scores, 3));
+        self.linear_out
+            .forward(
+                attn.matmul(value)
+                    .swap_dims(1, 2)
+                    .reshape([batch_size, seq_len, hidden_size]),
+            )
+    }
+
+    fn project_heads(&self, input: Tensor<B, 3>) -> Tensor<B, 4> {
+        let [batch_size, seq_len, _] = input.dims();
+        input
+            .reshape([batch_size, seq_len, self.num_heads, self.head_size])
+            .swap_dims(1, 2)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Wav2VecBertConvolutionModuleConfig {
+    hidden_size: usize,
+    kernel_size: usize,
+    dropout: f64,
+}
+
+impl Wav2VecBertConvolutionModuleConfig {
+    fn init<B: Backend>(&self, device: &B::Device) -> Wav2VecBertConvolutionModule<B> {
+        Wav2VecBertConvolutionModule {
+            layer_norm: LayerNormConfig::new(self.hidden_size).init(device),
+            pointwise_conv1: Conv1dConfig::new(self.hidden_size, self.hidden_size * 2, 1)
+                .with_bias(false)
+                .init(device),
+            depthwise_conv: Conv1dConfig::new(self.hidden_size, self.hidden_size, self.kernel_size)
+                .with_groups(self.hidden_size)
+                .with_bias(false)
+                .init(device),
+            depthwise_layer_norm: LayerNormConfig::new(self.hidden_size).init(device),
+            pointwise_conv2: Conv1dConfig::new(self.hidden_size, self.hidden_size, 1)
+                .with_bias(false)
+                .init(device),
+            dropout: DropoutConfig::new(self.dropout).init(),
+        }
+    }
+}
+
+#[derive(Module, Debug)]
+struct Wav2VecBertConvolutionModule<B: Backend> {
+    layer_norm: LayerNorm<B>,
+    pointwise_conv1: Conv1d<B>,
+    depthwise_conv: Conv1d<B>,
+    depthwise_layer_norm: LayerNorm<B>,
+    pointwise_conv2: Conv1d<B>,
+    dropout: Dropout,
+}
+
+impl<B: Backend> Wav2VecBertConvolutionModule<B> {
+    fn forward(&self, hidden_states: Tensor<B, 3>, lengths: &[usize]) -> Tensor<B, 3> {
+        let [batch_size, seq_len, hidden_size] = hidden_states.dims();
+        let mut hidden_states = self.layer_norm.forward(mask_time(hidden_states, lengths));
+        hidden_states = hidden_states.swap_dims(1, 2);
+        hidden_states = glu(self.pointwise_conv1.forward(hidden_states), 1);
+        let pad_left = self.depthwise_conv.kernel_size.saturating_sub(1);
+        if pad_left > 0 {
+            hidden_states = hidden_states.pad([(0, 0), (pad_left, 0)], PadMode::Constant(0.0));
+        }
+        hidden_states = self.depthwise_conv.forward(hidden_states);
+        hidden_states = self
+            .depthwise_layer_norm
+            .forward(hidden_states.swap_dims(1, 2))
+            .swap_dims(1, 2);
+        hidden_states = gelu(hidden_states);
+        hidden_states = self.pointwise_conv2.forward(hidden_states);
+        hidden_states = self.dropout.forward(hidden_states).swap_dims(1, 2);
+        mask_time(
+            hidden_states.reshape([batch_size, seq_len, hidden_size]),
+            lengths,
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Wav2VecBertAdapterConfig {
+    hidden_size: usize,
+    intermediate_size: usize,
+    num_attention_heads: usize,
+    num_adapter_layers: usize,
+    adapter_stride: usize,
+    adapter_kernel_size: usize,
+}
+
+impl Wav2VecBertAdapterConfig {
+    fn init<B: Backend>(&self, device: &B::Device) -> Wav2VecBertAdapter<B> {
+        Wav2VecBertAdapter {
+            layers: (0..self.num_adapter_layers)
+                .map(|_| {
+                    Wav2VecBertAdapterLayerConfig {
+                        hidden_size: self.hidden_size,
+                        intermediate_size: self.intermediate_size,
+                        num_attention_heads: self.num_attention_heads,
+                        stride: self.adapter_stride,
+                        kernel_size: self.adapter_kernel_size,
+                    }
+                    .init(device)
+                })
+                .collect(),
+            stride: self.adapter_stride,
+            kernel_size: self.adapter_kernel_size,
+        }
+    }
+}
+
+#[derive(Module, Debug)]
+struct Wav2VecBertAdapter<B: Backend> {
+    layers: Vec<Wav2VecBertAdapterLayer<B>>,
+    stride: usize,
+    kernel_size: usize,
+}
+
+impl<B: Backend> Wav2VecBertAdapter<B> {
+    fn forward(
+        &self,
+        mut hidden_states: Tensor<B, 3>,
+        lengths: &[usize],
+    ) -> (Tensor<B, 3>, Vec<usize>) {
+        let mut output_lengths = lengths.to_vec();
+        for layer in &self.layers {
+            output_lengths = conv1d_output_lengths(
+                &output_lengths,
+                self.kernel_size,
+                self.stride,
+                self.stride / 2,
+            );
+            hidden_states = layer.forward(hidden_states, &output_lengths);
+        }
+        (hidden_states, output_lengths)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Wav2VecBertAdapterLayerConfig {
+    hidden_size: usize,
+    intermediate_size: usize,
+    num_attention_heads: usize,
+    stride: usize,
+    kernel_size: usize,
+}
+
+impl Wav2VecBertAdapterLayerConfig {
+    fn init<B: Backend>(&self, device: &B::Device) -> Wav2VecBertAdapterLayer<B> {
+        let padding = PaddingConfig1d::Explicit(self.stride / 2, self.stride / 2);
+        Wav2VecBertAdapterLayer {
+            residual_layer_norm: LayerNormConfig::new(self.hidden_size).init(device),
+            residual_conv: Conv1dConfig::new(
+                self.hidden_size,
+                self.hidden_size * 2,
+                self.kernel_size,
+            )
+            .with_stride(self.stride)
+            .with_padding(padding.clone())
+            .init(device),
+            self_attn_layer_norm: LayerNormConfig::new(self.hidden_size).init(device),
+            self_attn_conv: Conv1dConfig::new(
+                self.hidden_size,
+                self.hidden_size * 2,
+                self.kernel_size,
+            )
+            .with_stride(self.stride)
+            .with_padding(padding)
+            .init(device),
+            self_attn: Wav2VecBertSelfAttentionConfig {
+                hidden_size: self.hidden_size,
+                num_attention_heads: self.num_attention_heads,
+                left_max_position_embeddings: 0,
+                right_max_position_embeddings: 0,
+                use_relative_key: false,
+                dropout: 0.0,
+            }
+            .init(device),
+            self_attn_dropout: DropoutConfig::new(0.0).init(),
+            ffn_layer_norm: LayerNormConfig::new(self.hidden_size).init(device),
+            ffn: Wav2VecBertFeedForwardConfig {
+                hidden_size: self.hidden_size,
+                intermediate_size: self.intermediate_size,
+                dropout: 0.0,
+            }
+            .init(device),
+        }
+    }
+}
+
+#[derive(Module, Debug)]
+struct Wav2VecBertAdapterLayer<B: Backend> {
+    residual_layer_norm: LayerNorm<B>,
+    residual_conv: Conv1d<B>,
+    self_attn_layer_norm: LayerNorm<B>,
+    self_attn_conv: Conv1d<B>,
+    self_attn: Wav2VecBertSelfAttention<B>,
+    self_attn_dropout: Dropout,
+    ffn_layer_norm: LayerNorm<B>,
+    ffn: Wav2VecBertFeedForward<B>,
+}
+
+impl<B: Backend> Wav2VecBertAdapterLayer<B> {
+    fn forward(&self, hidden_states: Tensor<B, 3>, output_lengths: &[usize]) -> Tensor<B, 3> {
+        let device = hidden_states.device();
+        let residual = self.residual_conv.forward(
+            self.residual_layer_norm
+                .forward(hidden_states.clone())
+                .swap_dims(1, 2),
+        );
+        let residual = glu(residual, 1).swap_dims(1, 2);
+
+        let hidden_states = self.self_attn_conv.forward(
+            self.self_attn_layer_norm
+                .forward(hidden_states)
+                .swap_dims(1, 2),
+        );
+        let hidden_states = glu(hidden_states, 1).swap_dims(1, 2);
+        let hidden_states = self.self_attn_dropout.forward(self.self_attn.forward(
+            hidden_states,
+            output_lengths,
+            &device,
+        )) + residual;
+
+        let residual = hidden_states.clone();
+        self.ffn.forward(self.ffn_layer_norm.forward(hidden_states)) + residual
     }
 }
 
@@ -588,25 +1137,17 @@ impl<B: Backend> Wav2VecBertCtc<B> {
             device,
             &mut report,
         );
-        load_conv1d(
-            &mut self.encoder.positional_conv,
+        let masked_spec_dim = self.encoder.masked_spec_embed.dims()[0];
+        load_param_1d(
+            &mut self.encoder.masked_spec_embed,
             &store,
-            &[
-                "encoder.pos_conv_embed.conv",
-                "wav2vec2_bert.encoder.pos_conv_embed.conv",
-                "model.encoder.pos_conv_embed.conv",
-            ],
-            device,
-            &mut report,
-        );
-        load_layer_norm(
-            &mut self.encoder.final_norm,
-            &store,
-            &[
-                "encoder.layer_norm",
-                "wav2vec2_bert.encoder.layer_norm",
-                "model.encoder.layer_norm",
-            ],
+            &str_prefixes(&[
+                "masked_spec_embed",
+                "wav2vec2_bert.masked_spec_embed",
+                "model.masked_spec_embed",
+            ]),
+            "",
+            masked_spec_dim,
             device,
             &mut report,
         );
@@ -620,69 +1161,12 @@ impl<B: Backend> Wav2VecBertCtc<B> {
         );
 
         for (index, layer) in self.encoder.encoder.layers.iter_mut().enumerate() {
-            let prefixes = layer_prefixes(index);
-            load_linear(
-                &mut layer.mha.query,
-                &store,
-                &prefix_field(&prefixes, "attention.q_proj"),
-                true,
-                device,
-                &mut report,
-            );
-            load_linear(
-                &mut layer.mha.key,
-                &store,
-                &prefix_field(&prefixes, "attention.k_proj"),
-                true,
-                device,
-                &mut report,
-            );
-            load_linear(
-                &mut layer.mha.value,
-                &store,
-                &prefix_field(&prefixes, "attention.v_proj"),
-                true,
-                device,
-                &mut report,
-            );
-            load_linear(
-                &mut layer.mha.output,
-                &store,
-                &prefix_field(&prefixes, "attention.out_proj"),
-                true,
-                device,
-                &mut report,
-            );
-            load_linear(
-                &mut layer.pwff.linear_inner,
-                &store,
-                &prefix_field(&prefixes, "feed_forward.intermediate_dense"),
-                true,
-                device,
-                &mut report,
-            );
-            load_linear(
-                &mut layer.pwff.linear_outer,
-                &store,
-                &prefix_field(&prefixes, "feed_forward.output_dense"),
-                true,
-                device,
-                &mut report,
-            );
-            load_layer_norm(
-                &mut layer.norm_2,
-                &store,
-                &prefix_field(&prefixes, "layer_norm"),
-                device,
-                &mut report,
-            );
-            load_layer_norm(
-                &mut layer.norm_1,
-                &store,
-                &prefix_field(&prefixes, "final_layer_norm"),
-                device,
-                &mut report,
-            );
+            load_wav2vec_encoder_layer(layer, &store, index, device, &mut report);
+        }
+        if let Some(adapter) = self.encoder.adapter.as_mut() {
+            for (index, layer) in adapter.layers.iter_mut().enumerate() {
+                load_wav2vec_adapter_layer(layer, &store, index, device, &mut report);
+            }
         }
 
         Ok(report)
@@ -731,7 +1215,11 @@ impl HfSafetensors {
 
     fn get_any<'a>(&'a self, prefixes: &[String], suffix: &str) -> Option<(&'a str, &'a HfTensor)> {
         for prefix in prefixes {
-            let name = format!("{prefix}.{suffix}");
+            let name = if suffix.is_empty() {
+                prefix.to_string()
+            } else {
+                format!("{prefix}.{suffix}")
+            };
             if let Some(tensor) = self.tensors.get(&name) {
                 return Some((
                     self.tensors.get_key_value(&name).unwrap().0.as_str(),
@@ -837,6 +1325,242 @@ fn str_prefixes(prefixes: &[&str]) -> Vec<String> {
     prefixes.iter().map(|value| (*value).to_string()).collect()
 }
 
+fn load_wav2vec_encoder_layer<B: Backend>(
+    layer: &mut Wav2VecBertEncoderLayer<B>,
+    store: &HfSafetensors,
+    index: usize,
+    device: &B::Device,
+    report: &mut Wav2VecBertImportReport,
+) {
+    let prefixes = layer_prefixes(index);
+    load_layer_norm(
+        &mut layer.ffn1_layer_norm,
+        store,
+        &prefix_field(&prefixes, "ffn1_layer_norm"),
+        device,
+        report,
+    );
+    load_feed_forward(
+        &mut layer.ffn1,
+        store,
+        &prefix_field(&prefixes, "ffn1"),
+        device,
+        report,
+    );
+    load_layer_norm(
+        &mut layer.self_attn_layer_norm,
+        store,
+        &prefix_field(&prefixes, "self_attn_layer_norm"),
+        device,
+        report,
+    );
+    load_self_attention(
+        &mut layer.self_attn,
+        store,
+        &prefix_field(&prefixes, "self_attn"),
+        device,
+        report,
+    );
+    load_layer_norm(
+        &mut layer.conv_module.layer_norm,
+        store,
+        &prefix_field(&prefixes, "conv_module.layer_norm"),
+        device,
+        report,
+    );
+    load_conv1d(
+        &mut layer.conv_module.pointwise_conv1,
+        store,
+        &prefix_field(&prefixes, "conv_module.pointwise_conv1"),
+        device,
+        report,
+    );
+    load_conv1d(
+        &mut layer.conv_module.depthwise_conv,
+        store,
+        &prefix_field(&prefixes, "conv_module.depthwise_conv"),
+        device,
+        report,
+    );
+    load_layer_norm(
+        &mut layer.conv_module.depthwise_layer_norm,
+        store,
+        &prefix_field(&prefixes, "conv_module.depthwise_layer_norm"),
+        device,
+        report,
+    );
+    load_conv1d(
+        &mut layer.conv_module.pointwise_conv2,
+        store,
+        &prefix_field(&prefixes, "conv_module.pointwise_conv2"),
+        device,
+        report,
+    );
+    load_layer_norm(
+        &mut layer.ffn2_layer_norm,
+        store,
+        &prefix_field(&prefixes, "ffn2_layer_norm"),
+        device,
+        report,
+    );
+    load_feed_forward(
+        &mut layer.ffn2,
+        store,
+        &prefix_field(&prefixes, "ffn2"),
+        device,
+        report,
+    );
+    load_layer_norm(
+        &mut layer.final_layer_norm,
+        store,
+        &prefix_field(&prefixes, "final_layer_norm"),
+        device,
+        report,
+    );
+}
+
+fn load_wav2vec_adapter_layer<B: Backend>(
+    layer: &mut Wav2VecBertAdapterLayer<B>,
+    store: &HfSafetensors,
+    index: usize,
+    device: &B::Device,
+    report: &mut Wav2VecBertImportReport,
+) {
+    let prefixes = [
+        format!("adapter.layers.{index}"),
+        format!("wav2vec2_bert.adapter.layers.{index}"),
+        format!("model.adapter.layers.{index}"),
+    ];
+    load_layer_norm(
+        &mut layer.residual_layer_norm,
+        store,
+        &prefix_field(&prefixes, "residual_layer_norm"),
+        device,
+        report,
+    );
+    load_conv1d(
+        &mut layer.residual_conv,
+        store,
+        &prefix_field(&prefixes, "residual_conv"),
+        device,
+        report,
+    );
+    load_layer_norm(
+        &mut layer.self_attn_layer_norm,
+        store,
+        &prefix_field(&prefixes, "self_attn_layer_norm"),
+        device,
+        report,
+    );
+    load_conv1d(
+        &mut layer.self_attn_conv,
+        store,
+        &prefix_field(&prefixes, "self_attn_conv"),
+        device,
+        report,
+    );
+    load_self_attention(
+        &mut layer.self_attn,
+        store,
+        &prefix_field(&prefixes, "self_attn"),
+        device,
+        report,
+    );
+    load_layer_norm(
+        &mut layer.ffn_layer_norm,
+        store,
+        &prefix_field(&prefixes, "ffn_layer_norm"),
+        device,
+        report,
+    );
+    load_feed_forward(
+        &mut layer.ffn,
+        store,
+        &prefix_field(&prefixes, "ffn"),
+        device,
+        report,
+    );
+}
+
+fn load_self_attention<B: Backend>(
+    attention: &mut Wav2VecBertSelfAttention<B>,
+    store: &HfSafetensors,
+    prefixes: &[String],
+    device: &B::Device,
+    report: &mut Wav2VecBertImportReport,
+) {
+    load_linear(
+        &mut attention.linear_q,
+        store,
+        &prefix_field(prefixes, "linear_q"),
+        true,
+        device,
+        report,
+    );
+    load_linear(
+        &mut attention.linear_k,
+        store,
+        &prefix_field(prefixes, "linear_k"),
+        true,
+        device,
+        report,
+    );
+    load_linear(
+        &mut attention.linear_v,
+        store,
+        &prefix_field(prefixes, "linear_v"),
+        true,
+        device,
+        report,
+    );
+    load_linear(
+        &mut attention.linear_out,
+        store,
+        &prefix_field(prefixes, "linear_out"),
+        true,
+        device,
+        report,
+    );
+    if let Some(distance_embedding) = attention.distance_embedding.as_mut() {
+        let [positions, head_size] = distance_embedding.weight.dims();
+        load_param_2d(
+            &mut distance_embedding.weight,
+            store,
+            &prefix_field(prefixes, "distance_embedding"),
+            "weight",
+            [positions, head_size],
+            false,
+            device,
+            report,
+        );
+    }
+}
+
+fn load_feed_forward<B: Backend>(
+    ffn: &mut Wav2VecBertFeedForward<B>,
+    store: &HfSafetensors,
+    prefixes: &[String],
+    device: &B::Device,
+    report: &mut Wav2VecBertImportReport,
+) {
+    load_linear(
+        &mut ffn.intermediate_dense,
+        store,
+        &prefix_field(prefixes, "intermediate_dense"),
+        true,
+        device,
+        report,
+    );
+    load_linear(
+        &mut ffn.output_dense,
+        store,
+        &prefix_field(prefixes, "output_dense"),
+        true,
+        device,
+        report,
+    );
+}
+
 fn load_linear<B: Backend>(
     linear: &mut Linear<B>,
     store: &HfSafetensors,
@@ -868,11 +1592,14 @@ fn load_linear<B: Backend>(
 fn load_conv1d<B: Backend>(
     conv: &mut Conv1d<B>,
     store: &HfSafetensors,
-    prefixes: &[&str],
+    prefixes: &[impl AsRef<str>],
     device: &B::Device,
     report: &mut Wav2VecBertImportReport,
 ) {
-    let prefixes = str_prefixes(prefixes);
+    let prefixes = prefixes
+        .iter()
+        .map(|value| value.as_ref().to_string())
+        .collect::<Vec<_>>();
     let [out_channels, in_channels, kernel] = conv.weight.dims();
     load_param_3d(
         &mut conv.weight,
@@ -1004,32 +1731,40 @@ fn transpose_2d(values: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     transposed
 }
 
-fn downsample_time<B: Backend>(
-    input: Tensor<B, 3>,
-    lengths: &[usize],
-    stride: usize,
-) -> (Tensor<B, 3>, Vec<usize>) {
-    if stride <= 1 {
-        return (input, lengths.to_vec());
+fn glu<B: Backend>(input: Tensor<B, 3>, dim: usize) -> Tensor<B, 3> {
+    let mut chunks = input.chunk(2, dim);
+    let gate = chunks.remove(1);
+    let value = chunks.remove(0);
+    value * sigmoid(gate)
+}
+
+fn relative_key_positions<B: Backend>(
+    seq_len: usize,
+    left_max: usize,
+    right_max: usize,
+    device: &B::Device,
+) -> Tensor<B, 2, Int> {
+    let mut values = Vec::with_capacity(seq_len * seq_len);
+    for left in 0..seq_len {
+        for right in 0..seq_len {
+            let distance = right as isize - left as isize;
+            let distance = distance.clamp(-(left_max as isize), right_max as isize);
+            values.push((distance + left_max as isize) as i64);
+        }
     }
-    let [_, seq_len, _] = input.dims();
-    let pad = (stride - (seq_len % stride)) % stride;
-    let output = if pad > 0 {
-        input.pad([(0, pad), (0, 0)], PadMode::Edge)
-    } else {
-        input
-    };
-    let [batch_size, padded_len, dim] = output.dims();
-    let output = output
-        .reshape([batch_size, padded_len / stride, stride, dim])
-        .mean_dim(2)
-        .reshape([batch_size, padded_len / stride, dim]);
-    let output_len = output.dims()[1];
-    let lengths = lengths
+    Tensor::from_data(TensorData::new(values, [seq_len, seq_len]), device)
+}
+
+fn conv1d_output_lengths(
+    lengths: &[usize],
+    kernel_size: usize,
+    stride: usize,
+    padding: usize,
+) -> Vec<usize> {
+    lengths
         .iter()
-        .map(|length| ceil_divide(*length, stride).clamp(1, output_len))
-        .collect();
-    (output, lengths)
+        .map(|length| ((*length + 2 * padding).saturating_sub(kernel_size) / stride + 1).max(1))
+        .collect()
 }
 
 fn clamp_lengths(lengths: &[usize], max_len: usize) -> Vec<usize> {
@@ -1037,10 +1772,6 @@ fn clamp_lengths(lengths: &[usize], max_len: usize) -> Vec<usize> {
         .iter()
         .map(|length| (*length).clamp(1, max_len))
         .collect()
-}
-
-fn ceil_divide(value: usize, divisor: usize) -> usize {
-    value.div_ceil(divisor)
 }
 
 fn to_i64(values: Vec<usize>) -> Vec<i64> {
