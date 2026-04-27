@@ -35,9 +35,11 @@ swift = ["dep:swift-bridge"]
 anyhow = "1.0"
 asr-features = { version = "0.1.1", features = ["frontend"] }
 clap = { version = "4.6.1", features = ["derive"] }
+env_logger = "0.11"
 half = { version = "2.1", default-features = false }
 kenlm-rs = { version = "0.1.0" }
 jni = { version = "0.22.4", optional = true }
+log = "0.4"
 magnus = { version = "0.8.2", optional = true }
 napi = { version = "2.16.17", optional = true, default-features = false, features = ["napi4"] }
 napi-derive = { version = "2.16.13", optional = true }
@@ -45,6 +47,7 @@ ort = { version = "2.0.0-rc.12", default-features = false, features = ["api-24",
 prost = "0.14"
 pyo3 = { version = "0.27.1", optional = true, features = ["abi3-py310"] }
 rayon = "1.11"
+serde_json = "1.0"
 splintr = "0.9.1"
 swift-bridge = { version = "0.1.59", optional = true }
 symphonia = { version = "0.5", default-features = false, features = ["aac", "flac", "isomp4", "mp3", "ogg", "pcm", "vorbis", "wav"] }

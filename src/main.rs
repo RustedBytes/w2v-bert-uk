@@ -3,6 +3,8 @@ use std::time::Instant;
 
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
+use env_logger::Env;
+use log::{info, warn};
 use w2v_bert_uk::{
     AcousticModelConfig, CandidateProcessingConfig, CtcDecoderConfig, DecoderConfig, EncoderConfig,
     LmConfig, RuntimeConfig, TextDecoderConfig, TimingReport, TranscriptionConfig,
@@ -153,6 +155,7 @@ fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
 }
 
 fn main() -> Result<()> {
+    init_logger();
     let total_start = Instant::now();
     let args = Args::parse();
     let candidate_processing = CandidateProcessingConfig {
@@ -170,7 +173,7 @@ fn main() -> Result<()> {
             candidate_processing: candidate_processing.clone(),
         })
     } else {
-        eprintln!("KenLM disabled: {} does not exist", args.lm.display());
+        warn!("KenLM disabled: {} does not exist", args.lm.display());
         None
     };
 
@@ -219,13 +222,17 @@ fn main() -> Result<()> {
 
     print_result(&result);
     println!("{}", result.transcript);
-    eprintln!("total: {}", format_duration(total_start.elapsed()));
+    info!("total: {}", format_duration(total_start.elapsed()));
 
     Ok(())
 }
 
+fn init_logger() {
+    env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
+}
+
 fn print_result(result: &TranscriptionResult) {
-    eprintln!(
+    info!(
         "w2v-bert features: {} frames x {} dims ({} f32 values)",
         result.timings.feature_rows, result.timings.feature_cols, result.timings.feature_count
     );
@@ -233,46 +240,46 @@ fn print_result(result: &TranscriptionResult) {
 }
 
 fn print_timings(report: &TimingReport) {
-    eprintln!("audio duration: {:.3}s", report.audio_duration_seconds);
-    eprintln!(
+    info!("audio duration: {:.3}s", report.audio_duration_seconds);
+    info!(
         "audio decode: {}",
         format_duration(report.audio_decode_elapsed)
     );
-    eprintln!(
+    info!(
         "feature extraction: {}",
         format_duration(report.feature_elapsed)
     );
-    eprintln!(
+    info!(
         "feature throughput: {:.0} values/s",
         report.feature_count as f64 / report.feature_elapsed.as_secs_f64()
     );
-    eprintln!(
+    info!(
         "model session: {}",
         format_duration(report.model.session_elapsed)
     );
-    eprintln!(
+    info!(
         "input tensor: {}",
         format_duration(report.model.input_elapsed)
     );
-    eprintln!(
+    info!(
         "onnx inference: {}",
         format_duration(report.model.inference_elapsed)
     );
-    eprintln!(
+    info!(
         "ctc beam search: {}",
         format_duration(report.model.ctc_elapsed)
     );
-    eprintln!(
+    info!(
         "tokenizer load: {}",
         format_duration(report.tokenizer_load_elapsed)
     );
-    eprintln!(
+    info!(
         "text decode: {}",
         format_duration(report.text_decode_elapsed)
     );
-    eprintln!("kenlm rerank: {}", format_duration(report.lm_elapsed));
+    info!("kenlm rerank: {}", format_duration(report.lm_elapsed));
     if let Some(candidate) = &report.best_candidate {
-        eprintln!(
+        info!(
             "best score: total={:.3} ctc={:.3} lm={:.3} words={}",
             candidate.total_score,
             candidate.ctc_log_prob,
@@ -280,9 +287,9 @@ fn print_timings(report: &TimingReport) {
             candidate.word_count
         );
     }
-    eprintln!(
+    info!(
         "measured pipeline: {}",
         format_duration(report.measured_elapsed())
     );
-    eprintln!("RTF/RFT: {:.3}x", report.real_time_factor());
+    info!("RTF/RFT: {:.3}x", report.real_time_factor());
 }

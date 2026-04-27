@@ -4,13 +4,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 use asr_features::FeatureMatrix;
 use half::f16;
+use log::info;
 #[cfg(any(feature = "coreml", feature = "cuda"))]
 use ort::ep;
 use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::value::{Tensor, TensorElementType, ValueType};
 
-use crate::ctc::{CtcCandidate, threaded_ctc_beam_search_decode_n_best};
+use crate::ctc::{CtcCandidate, ctc_log_probs, threaded_ctc_beam_search_decode_n_best};
 
 #[derive(Clone, Copy, Debug)]
 pub enum ModelOptimizationLevel {
@@ -56,6 +57,16 @@ pub struct ModelOutput {
     pub ctc_elapsed: Duration,
 }
 
+pub struct CtcLogProbs {
+    pub frames: usize,
+    pub vocab_size: usize,
+    pub values: Vec<f32>,
+    pub session_elapsed: Duration,
+    pub input_elapsed: Duration,
+    pub inference_elapsed: Duration,
+    pub log_softmax_elapsed: Duration,
+}
+
 pub struct CtcModel {
     session: Session,
     input_name: String,
@@ -90,7 +101,7 @@ impl CtcModel {
                 anyhow!("failed to configure ONNX Runtime execution providers: {error}")
             })?;
         if config.log_accelerator {
-            eprintln!("onnx accelerator: {}", configured_accelerator_label());
+            info!("onnx accelerator: {}", configured_accelerator_label());
         }
 
         let session = builder.commit_from_file(model_path).map_err(|error| {
@@ -142,6 +153,11 @@ impl CtcModel {
         )
     }
 
+    pub fn run_log_probs(&mut self, features: FeatureMatrix) -> Result<CtcLogProbs> {
+        let session_elapsed = self.session_elapsed();
+        self.run_log_probs_with_reported_session_elapsed(features, session_elapsed)
+    }
+
     pub(crate) fn run_with_reported_session_elapsed(
         &mut self,
         features: FeatureMatrix,
@@ -150,6 +166,51 @@ impl CtcModel {
         n_best: usize,
         session_elapsed: Duration,
     ) -> Result<ModelOutput> {
+        let raw_output = self.run_raw_output(features)?;
+
+        let ctc_start = Instant::now();
+        let candidates = match &raw_output {
+            RawModelOutput::F16 { shape, logits, .. } => {
+                threaded_ctc_beam_search_decode_n_best(shape, logits, blank_id, beam_width, n_best)?
+            }
+            RawModelOutput::F32 { shape, logits, .. } => {
+                threaded_ctc_beam_search_decode_n_best(shape, logits, blank_id, beam_width, n_best)?
+            }
+        };
+
+        Ok(ModelOutput {
+            candidates,
+            session_elapsed,
+            input_elapsed: raw_output.input_elapsed(),
+            inference_elapsed: raw_output.inference_elapsed(),
+            ctc_elapsed: ctc_start.elapsed(),
+        })
+    }
+
+    pub(crate) fn run_log_probs_with_reported_session_elapsed(
+        &mut self,
+        features: FeatureMatrix,
+        session_elapsed: Duration,
+    ) -> Result<CtcLogProbs> {
+        let raw_output = self.run_raw_output(features)?;
+        let log_softmax_start = Instant::now();
+        let (frames, vocab_size, values) = match &raw_output {
+            RawModelOutput::F16 { shape, logits, .. } => ctc_log_probs(shape, logits)?,
+            RawModelOutput::F32 { shape, logits, .. } => ctc_log_probs(shape, logits)?,
+        };
+
+        Ok(CtcLogProbs {
+            frames,
+            vocab_size,
+            values,
+            session_elapsed,
+            input_elapsed: raw_output.input_elapsed(),
+            inference_elapsed: raw_output.inference_elapsed(),
+            log_softmax_elapsed: log_softmax_start.elapsed(),
+        })
+    }
+
+    fn run_raw_output(&mut self, features: FeatureMatrix) -> Result<RawModelOutput> {
         let input_start = Instant::now();
         let rows = features.rows;
         let cols = features.cols;
@@ -190,31 +251,66 @@ impl CtcModel {
             .next()
             .ok_or_else(|| anyhow!("ONNX model returned no outputs"))?;
 
-        let ctc_start = Instant::now();
-        let candidates = match self.output_precision {
+        match self.output_precision {
             ModelFloatPrecision::F16 => {
                 let (shape, logits) =
                     first_output.try_extract_tensor::<f16>().map_err(|error| {
                         anyhow!("failed to read ONNX output tensor as f16 logits: {error}")
                     })?;
-                threaded_ctc_beam_search_decode_n_best(shape, logits, blank_id, beam_width, n_best)?
+                Ok(RawModelOutput::F16 {
+                    shape: shape.to_vec(),
+                    logits: logits.to_vec(),
+                    input_elapsed,
+                    inference_elapsed,
+                })
             }
             ModelFloatPrecision::F32 => {
                 let (shape, logits) =
                     first_output.try_extract_tensor::<f32>().map_err(|error| {
                         anyhow!("failed to read ONNX output tensor as f32 logits: {error}")
                     })?;
-                threaded_ctc_beam_search_decode_n_best(shape, logits, blank_id, beam_width, n_best)?
+                Ok(RawModelOutput::F32 {
+                    shape: shape.to_vec(),
+                    logits: logits.to_vec(),
+                    input_elapsed,
+                    inference_elapsed,
+                })
             }
-        };
+        }
+    }
+}
 
-        Ok(ModelOutput {
-            candidates,
-            session_elapsed,
-            input_elapsed,
-            inference_elapsed,
-            ctc_elapsed: ctc_start.elapsed(),
-        })
+enum RawModelOutput {
+    F16 {
+        shape: Vec<i64>,
+        logits: Vec<f16>,
+        input_elapsed: Duration,
+        inference_elapsed: Duration,
+    },
+    F32 {
+        shape: Vec<i64>,
+        logits: Vec<f32>,
+        input_elapsed: Duration,
+        inference_elapsed: Duration,
+    },
+}
+
+impl RawModelOutput {
+    fn input_elapsed(&self) -> Duration {
+        match self {
+            Self::F16 { input_elapsed, .. } | Self::F32 { input_elapsed, .. } => *input_elapsed,
+        }
+    }
+
+    fn inference_elapsed(&self) -> Duration {
+        match self {
+            Self::F16 {
+                inference_elapsed, ..
+            }
+            | Self::F32 {
+                inference_elapsed, ..
+            } => *inference_elapsed,
+        }
     }
 }
 

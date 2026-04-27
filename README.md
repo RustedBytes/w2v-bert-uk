@@ -84,6 +84,28 @@ cargo run --release -- example_1.wav \
   --lm-no-eos
 ```
 
+## CTC Alignment
+
+The package also includes a CTC-segmentation aligner based on the dynamic
+programming method from arXiv:2007.09127v2. It aligns an existing transcript to
+audio and prints tab-separated utterance segments:
+
+```bash
+cargo run --release --bin ctc-align -- audio.wav transcript.txt model_optimized.onnx tokenizer.model
+cargo run --release --bin ctc-align -- audio.wav transcript.txt --output-format jsonl --output-file segments.jsonl
+```
+
+`transcript.txt` should contain one utterance per non-empty line. Output columns
+for the default TSV format are:
+
+```text
+start	end	score	text
+```
+
+The `score` is the minimum mean frame log-probability window from the paper. By
+default the tool infers the CTC frame duration from `audio duration / CTC
+frames`; pass `--index-duration` if your model requires a fixed value.
+
 For Rust callers, `TranscriptionConfig` is split by processing stage:
 
 ```rust

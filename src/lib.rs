@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use asr_features::{W2vBertFrontendConfig, w2v_bert_frontend_config};
 use kenlm::{Config as KenlmConfig, Model as KenlmModel};
+use log::info;
 use splintr::SentencePieceTokenizer;
 
 use crate::audio::{
@@ -293,10 +294,15 @@ impl Transcriber {
     }
 
     pub fn transcribe_features(&mut self, audio: AudioFeatures) -> Result<TranscriptionResult> {
-        let audio_duration_seconds = audio.duration_seconds();
-        let feature_rows = audio.features.rows;
-        let feature_cols = audio.features.cols;
-        let feature_count = audio.features.values.len();
+        let decode_context = DecodeTimingContext {
+            audio_duration_seconds: audio.duration_seconds(),
+            feature_rows: audio.features.rows,
+            feature_cols: audio.features.cols,
+            feature_count: audio.features.values.len(),
+            audio_decode_elapsed: audio.decode_elapsed,
+            feature_elapsed: audio.feature_elapsed,
+            tokenizer_load_elapsed: Duration::ZERO,
+        };
         let reported_session_elapsed = self.next_session_elapsed.take().unwrap_or(Duration::ZERO);
         let model = self.model.run_with_reported_session_elapsed(
             audio.features,
@@ -311,13 +317,7 @@ impl Transcriber {
             &self.tokenizer,
             &self.text,
             &self.language_model,
-            audio_duration_seconds,
-            feature_rows,
-            feature_cols,
-            feature_count,
-            audio.decode_elapsed,
-            audio.feature_elapsed,
-            Duration::ZERO,
+            decode_context,
         )
     }
 }
@@ -325,6 +325,16 @@ impl Transcriber {
 struct DecodedCandidate {
     text: String,
     ctc_log_prob: f32,
+}
+
+struct DecodeTimingContext {
+    audio_duration_seconds: f64,
+    feature_rows: usize,
+    feature_cols: usize,
+    feature_count: usize,
+    audio_decode_elapsed: Duration,
+    feature_elapsed: Duration,
+    tokenizer_load_elapsed: Duration,
 }
 
 struct LmDecoder {
@@ -335,7 +345,7 @@ struct LmDecoder {
 impl LmDecoder {
     fn new(config: LmConfig) -> Result<Self> {
         if config.log_language_model {
-            eprintln!(
+            info!(
                 "KenLM: {} weight={:.3} word_bonus={:.3}",
                 config.path.display(),
                 config.weight,
@@ -476,13 +486,7 @@ fn decode_model_output(
     tokenizer: &SentencePieceTokenizer,
     text_config: &TextDecoderConfig,
     language_model: &Option<LmDecoder>,
-    audio_duration_seconds: f64,
-    feature_rows: usize,
-    feature_cols: usize,
-    feature_count: usize,
-    audio_decode_elapsed: Duration,
-    feature_elapsed: Duration,
-    tokenizer_load_elapsed: Duration,
+    decode_context: DecodeTimingContext,
 ) -> Result<TranscriptionResult> {
     let text_decode_start = Instant::now();
     let decoded_candidates = model
@@ -513,14 +517,14 @@ fn decode_model_output(
     Ok(TranscriptionResult {
         transcript,
         timings: TimingReport {
-            audio_duration_seconds,
-            feature_rows,
-            feature_cols,
-            feature_count,
-            audio_decode_elapsed,
-            feature_elapsed,
+            audio_duration_seconds: decode_context.audio_duration_seconds,
+            feature_rows: decode_context.feature_rows,
+            feature_cols: decode_context.feature_cols,
+            feature_count: decode_context.feature_count,
+            audio_decode_elapsed: decode_context.audio_decode_elapsed,
+            feature_elapsed: decode_context.feature_elapsed,
             model,
-            tokenizer_load_elapsed,
+            tokenizer_load_elapsed: decode_context.tokenizer_load_elapsed,
             text_decode_elapsed,
             lm_elapsed,
             best_candidate: ranked.first().cloned(),
