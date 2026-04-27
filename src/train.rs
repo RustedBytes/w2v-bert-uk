@@ -6915,6 +6915,7 @@ impl<B: AutodiffBackend> ModuleMapper<B> for WarmStartMapper<'_, B> {
             return Param::from_mapped_value(id, current, mapper);
         };
         let (data, transposed) = maybe_transpose_warm_start_data(&path, data, &current.dims());
+        let data = maybe_reshape_warm_start_scalar(data, &current.dims());
         if transposed {
             self.transposed += 1;
         }
@@ -6934,6 +6935,19 @@ impl<B: AutodiffBackend> ModuleMapper<B> for WarmStartMapper<'_, B> {
         self.loaded += 1;
         Param::from_mapped_value(id, tensor, mapper)
     }
+}
+
+fn maybe_reshape_warm_start_scalar<const D: usize>(
+    data: TensorData,
+    target_shape: &[usize; D],
+) -> TensorData {
+    if data.shape.as_slice().is_empty() && target_shape.as_slice() == [1] {
+        let Ok(values) = data.into_vec::<f32>() else {
+            return TensorData::new(Vec::<f32>::new(), [0]);
+        };
+        return TensorData::new(values, [1]);
+    }
+    data
 }
 
 fn maybe_transpose_warm_start_data<const D: usize>(
@@ -7004,6 +7018,12 @@ fn squeezeformer_positiveloss_alias(path: &str) -> Option<String> {
     }
     if let Some(suffix) = path.strip_prefix("encoder.time_recovery.projection.") {
         return Some(format!("encoder.time_recover.15.proj.{suffix}"));
+    }
+    if let Some(suffix) = path.strip_prefix("encoder.input_norm.") {
+        return Some(format!(
+            "encoder.input_norm.{}",
+            layer_norm_suffix_alias(suffix)
+        ));
     }
 
     let parts = path.split('.').collect::<Vec<_>>();
@@ -7137,14 +7157,14 @@ fn squeezeformer_mhsa_ff_alias(block: &str, rest: &[&str]) -> Option<String> {
                 "value_proj" => "value",
                 other => other,
             };
-            Some(format!(
-                "encoder.blocks.{block}.layers.0.attn.attn.{projection}.{}",
-                tail.join(".")
+            Some(join_weight_path(
+                &format!("encoder.blocks.{block}.layers.0.attn.attn.{projection}"),
+                tail,
             ))
         }
-        ["mid_norm", tail @ ..] => Some(format!(
-            "encoder.blocks.{block}.layers.0.mid_norm.{}",
-            tail.join(".")
+        ["mid_norm", tail @ ..] => Some(join_weight_path(
+            &format!("encoder.blocks.{block}.layers.0.mid_norm"),
+            tail,
         )),
         ["feed_forward", "input_transform", tail @ ..] => Some(format!(
             "encoder.blocks.{block}.layers.0.ff.input_transform.{}",
@@ -7161,9 +7181,9 @@ fn squeezeformer_mhsa_ff_alias(block: &str, rest: &[&str]) -> Option<String> {
                 tail.join(".")
             ))
         }
-        ["out_norm", tail @ ..] => Some(format!(
-            "encoder.blocks.{block}.layers.0.out_norm.{}",
-            tail.join(".")
+        ["out_norm", tail @ ..] => Some(join_weight_path(
+            &format!("encoder.blocks.{block}.layers.0.out_norm"),
+            tail,
         )),
         _ => None,
     }
@@ -7171,13 +7191,13 @@ fn squeezeformer_mhsa_ff_alias(block: &str, rest: &[&str]) -> Option<String> {
 
 fn squeezeformer_conv_ff_alias(block: &str, rest: &[&str]) -> Option<String> {
     match rest {
-        ["convolution", tail @ ..] => Some(format!(
-            "encoder.blocks.{block}.layers.2.conv.{}",
-            tail.join(".")
+        ["convolution", tail @ ..] => Some(join_weight_path(
+            &format!("encoder.blocks.{block}.layers.2.conv"),
+            tail,
         )),
-        ["mid_norm", tail @ ..] => Some(format!(
-            "encoder.blocks.{block}.layers.2.mid_norm.{}",
-            tail.join(".")
+        ["mid_norm", tail @ ..] => Some(join_weight_path(
+            &format!("encoder.blocks.{block}.layers.2.mid_norm"),
+            tail,
         )),
         ["feed_forward", "input_transform", tail @ ..] => Some(format!(
             "encoder.blocks.{block}.layers.2.ff.input_transform.{}",
@@ -7194,12 +7214,28 @@ fn squeezeformer_conv_ff_alias(block: &str, rest: &[&str]) -> Option<String> {
                 tail.join(".")
             ))
         }
-        ["out_norm", tail @ ..] => Some(format!(
-            "encoder.blocks.{block}.layers.2.out_norm.{}",
-            tail.join(".")
+        ["out_norm", tail @ ..] => Some(join_weight_path(
+            &format!("encoder.blocks.{block}.layers.2.out_norm"),
+            tail,
         )),
         _ => None,
     }
+}
+
+fn join_weight_path(prefix: &str, tail: &[&str]) -> String {
+    if tail.is_empty() {
+        return prefix.to_string();
+    }
+    let suffix = tail
+        .iter()
+        .map(|part| match *part {
+            "gamma" => "weight",
+            "beta" => "bias",
+            other => other,
+        })
+        .collect::<Vec<_>>()
+        .join(".");
+    format!("{prefix}.{suffix}")
 }
 
 fn load_model_checkpoint<B, M>(

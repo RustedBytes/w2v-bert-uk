@@ -1,4 +1,4 @@
-use burn::module::{Initializer, Module, Param};
+use burn::module::{Initializer, Module, Param, RunningState};
 use burn::tensor::activation::{relu, silu, softmax};
 use burn::tensor::ops::PadMode;
 use burn::tensor::{Bool, Tensor, TensorData, backend::Backend};
@@ -361,6 +361,7 @@ impl ConvolutionModuleConfig {
                     self.kernel_size / 2,
                 ))
                 .init(device),
+            batch_norm: PositiveLossBatchNorm1d::new(hidden, device),
             pointwise_out: Conv1dConfig::new(hidden, self.d_model, 1).init(device),
             dropout: DropoutConfig::new(self.dropout).init(),
         }
@@ -372,6 +373,7 @@ pub struct ConvolutionModule<B: Backend> {
     input_transform: ScaleBiasLayer<B>,
     pointwise_in: Conv1d<B>,
     depthwise: Conv1d<B>,
+    batch_norm: PositiveLossBatchNorm1d<B>,
     pointwise_out: Conv1d<B>,
     dropout: Dropout,
 }
@@ -387,6 +389,7 @@ impl<B: Backend> ConvolutionModule<B> {
         let output = silu(output);
         let output = apply_channel_time_mask(output, lengths);
         let output = self.depthwise.forward(output);
+        let output = self.batch_norm.forward(output);
         let output = silu(output);
         let output = apply_channel_time_mask(output, lengths);
         let output = self.pointwise_out.forward(output);
@@ -396,6 +399,115 @@ impl<B: Backend> ConvolutionModule<B> {
             + output
                 .swap_dims(1, 2)
                 .reshape([batch_size, seq_len, d_model])
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct PositiveLossBatchNorm1d<B: Backend> {
+    gamma: Param<Tensor<B, 1>>,
+    beta: Param<Tensor<B, 1>>,
+    running_mean: RunningState<Tensor<B, 1>>,
+    running_var: RunningState<Tensor<B, 1>>,
+    num_batches_tracked: Param<Tensor<B, 1>>,
+    momentum: f64,
+    epsilon: f64,
+}
+
+impl<B: Backend> PositiveLossBatchNorm1d<B> {
+    fn new(num_features: usize, device: &B::Device) -> Self {
+        Self {
+            gamma: Initializer::Ones.init([num_features], device),
+            beta: Initializer::Zeros.init([num_features], device),
+            running_mean: RunningState::new(Tensor::zeros([num_features], device)),
+            running_var: RunningState::new(Tensor::ones([num_features], device)),
+            num_batches_tracked: Param::from_tensor(Tensor::from_data(
+                TensorData::new(vec![0.0f32], [1]),
+                device,
+            )),
+            momentum: 0.1,
+            epsilon: 1.0e-5,
+        }
+    }
+
+    fn forward(&self, input: Tensor<B, 3>) -> Tensor<B, 3> {
+        if B::ad_enabled(&input.device()) {
+            self.forward_train(input)
+        } else {
+            self.forward_inference(input)
+        }
+    }
+
+    fn forward_inference(&self, input: Tensor<B, 3>) -> Tensor<B, 3> {
+        let device = input.device();
+        let channels = input.dims()[1];
+        let mean = self.running_mean.value().to_device(&device);
+        let var = self.running_var.value().to_device(&device);
+        self.forward_shared(
+            input,
+            mean.reshape([1, channels, 1]),
+            var.reshape([1, channels, 1]),
+        )
+    }
+
+    fn forward_train(&self, input: Tensor<B, 3>) -> Tensor<B, 3> {
+        let device = input.device();
+        let [batch_size, channels, seq_len] = input.dims();
+        let flatten_size = batch_size * seq_len;
+        let mean = input
+            .clone()
+            .swap_dims(0, 1)
+            .reshape([channels, flatten_size])
+            .mean_dim(1)
+            .reshape([1, channels, 1]);
+        let var = input
+            .clone()
+            .sub(mean.clone())
+            .square()
+            .swap_dims(0, 1)
+            .reshape([channels, flatten_size])
+            .mean_dim(1)
+            .reshape([1, channels, 1]);
+
+        let running_mean = self.running_mean.value_sync().to_device(&device);
+        let running_var = self.running_var.value_sync().to_device(&device);
+        self.running_mean.update(
+            running_mean
+                .mul_scalar(1.0 - self.momentum)
+                .add(
+                    mean.clone()
+                        .detach()
+                        .mul_scalar(self.momentum)
+                        .reshape([channels]),
+                )
+                .detach(),
+        );
+        self.running_var.update(
+            running_var
+                .mul_scalar(1.0 - self.momentum)
+                .add(
+                    var.clone()
+                        .detach()
+                        .mul_scalar(self.momentum)
+                        .reshape([channels]),
+                )
+                .detach(),
+        );
+
+        self.forward_shared(input, mean, var)
+    }
+
+    fn forward_shared(
+        &self,
+        input: Tensor<B, 3>,
+        mean: Tensor<B, 3>,
+        var: Tensor<B, 3>,
+    ) -> Tensor<B, 3> {
+        let channels = input.dims()[1];
+        let std = var.add_scalar(self.epsilon).sqrt();
+        let output = input.sub(mean).div(std);
+        output
+            .mul(self.gamma.val().reshape([1, channels, 1]))
+            .add(self.beta.val().reshape([1, channels, 1]))
     }
 }
 
