@@ -23,20 +23,22 @@ cargo run --bin train -- \
 Run CUDA training on two GPUs:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 cargo run --release --features burn-cuda-backend --bin train -- \
+RUST_LOG=info CUDA_VISIBLE_DEVICES=0,1 cargo run --release --features burn-cuda-backend --bin train -- \
   --train-manifest testdata \
   --architecture squeezeformer \
+  --variant xs \
   --backend cuda \
   --device-indices 0,1 \
-  --precision bf16 \
+  --precision f32 \
   --input-dim 80 \
   --vocab-size <VOCAB_SIZE> \
-  --batch-size 8 \
+  --batch-size 2 \
   --adaptive-batch-unit feature-values \
-  --adaptive-batch-budget 8000000 \
-  --adaptive-batch-max-samples 64 \
+  --adaptive-batch-budget 40000 \
+  --adaptive-batch-max-samples 2 \
   --sort-by-length-desc \
   --dataset-index-dir runs/index-cache \
+  --log-every 1 \
   --epochs 10 \
   --learning-rate 0.001 \
   --gradient-clip-norm 5.0 \
@@ -311,11 +313,12 @@ For large GPU runs, start with `feature-values`:
 
 ```bash
 --adaptive-batch-unit feature-values \
---adaptive-batch-budget 8000000 \
---adaptive-batch-max-samples 64
+--adaptive-batch-budget 40000 \
+--adaptive-batch-max-samples 2
 ```
 
-Increase the budget until GPU memory is close to full without OOM.
+For `f32`, start conservatively and increase the budget until GPU memory is
+close to full without OOM. `bf16`/`f16` can usually use a larger budget.
 
 ## Augmentation
 
@@ -446,18 +449,19 @@ Resume validates model-shape and training-critical config before loading.
 ### Squeezeformer From Parquet On Two CUDA GPUs
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 cargo run --release --features burn-cuda-backend --bin train -- \
+RUST_LOG=info CUDA_VISIBLE_DEVICES=0,1 cargo run --release --features burn-cuda-backend --bin train -- \
   --train-manifest testdata \
   --architecture squeezeformer \
+  --variant xs \
   --backend cuda \
   --device-indices 0,1 \
-  --precision bf16 \
+  --precision f32 \
   --input-dim 80 \
   --vocab-size <VOCAB_SIZE> \
-  --batch-size 8 \
+  --batch-size 2 \
   --adaptive-batch-unit feature-values \
-  --adaptive-batch-budget 8000000 \
-  --adaptive-batch-max-samples 64 \
+  --adaptive-batch-budget 40000 \
+  --adaptive-batch-max-samples 2 \
   --sort-by-length-desc \
   --dataset-index-dir runs/index-cache \
   --spec-time-masks 2 \
@@ -469,6 +473,7 @@ CUDA_VISIBLE_DEVICES=0,1 cargo run --release --features burn-cuda-backend --bin 
   --lr-warmup-steps 1000 \
   --lr-decay-steps 20000 \
   --gradient-clip-norm 5.0 \
+  --log-every 1 \
   --ema-decay 0.9999 \
   --output-dir runs/squeezeformer-parquet
 ```

@@ -1591,6 +1591,50 @@ impl BatchDiagnostics {
     }
 }
 
+fn should_log_progress(global_step: usize, log_every: usize) -> bool {
+    global_step == 0 || (log_every > 0 && global_step % log_every == 0)
+}
+
+fn log_batch_start(
+    logger: &mut RunLogger<'_>,
+    epoch: usize,
+    global_step: usize,
+    devices: usize,
+    diagnostics: BatchDiagnostics,
+    dry_run: bool,
+) -> Result<()> {
+    if should_log_progress(global_step, logger.config.log_every) {
+        let padding_ratio = if diagnostics.total_frames > 0 {
+            diagnostics.padded_frames as f64 / diagnostics.total_frames as f64
+        } else {
+            0.0
+        };
+        log::info!(
+            "batch_start epoch={} next_step={} devices={} micro_batches={} samples={} max_frames={} padded_frames={} feature_values={} padding_ratio={:.3} dry_run={}",
+            epoch,
+            global_step + 1,
+            devices,
+            diagnostics.batches,
+            diagnostics.samples,
+            diagnostics.max_frames,
+            diagnostics.padded_frames,
+            diagnostics.feature_values,
+            padding_ratio,
+            dry_run
+        );
+    }
+    logger.log(
+        "batch_start",
+        json!({
+            "epoch": epoch,
+            "next_step": global_step + 1,
+            "devices": devices,
+            "dry_run": dry_run,
+            "batch": diagnostics.as_json(),
+        }),
+    )
+}
+
 fn train_ctc_model<B, M>(
     mut model: M,
     config: &BurnTrainConfig,
@@ -1664,12 +1708,17 @@ where
             };
             let step_started = Instant::now();
             let batch_diagnostics = BatchDiagnostics::from_batches(&batches);
-
-            let loss = ctc_loss_for_batch::<B, M>(&model, &batches[0], config, device);
-            let mut loss_value = scalar_value(loss.clone())?;
-            last_train_loss = Some(loss_value);
+            log_batch_start(
+                &mut logger,
+                epoch,
+                global_step,
+                batches.len(),
+                batch_diagnostics,
+                config.dry_run,
+            )?;
 
             if !config.dry_run {
+                let loss_value;
                 if devices.len() > 1 {
                     let active_devices = &devices[..batches.len()];
                     let results = collect_parallel_gradients::<B, M, f32, _>(
@@ -1690,16 +1739,18 @@ where
                     )?;
                     loss_value =
                         results.iter().map(|(_, value)| *value).sum::<f32>() / results.len() as f32;
-                    last_train_loss = Some(loss_value);
                     for (grads, _) in results {
                         accumulator.accumulate::<B>(&model, grads);
                         accumulated_batches += 1;
                     }
                 } else {
+                    let loss = ctc_loss_for_batch::<B, M>(&model, &batches[0], config, device);
+                    loss_value = scalar_value(loss.clone())?;
                     let grads = GradientsParams::from_grads(loss.backward(), &model);
                     accumulator.accumulate::<B>(&model, grads);
                     accumulated_batches += 1;
                 }
+                last_train_loss = Some(loss_value);
                 let pending_micro_batches = accumulated_batches;
                 let (next_model, lr) = maybe_step_accumulated::<B, M, _>(
                     model,
@@ -1734,6 +1785,9 @@ where
                     )?;
                 }
             } else {
+                let loss = ctc_loss_for_batch::<B, M>(&model, &batches[0], config, device);
+                let loss_value = scalar_value(loss.clone())?;
+                last_train_loss = Some(loss_value);
                 global_step += 1;
                 if global_step == 1 || global_step % config.log_every == 0 {
                     println!(
@@ -2004,17 +2058,17 @@ where
             };
             let step_started = Instant::now();
             let batch_diagnostics = BatchDiagnostics::from_batches(&batches);
-
-            let loss_output = paraformer_loss_for_batch(&model, &batches[0], config, device, true);
-            let loss_value = scalar_value(loss_output.loss.clone())?;
-            let mut metric_values = [
-                loss_value,
-                scalar_value(loss_output.ctc_loss.clone())?,
-                scalar_value(loss_output.ce_loss.clone())?,
-            ];
-            last_train_loss = Some(metric_values[0]);
+            log_batch_start(
+                &mut logger,
+                epoch,
+                global_step,
+                batches.len(),
+                batch_diagnostics,
+                config.dry_run,
+            )?;
 
             if !config.dry_run {
+                let metric_values;
                 if devices.len() > 1 {
                     let active_devices = &devices[..batches.len()];
                     let results = collect_parallel_gradients::<B, ParaformerV2<B>, [f32; 3], _>(
@@ -2039,16 +2093,23 @@ where
                         },
                     )?;
                     metric_values = average_metric_triplets(&results);
-                    last_train_loss = Some(metric_values[0]);
                     for (grads, _) in results {
                         accumulator.accumulate::<B>(&model, grads);
                         accumulated_batches += 1;
                     }
                 } else {
+                    let loss_output =
+                        paraformer_loss_for_batch(&model, &batches[0], config, device, true);
+                    metric_values = [
+                        scalar_value(loss_output.loss.clone())?,
+                        scalar_value(loss_output.ctc_loss.clone())?,
+                        scalar_value(loss_output.ce_loss.clone())?,
+                    ];
                     let grads = GradientsParams::from_grads(loss_output.loss.backward(), &model);
                     accumulator.accumulate::<B>(&model, grads);
                     accumulated_batches += 1;
                 }
+                last_train_loss = Some(metric_values[0]);
                 let pending_micro_batches = accumulated_batches;
                 let (next_model, lr) = maybe_step_accumulated::<B, ParaformerV2<B>, _>(
                     model,
@@ -2095,6 +2156,14 @@ where
                     )?;
                 }
             } else {
+                let loss_output =
+                    paraformer_loss_for_batch(&model, &batches[0], config, device, true);
+                let metric_values = [
+                    scalar_value(loss_output.loss.clone())?,
+                    scalar_value(loss_output.ctc_loss.clone())?,
+                    scalar_value(loss_output.ce_loss.clone())?,
+                ];
+                last_train_loss = Some(metric_values[0]);
                 global_step += 1;
                 if global_step == 1 || global_step % config.log_every == 0 {
                     println!(
@@ -2369,19 +2438,17 @@ where
             };
             let step_started = Instant::now();
             let batch_diagnostics = BatchDiagnostics::from_batches(&batches);
-
-            let loss_output =
-                enhanced_paraformer_loss_for_batch(&model, &batches[0], config, device, true);
-            let mut metric_values = [
-                scalar_value(loss_output.loss.clone())?,
-                scalar_value(loss_output.ctc_loss.clone())?,
-                scalar_value(loss_output.shallow_ctc_loss.clone())?,
-                scalar_value(loss_output.ce_loss.clone())?,
-                scalar_value(loss_output.boundary_loss.clone())?,
-            ];
-            last_train_loss = Some(metric_values[0]);
+            log_batch_start(
+                &mut logger,
+                epoch,
+                global_step,
+                batches.len(),
+                batch_diagnostics,
+                config.dry_run,
+            )?;
 
             if !config.dry_run {
+                let metric_values;
                 if devices.len() > 1 {
                     let active_devices = &devices[..batches.len()];
                     let results =
@@ -2409,16 +2476,30 @@ where
                             },
                         )?;
                     metric_values = average_metric_quintets(&results);
-                    last_train_loss = Some(metric_values[0]);
                     for (grads, _) in results {
                         accumulator.accumulate::<B>(&model, grads);
                         accumulated_batches += 1;
                     }
                 } else {
+                    let loss_output = enhanced_paraformer_loss_for_batch(
+                        &model,
+                        &batches[0],
+                        config,
+                        device,
+                        true,
+                    );
+                    metric_values = [
+                        scalar_value(loss_output.loss.clone())?,
+                        scalar_value(loss_output.ctc_loss.clone())?,
+                        scalar_value(loss_output.shallow_ctc_loss.clone())?,
+                        scalar_value(loss_output.ce_loss.clone())?,
+                        scalar_value(loss_output.boundary_loss.clone())?,
+                    ];
                     let grads = GradientsParams::from_grads(loss_output.loss.backward(), &model);
                     accumulator.accumulate::<B>(&model, grads);
                     accumulated_batches += 1;
                 }
+                last_train_loss = Some(metric_values[0]);
                 let pending_micro_batches = accumulated_batches;
                 let (next_model, lr) = maybe_step_accumulated::<B, EnhancedParaformerV2<B>, _>(
                     model,
@@ -2469,6 +2550,16 @@ where
                     )?;
                 }
             } else {
+                let loss_output =
+                    enhanced_paraformer_loss_for_batch(&model, &batches[0], config, device, true);
+                let metric_values = [
+                    scalar_value(loss_output.loss.clone())?,
+                    scalar_value(loss_output.ctc_loss.clone())?,
+                    scalar_value(loss_output.shallow_ctc_loss.clone())?,
+                    scalar_value(loss_output.ce_loss.clone())?,
+                    scalar_value(loss_output.boundary_loss.clone())?,
+                ];
+                last_train_loss = Some(metric_values[0]);
                 global_step += 1;
                 if global_step == 1 || global_step % config.log_every == 0 {
                     println!(
@@ -2984,6 +3075,7 @@ fn decode_validation_batch<B: Backend>(
         bail!("blank_id {blank_id} is outside vocab size {vocab_size}");
     }
     let values = logits_or_log_probs
+        .cast(FloatDType::F32)
         .into_data()
         .to_vec::<f32>()
         .context("failed to read validation logits")?;
@@ -4990,6 +5082,7 @@ fn resolve_path(base_dir: &Path, value: &str) -> PathBuf {
 
 fn scalar_value<B: Backend>(tensor: Tensor<B, 1>) -> Result<f32> {
     let values = tensor
+        .cast(FloatDType::F32)
         .into_data()
         .to_vec::<f32>()
         .context("failed to read scalar loss")?;
@@ -5177,6 +5270,12 @@ impl<'a> RunLogger<'a> {
         .with_context(|| {
             format!(
                 "failed to write structured log {}",
+                structured_log_path(self.config).display()
+            )
+        })?;
+        self.file.flush().with_context(|| {
+            format!(
+                "failed to flush structured log {}",
                 structured_log_path(self.config).display()
             )
         })
