@@ -47,7 +47,7 @@ burn-optim = { version = "0.21.0-pre.3", default-features = false, features = ["
 burn-wgpu = { version = "0.21.0-pre.3", default-features = false, features = ["std"], optional = true }
 clap = { version = "4.6.1", features = ["derive"] }
 crossterm = "0.29"
-cubecl = { version = "0.10.0-pre.4", default-features = false, features = ["std"], optional = true }
+cubecl = { version = "=0.10.0-pre.3", default-features = false, features = ["std"], optional = true }
 env_logger = "0.11"
 half = { version = "2.7", default-features = false }
 kenlm-rs = { version = "0.1.0" }
