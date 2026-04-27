@@ -30,6 +30,7 @@ mod kotlin;
 pub mod model;
 #[cfg(feature = "nodejs")]
 mod nodejs;
+pub mod paraformer;
 #[cfg(feature = "python")]
 mod python;
 #[cfg(feature = "ruby")]
@@ -40,6 +41,8 @@ pub mod squeezeformer;
 #[cfg(feature = "swift")]
 mod swift;
 pub mod tokenizer;
+pub mod wav2vec;
+pub mod zipformer;
 
 #[derive(Clone, Debug, Default)]
 pub struct TranscriptionConfig {
