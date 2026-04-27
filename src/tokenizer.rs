@@ -12,14 +12,16 @@ pub fn load_sentencepiece_transcript_tokenizer(path: &Path) -> Result<SentencePi
     load_sentencepiece_tokenizer_with_bos(path, false)
 }
 
+pub fn sentencepiece_vocab_size(path: &Path) -> Result<usize> {
+    let model = load_sentencepiece_model(path)?;
+    Ok(model.pieces.len())
+}
+
 fn load_sentencepiece_tokenizer_with_bos(
     path: &Path,
     include_bos: bool,
 ) -> Result<SentencePieceTokenizer> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("failed to read tokenizer model {}", path.display()))?;
-    let model = SentencePieceModel::decode(bytes.as_slice())
-        .with_context(|| format!("failed to parse SentencePiece model {}", path.display()))?;
+    let model = load_sentencepiece_model(path)?;
 
     let mut tokens = Vec::with_capacity(model.pieces.len());
     let mut scores = Vec::with_capacity(model.pieces.len());
@@ -38,6 +40,13 @@ fn load_sentencepiece_tokenizer_with_bos(
 
     SentencePieceTokenizer::new(tokens, scores, bos_token_id, eos_token_id)
         .context("failed to create Splintr SentencePiece tokenizer")
+}
+
+fn load_sentencepiece_model(path: &Path) -> Result<SentencePieceModel> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed to read tokenizer model {}", path.display()))?;
+    SentencePieceModel::decode(bytes.as_slice())
+        .with_context(|| format!("failed to parse SentencePiece model {}", path.display()))
 }
 
 #[derive(Clone, PartialEq, Message)]

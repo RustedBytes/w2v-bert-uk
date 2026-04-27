@@ -19,6 +19,7 @@ use polars::prelude::{
 use serde_json::{Value, json};
 use w2v_bert_uk::audio::{FeatureExtractorConfig, WaveformAugmentConfig};
 use w2v_bert_uk::paraformer::ParaformerAlignmentMode;
+use w2v_bert_uk::tokenizer::sentencepiece_vocab_size;
 use w2v_bert_uk::train::{
     AdaptiveBatchConfig, AdaptiveBatchUnit, BurnTrainConfig, FeatureExtractionProgress,
     SpecAugmentConfig, TrainArchitecture, TrainBackendKind, TrainPrecision,
@@ -591,6 +592,8 @@ fn run_training(args: RunArgs) -> Result<()> {
     let step_schedule_requested = args.lr_warmup_steps.is_some()
         || args.lr_hold_steps.is_some()
         || args.lr_decay_steps.is_some();
+    let vocab_size = resolve_training_vocab_size(&args)?;
+    let tokenizer_path = args.tokenizer.clone();
     let config = BurnTrainConfig {
         architecture,
         train_manifest,
@@ -598,9 +601,7 @@ fn run_training(args: RunArgs) -> Result<()> {
         output_dir: args.output_dir,
         variant: args.variant,
         input_dim: args.input_dim,
-        vocab_size: args
-            .vocab_size
-            .ok_or_else(|| anyhow!("--vocab-size is required for model training"))?,
+        vocab_size,
         blank_id: args.blank_id,
         d_model: args.d_model,
         num_layers: args.num_layers,
@@ -655,7 +656,7 @@ fn run_training(args: RunArgs) -> Result<()> {
         max_train_samples: args.max_train_samples,
         max_val_samples: args.max_val_samples,
         max_audio_duration_ms: duration_sec_to_ms(args.max_audio_duration_sec)?,
-        tokenizer_path: args.tokenizer,
+        tokenizer_path,
         val_beam_width: args.val_beam_width,
         val_n_best: args.val_n_best.unwrap_or(args.val_beam_width),
         val_lm_path: args.val_lm_path,
@@ -710,6 +711,17 @@ fn resolve_device_indices(args: &RunArgs) -> Vec<usize> {
     } else {
         args.device_indices.clone()
     }
+}
+
+fn resolve_training_vocab_size(args: &RunArgs) -> Result<usize> {
+    if let Some(vocab_size) = args.vocab_size {
+        return Ok(vocab_size);
+    }
+    let tokenizer = args.tokenizer.as_ref().ok_or_else(|| {
+        anyhow!("--vocab-size is required unless --tokenizer is provided for auto-detection")
+    })?;
+    sentencepiece_vocab_size(tokenizer)
+        .with_context(|| format!("failed to infer --vocab-size from {}", tokenizer.display()))
 }
 
 fn resolve_precision(args: &RunArgs) -> TrainPrecision {

@@ -302,7 +302,7 @@ frontend. For Parquet feature rows, the features are used directly.
 
 | Argument | Required | Description |
 | --- | --- | --- |
-| `--vocab-size <N>` | Yes | Vocabulary size including the blank token. |
+| `--vocab-size <N>` | Yes, unless `--tokenizer` | Vocabulary size including the blank token. When omitted, it is inferred from `--tokenizer`. |
 | `--train-manifest <PATH>` | Yes, unless `--manifest-dir` | File, folder, Parquet folder, or raw-audio folder. |
 | `--val-manifest <PATH>` | No | Validation file or folder. Aliases: `--validation-manifest`, `--valid-manifest`, `--validation-set`, `--val-set`. |
 | `--manifest-dir <DIR>` | Alternative | Directory containing `train.jsonl` and optional validation manifest. |
@@ -414,7 +414,7 @@ The trainer uses AdamW.
 | `--val-manifest <PATH>` | unset | Validation dataset. |
 | `--validate-every-steps <N>` | unset | Run validation every N optimizer steps. Epoch-end validation also runs when validation data exists. |
 | `--max-val-samples <N>` | unset | Limit validation samples. |
-| `--tokenizer <PATH>` | unset | SentencePiece tokenizer for transcript-to-token conversion and CER/WER text decoding. |
+| `--tokenizer <PATH>` | unset | SentencePiece tokenizer for transcript-to-token conversion, CER/WER text decoding, and automatic `--vocab-size` inference. |
 | `--val-beam-width <N>` | `1` | CTC beam width. `1` means greedy. |
 | `--val-n-best <N>` | `--val-beam-width` | Number of hypotheses to keep before optional LM reranking. |
 | `--val-lm-path <PATH>` | unset | KenLM model for validation decoding. Requires `--tokenizer`. |
@@ -474,6 +474,11 @@ Inside the process, those visible GPUs are addressed as `0,1`.
 | `--log-every <N>` | `10` | Log every N optimizer steps. |
 | `--dry-run` | false | Forward/loss only; skip optimizer updates. Useful for smoke tests. |
 | `--max-train-samples <N>` | unset | Limit training samples. Useful for smoke tests. |
+
+When using `--init-from` with your own tokenizer, set `--tokenizer` to that
+SentencePiece model. If its vocabulary size differs from the warm-start
+checkpoint, compatible encoder weights are loaded and incompatible output-head
+tensors are skipped.
 | `--tui` | false | Open a live terminal UI showing batch extraction/loading, throughput, training loss, and validation metrics. |
 | `--hf-upload-checkpoints` | false | Upload `checkpoint_latest/` and `checkpoint_latest.json` after each checkpoint save. |
 | `--hf-upload-repo-id <ID>` | unset | Hugging Face model repository for checkpoint uploads. Required with `--hf-upload-checkpoints`. |
