@@ -35,7 +35,7 @@ burn-wgpu-backend = ["dep:burn-wgpu"]
 
 [dependencies]
 anyhow = "1.0"
-asr-features = { version = "0.1.1", features = ["frontend"] }
+asr-features = { version = "0.1.2", features = ["frontend"] }
 burn = { package = "burn-core", version = "0.21.0-pre.3", default-features = false, features = ["std"] }
 burn-autodiff = { version = "0.21.0-pre.3", default-features = false, features = ["std"] }
 burn-cuda = { version = "0.21.0-pre.3", default-features = false, features = ["std"], optional = true }

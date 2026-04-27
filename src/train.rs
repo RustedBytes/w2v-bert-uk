@@ -26,9 +26,9 @@ use serde_json::{Value, json};
 use splintr::SentencePieceTokenizer;
 
 use crate::audio::{
-    AudioDecodeConfig, WaveformAugmentConfig, audio_bytes_to_w2v_bert_features_with_augmentation,
-    audio_bytes_to_w2v_bert_features_with_config,
-    audio_file_to_w2v_bert_features_with_augmentation, audio_file_to_w2v_bert_features_with_config,
+    AudioDecodeConfig, FeatureExtractorConfig, WaveformAugmentConfig,
+    audio_bytes_to_features_with_augmentation, audio_bytes_to_features_with_config,
+    audio_file_to_features_with_augmentation, audio_file_to_features_with_config,
 };
 use crate::ctc::{CtcCandidate, threaded_ctc_beam_search_decode_n_best};
 use crate::paraformer::{
@@ -1654,6 +1654,7 @@ where
             config.tokenizer_path.clone(),
             dataset_index_path(config, "train"),
             config.waveform_augment,
+            feature_extractor_for_architecture(config),
         )?;
         while let Some(batch) = train_batches.next_batch()? {
             let batches = if !config.dry_run && devices.len() > 1 {
@@ -1895,6 +1896,7 @@ where
         config.tokenizer_path.clone(),
         dataset_index_path(config, "val"),
         WaveformAugmentConfig::default(),
+        feature_extractor_for_architecture(config),
     )?;
     while let Some(batch) = batches.next_batch()? {
         let (logits_or_log_probs, output_lengths) =
@@ -1992,6 +1994,7 @@ where
             config.tokenizer_path.clone(),
             dataset_index_path(config, "train"),
             config.waveform_augment,
+            feature_extractor_for_architecture(config),
         )?;
         while let Some(batch) = train_batches.next_batch()? {
             let batches = if !config.dry_run && devices.len() > 1 {
@@ -2265,6 +2268,7 @@ where
         config.tokenizer_path.clone(),
         dataset_index_path(config, "val"),
         WaveformAugmentConfig::default(),
+        feature_extractor_for_architecture(config),
     )?;
     while let Some(batch) = batches.next_batch()? {
         let output = paraformer_loss_for_batch(model, &batch, config, device, false);
@@ -2355,6 +2359,7 @@ where
             config.tokenizer_path.clone(),
             dataset_index_path(config, "train"),
             config.waveform_augment,
+            feature_extractor_for_architecture(config),
         )?;
         while let Some(batch) = train_batches.next_batch()? {
             let batches = if !config.dry_run && devices.len() > 1 {
@@ -2641,6 +2646,7 @@ where
         config.tokenizer_path.clone(),
         dataset_index_path(config, "val"),
         WaveformAugmentConfig::default(),
+        feature_extractor_for_architecture(config),
     )?;
     while let Some(batch) = batches.next_batch()? {
         let output = enhanced_paraformer_loss_for_batch(model, &batch, config, device, false);
@@ -3153,6 +3159,7 @@ where
         config.tokenizer_path.clone(),
         None,
         WaveformAugmentConfig::default(),
+        feature_extractor_for_architecture(config),
     )?;
     let mut decoded_samples = 0usize;
     while let Some(batch) = batches.next_batch()? {
@@ -3273,7 +3280,7 @@ pub struct StreamingBatchLoader {
     limit: Option<usize>,
     tokenizer: Option<SentencePieceTokenizer>,
     audio_decode: AudioDecodeConfig,
-    audio_frontend: asr_features::W2vBertFrontendConfig,
+    audio_frontend: FeatureExtractorConfig,
     waveform_augment: WaveformAugmentConfig,
     pending: Option<FeatureRecord>,
     raw_pending: VecDeque<RawManifestLine>,
@@ -3311,6 +3318,7 @@ impl StreamingBatchLoader {
         tokenizer_path: Option<PathBuf>,
         index_path: Option<PathBuf>,
         waveform_augment: WaveformAugmentConfig,
+        audio_frontend: FeatureExtractorConfig,
     ) -> Result<Self> {
         if batch_size == 0 {
             bail!("batch_size must be > 0");
@@ -3348,7 +3356,7 @@ impl StreamingBatchLoader {
             limit,
             tokenizer,
             audio_decode: AudioDecodeConfig::default(),
-            audio_frontend: W2vBertEncoderConfig::default().to_frontend_config(),
+            audio_frontend,
             waveform_augment,
             pending: None,
             raw_pending: VecDeque::new(),
@@ -3565,7 +3573,7 @@ impl RawManifestLine {
         &self,
         tokenizer: Option<&SentencePieceTokenizer>,
         audio_decode: &AudioDecodeConfig,
-        audio_frontend: &asr_features::W2vBertFrontendConfig,
+        audio_frontend: &FeatureExtractorConfig,
         waveform_augment: WaveformAugmentConfig,
     ) -> Result<FeatureRecord> {
         if is_parquet_file(&self.manifest_path) {
@@ -3640,7 +3648,7 @@ impl FeatureRecordMetadata {
         &self,
         tokenizer: Option<&SentencePieceTokenizer>,
         audio_decode: &AudioDecodeConfig,
-        audio_frontend: &asr_features::W2vBertFrontendConfig,
+        audio_frontend: &FeatureExtractorConfig,
         waveform_augment: WaveformAugmentConfig,
     ) -> Result<FeatureRecord> {
         if is_parquet_file(&self.manifest_path) {
@@ -4017,7 +4025,7 @@ fn parse_parquet_record(
     base_dir: &Path,
     tokenizer: Option<&SentencePieceTokenizer>,
     audio_decode: &AudioDecodeConfig,
-    audio_frontend: &asr_features::W2vBertFrontendConfig,
+    audio_frontend: &FeatureExtractorConfig,
     waveform_augment: WaveformAugmentConfig,
 ) -> Result<FeatureRecord> {
     let df = read_parquet_dataframe(path)?;
@@ -4057,7 +4065,7 @@ fn parse_parquet_record(
 
     if let Some((bytes, hint)) = parquet_optional_audio_bytes(&df, row)? {
         let audio = if waveform_augment.is_enabled() {
-            audio_bytes_to_w2v_bert_features_with_augmentation(
+            audio_bytes_to_features_with_augmentation(
                 bytes,
                 hint.as_deref(),
                 audio_decode,
@@ -4065,7 +4073,7 @@ fn parse_parquet_record(
                 waveform_augment,
             )?
         } else {
-            audio_bytes_to_w2v_bert_features_with_config(
+            audio_bytes_to_features_with_config(
                 bytes,
                 hint.as_deref(),
                 audio_decode,
@@ -4087,14 +4095,14 @@ fn parse_parquet_record(
     {
         let audio_path = resolve_path(base_dir, &audio_path);
         let audio = if waveform_augment.is_enabled() {
-            audio_file_to_w2v_bert_features_with_augmentation(
+            audio_file_to_features_with_augmentation(
                 audio_path,
                 audio_decode,
                 audio_frontend,
                 waveform_augment,
             )?
         } else {
-            audio_file_to_w2v_bert_features_with_config(audio_path, audio_decode, audio_frontend)?
+            audio_file_to_features_with_config(audio_path, audio_decode, audio_frontend)?
         };
         return Ok(FeatureRecord {
             id,
@@ -4416,7 +4424,7 @@ fn parse_raw_audio_record(
     base_dir: &Path,
     tokenizer: Option<&SentencePieceTokenizer>,
     audio_decode: &AudioDecodeConfig,
-    audio_frontend: &asr_features::W2vBertFrontendConfig,
+    audio_frontend: &FeatureExtractorConfig,
     waveform_augment: WaveformAugmentConfig,
 ) -> Result<FeatureRecord> {
     let id = raw_audio_id(path, base_dir);
@@ -4433,14 +4441,14 @@ fn parse_raw_audio_record(
         )?,
     };
     let audio = if waveform_augment.is_enabled() {
-        audio_file_to_w2v_bert_features_with_augmentation(
+        audio_file_to_features_with_augmentation(
             path,
             audio_decode,
             audio_frontend,
             waveform_augment,
         )?
     } else {
-        audio_file_to_w2v_bert_features_with_config(path, audio_decode, audio_frontend)?
+        audio_file_to_features_with_config(path, audio_decode, audio_frontend)?
     };
     Ok(FeatureRecord {
         id,
@@ -4544,7 +4552,7 @@ fn load_manifest_file(path: &Path, limit: Option<usize>) -> Result<Vec<FeatureRe
             records.push(raw.parse_record(
                 None,
                 &AudioDecodeConfig::default(),
-                &W2vBertEncoderConfig::default().to_frontend_config(),
+                &default_training_feature_extractor(),
                 WaveformAugmentConfig::default(),
             )?);
         }
@@ -4557,7 +4565,7 @@ fn load_manifest_file(path: &Path, limit: Option<usize>) -> Result<Vec<FeatureRe
             path.parent().unwrap_or_else(|| Path::new(".")),
             None,
             &AudioDecodeConfig::default(),
-            &W2vBertEncoderConfig::default().to_frontend_config(),
+            &default_training_feature_extractor(),
             WaveformAugmentConfig::default(),
         )?]);
     }
@@ -4579,7 +4587,7 @@ fn load_manifest_file(path: &Path, limit: Option<usize>) -> Result<Vec<FeatureRe
                 line_index + 1,
                 None,
                 &AudioDecodeConfig::default(),
-                &W2vBertEncoderConfig::default().to_frontend_config(),
+                &default_training_feature_extractor(),
                 WaveformAugmentConfig::default(),
             )?
         } else {
@@ -4603,7 +4611,7 @@ fn parse_json_record(
     line_number: usize,
     tokenizer: Option<&SentencePieceTokenizer>,
     audio_decode: &AudioDecodeConfig,
-    audio_frontend: &asr_features::W2vBertFrontendConfig,
+    audio_frontend: &FeatureExtractorConfig,
     waveform_augment: WaveformAugmentConfig,
 ) -> Result<FeatureRecord> {
     let value: Value = serde_json::from_str(line)
@@ -4677,14 +4685,14 @@ fn parse_json_record(
         })?;
     let audio_path = resolve_path(base_dir, audio_path);
     let audio = if waveform_augment.is_enabled() {
-        audio_file_to_w2v_bert_features_with_augmentation(
+        audio_file_to_features_with_augmentation(
             audio_path,
             audio_decode,
             audio_frontend,
             waveform_augment,
         )?
     } else {
-        audio_file_to_w2v_bert_features_with_config(audio_path, audio_decode, audio_frontend)?
+        audio_file_to_features_with_config(audio_path, audio_decode, audio_frontend)?
     };
     Ok(FeatureRecord {
         id,
@@ -5174,6 +5182,27 @@ fn architecture_name(architecture: &TrainArchitecture) -> &'static str {
         TrainArchitecture::Paraformer => "paraformer",
         TrainArchitecture::Wav2VecBert => "w2v_bert",
     }
+}
+
+fn feature_extractor_for_architecture(config: &BurnTrainConfig) -> FeatureExtractorConfig {
+    match config.architecture {
+        TrainArchitecture::Zipformer => {
+            FeatureExtractorConfig::Audio(asr_features::zipformer_frontend_config())
+        }
+        TrainArchitecture::Squeezeformer => {
+            FeatureExtractorConfig::Audio(asr_features::squeezeformer_frontend_config())
+        }
+        TrainArchitecture::Paraformer => {
+            FeatureExtractorConfig::Audio(asr_features::paraformer_frontend_config())
+        }
+        TrainArchitecture::Wav2VecBert => {
+            FeatureExtractorConfig::W2vBert(W2vBertEncoderConfig::default().to_frontend_config())
+        }
+    }
+}
+
+fn default_training_feature_extractor() -> FeatureExtractorConfig {
+    FeatureExtractorConfig::W2vBert(W2vBertEncoderConfig::default().to_frontend_config())
 }
 
 fn adaptive_batch_json(config: &BurnTrainConfig) -> Option<Value> {
@@ -5871,7 +5900,7 @@ mod tests {
             1,
             None,
             &AudioDecodeConfig::default(),
-            &W2vBertEncoderConfig::default().to_frontend_config(),
+            &default_training_feature_extractor(),
             WaveformAugmentConfig::default(),
         )
         .unwrap();
@@ -5881,6 +5910,52 @@ mod tests {
         assert!(record.rows > 0);
         assert!(record.cols > 0);
         assert_eq!(record.features.len(), record.rows * record.cols);
+    }
+
+    #[test]
+    fn architecture_selects_matching_feature_extractor() {
+        let squeezeformer = BurnTrainConfig {
+            architecture: TrainArchitecture::Squeezeformer,
+            ..BurnTrainConfig::default()
+        };
+        let zipformer = BurnTrainConfig {
+            architecture: TrainArchitecture::Zipformer,
+            ..BurnTrainConfig::default()
+        };
+        let paraformer = BurnTrainConfig {
+            architecture: TrainArchitecture::Paraformer,
+            ..BurnTrainConfig::default()
+        };
+        let wav2vec = BurnTrainConfig {
+            architecture: TrainArchitecture::Wav2VecBert,
+            ..BurnTrainConfig::default()
+        };
+
+        assert_eq!(
+            feature_extractor_for_architecture(&squeezeformer).feature_dim(),
+            80
+        );
+        assert_eq!(
+            feature_extractor_for_architecture(&zipformer).feature_dim(),
+            80
+        );
+        assert_eq!(
+            feature_extractor_for_architecture(&paraformer).feature_dim(),
+            80
+        );
+        let FeatureExtractorConfig::Audio(paraformer_config) =
+            feature_extractor_for_architecture(&paraformer)
+        else {
+            panic!("paraformer should use audio frontend features");
+        };
+        assert_eq!(
+            paraformer_config.preemphasis,
+            asr_features::paraformer_frontend_config().preemphasis
+        );
+        assert_eq!(
+            feature_extractor_for_architecture(&wav2vec).feature_dim(),
+            160
+        );
     }
 
     #[test]
@@ -5911,6 +5986,7 @@ mod tests {
             None,
             None,
             WaveformAugmentConfig::default(),
+            default_training_feature_extractor(),
         )
         .unwrap();
         let batch = loader.next_batch().unwrap().unwrap();
@@ -6224,6 +6300,7 @@ mod tests {
             None,
             None,
             WaveformAugmentConfig::default(),
+            default_training_feature_extractor(),
         )
         .unwrap();
 
@@ -6266,6 +6343,7 @@ mod tests {
             None,
             None,
             WaveformAugmentConfig::default(),
+            default_training_feature_extractor(),
         )
         .unwrap();
 
@@ -6304,6 +6382,7 @@ mod tests {
             None,
             Some(index_path.clone()),
             WaveformAugmentConfig::default(),
+            default_training_feature_extractor(),
         )
         .unwrap();
         let first = first_loader.next_batch().unwrap().unwrap();
@@ -6321,6 +6400,7 @@ mod tests {
             None,
             Some(index_path),
             WaveformAugmentConfig::default(),
+            default_training_feature_extractor(),
         )
         .unwrap();
         let second = second_loader.next_batch().unwrap().unwrap();

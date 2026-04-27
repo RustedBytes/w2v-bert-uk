@@ -220,9 +220,9 @@ dependencies = [
 
 [[package]]
 name = "asr-features"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18b5a26e154eac4efc97473834910c57008ab7c6eec656365a11dd324d5c166e"
+checksum = "c745b1fcbf8cb1d456f51c3ae77dc9e5ce09285be4b13755f35eb2ee8d4db382"
 dependencies = [
  "anyhow",
  "audioadapter-buffers",

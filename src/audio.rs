@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use asr_features::{
-    FeatureMatrix, extract_w2v_bert_features_from_samples, w2v_bert_frontend_config,
+    AudioFrontendConfig, FeatureMatrix, W2vBertFrontendConfig, extract_audio_features_from_samples,
+    extract_w2v_bert_features_from_samples, w2v_bert_frontend_config,
 };
 use rand::Rng;
 use symphonia::core::audio::{AudioBufferRef, SampleBuffer};
@@ -40,6 +41,21 @@ pub struct AudioFeatures {
     pub feature_elapsed: Duration,
 }
 
+#[derive(Clone, Debug)]
+pub enum FeatureExtractorConfig {
+    Audio(AudioFrontendConfig),
+    W2vBert(W2vBertFrontendConfig),
+}
+
+impl FeatureExtractorConfig {
+    pub fn feature_dim(&self) -> usize {
+        match self {
+            Self::Audio(config) => config.n_mels,
+            Self::W2vBert(config) => config.feature_dim,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WaveformAugmentConfig {
     pub gain_min_db: Option<f32>,
@@ -72,9 +88,21 @@ pub fn audio_file_to_w2v_bert_features_with_config(
     decode_config: &AudioDecodeConfig,
     frontend_config: &asr_features::W2vBertFrontendConfig,
 ) -> Result<AudioFeatures> {
+    audio_file_to_features_with_config(
+        path,
+        decode_config,
+        &FeatureExtractorConfig::W2vBert(frontend_config.clone()),
+    )
+}
+
+pub fn audio_file_to_features_with_config(
+    path: impl AsRef<Path>,
+    decode_config: &AudioDecodeConfig,
+    frontend_config: &FeatureExtractorConfig,
+) -> Result<AudioFeatures> {
     let decode_start = Instant::now();
     let (samples, sample_rate) = decode_audio_file_to_mono_f32(path.as_ref(), decode_config)?;
-    samples_to_w2v_bert_features(samples, sample_rate, decode_start, frontend_config)
+    samples_to_features(samples, sample_rate, decode_start, frontend_config)
 }
 
 pub fn audio_file_to_w2v_bert_features_with_augmentation(
@@ -83,10 +111,24 @@ pub fn audio_file_to_w2v_bert_features_with_augmentation(
     frontend_config: &asr_features::W2vBertFrontendConfig,
     augment: WaveformAugmentConfig,
 ) -> Result<AudioFeatures> {
+    audio_file_to_features_with_augmentation(
+        path,
+        decode_config,
+        &FeatureExtractorConfig::W2vBert(frontend_config.clone()),
+        augment,
+    )
+}
+
+pub fn audio_file_to_features_with_augmentation(
+    path: impl AsRef<Path>,
+    decode_config: &AudioDecodeConfig,
+    frontend_config: &FeatureExtractorConfig,
+    augment: WaveformAugmentConfig,
+) -> Result<AudioFeatures> {
     let decode_start = Instant::now();
     let (mut samples, sample_rate) = decode_audio_file_to_mono_f32(path.as_ref(), decode_config)?;
     apply_waveform_augmentation(&mut samples, augment);
-    samples_to_w2v_bert_features(samples, sample_rate, decode_start, frontend_config)
+    samples_to_features(samples, sample_rate, decode_start, frontend_config)
 }
 
 pub fn audio_bytes_to_w2v_bert_features(
@@ -107,10 +149,24 @@ pub fn audio_bytes_to_w2v_bert_features_with_config(
     decode_config: &AudioDecodeConfig,
     frontend_config: &asr_features::W2vBertFrontendConfig,
 ) -> Result<AudioFeatures> {
+    audio_bytes_to_features_with_config(
+        audio_bytes,
+        format_hint,
+        decode_config,
+        &FeatureExtractorConfig::W2vBert(frontend_config.clone()),
+    )
+}
+
+pub fn audio_bytes_to_features_with_config(
+    audio_bytes: impl Into<Vec<u8>>,
+    format_hint: Option<&str>,
+    decode_config: &AudioDecodeConfig,
+    frontend_config: &FeatureExtractorConfig,
+) -> Result<AudioFeatures> {
     let decode_start = Instant::now();
     let (samples, sample_rate) =
         decode_audio_bytes_to_mono_f32(audio_bytes.into(), format_hint, decode_config)?;
-    samples_to_w2v_bert_features(samples, sample_rate, decode_start, frontend_config)
+    samples_to_features(samples, sample_rate, decode_start, frontend_config)
 }
 
 pub fn audio_bytes_to_w2v_bert_features_with_augmentation(
@@ -120,25 +176,49 @@ pub fn audio_bytes_to_w2v_bert_features_with_augmentation(
     frontend_config: &asr_features::W2vBertFrontendConfig,
     augment: WaveformAugmentConfig,
 ) -> Result<AudioFeatures> {
+    audio_bytes_to_features_with_augmentation(
+        audio_bytes,
+        format_hint,
+        decode_config,
+        &FeatureExtractorConfig::W2vBert(frontend_config.clone()),
+        augment,
+    )
+}
+
+pub fn audio_bytes_to_features_with_augmentation(
+    audio_bytes: impl Into<Vec<u8>>,
+    format_hint: Option<&str>,
+    decode_config: &AudioDecodeConfig,
+    frontend_config: &FeatureExtractorConfig,
+    augment: WaveformAugmentConfig,
+) -> Result<AudioFeatures> {
     let decode_start = Instant::now();
     let (mut samples, sample_rate) =
         decode_audio_bytes_to_mono_f32(audio_bytes.into(), format_hint, decode_config)?;
     apply_waveform_augmentation(&mut samples, augment);
-    samples_to_w2v_bert_features(samples, sample_rate, decode_start, frontend_config)
+    samples_to_features(samples, sample_rate, decode_start, frontend_config)
 }
 
-fn samples_to_w2v_bert_features(
+fn samples_to_features(
     samples: Vec<f32>,
     sample_rate: u32,
     decode_start: Instant,
-    frontend_config: &asr_features::W2vBertFrontendConfig,
+    frontend_config: &FeatureExtractorConfig,
 ) -> Result<AudioFeatures> {
     let decode_elapsed = decode_start.elapsed();
     let sample_count = samples.len();
 
     let feature_start = Instant::now();
-    let features = extract_w2v_bert_features_from_samples(&samples, sample_rate, frontend_config)
-        .context("failed to extract W2V-BERT features")?;
+    let features = match frontend_config {
+        FeatureExtractorConfig::Audio(config) => {
+            extract_audio_features_from_samples(&samples, sample_rate, config)
+                .context("failed to extract audio features")?
+        }
+        FeatureExtractorConfig::W2vBert(config) => {
+            extract_w2v_bert_features_from_samples(&samples, sample_rate, config)
+                .context("failed to extract W2V-BERT features")?
+        }
+    };
 
     Ok(AudioFeatures {
         features,
