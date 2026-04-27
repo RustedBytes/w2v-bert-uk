@@ -94,13 +94,16 @@ mod bench {
     use super::{Args, BenchBackend};
     use crate::cubecl_kernels;
     use anyhow::{Result, bail};
-    use burn::tensor::{Int, Tensor, backend::Backend};
+    use burn::tensor::activation::sigmoid;
+    use burn::tensor::ops::PadMode;
+    use burn::tensor::{Bool, Int, Tensor, TensorData, backend::Backend};
     use std::time::{Duration, Instant};
 
     struct BenchCase {
         name: &'static str,
         elements: usize,
-        elapsed: Duration,
+        standard_elapsed: Duration,
+        kernel_elapsed: Duration,
     }
 
     pub fn run(args: Args) -> Result<()> {
@@ -184,21 +187,27 @@ mod bench {
                 [$args.batch, $args.seq_len, $args.channels],
                 $device,
             );
-            cases.push(run_case::<$backend_type, _>(
+            cases.push(run_comparison_case::<$backend_type, _, _>(
                 "swoosh_l",
                 $args.iters,
                 $args.warmup,
                 $args.batch * $args.seq_len * $args.channels,
                 || {
+                    let _ = standard_swoosh_l(activation.clone());
+                },
+                || {
                     let _ = cubecl_kernels::swoosh_l(activation.clone());
                 },
                 $device,
             )?);
-            cases.push(run_case::<$backend_type, _>(
+            cases.push(run_comparison_case::<$backend_type, _, _>(
                 "swoosh_r",
                 $args.iters,
                 $args.warmup,
                 $args.batch * $args.seq_len * $args.channels,
+                || {
+                    let _ = standard_swoosh_r(activation.clone());
+                },
                 || {
                     let _ = cubecl_kernels::swoosh_r(activation.clone());
                 },
@@ -210,22 +219,28 @@ mod bench {
                 [$args.batch, $args.heads, $args.seq_len, rel_pos_len],
                 $device,
             );
-            cases.push(run_case::<$backend_type, _>(
+            cases.push(run_comparison_case::<$backend_type, _, _>(
                 "relative_shift",
                 $args.iters,
                 $args.warmup,
                 $args.batch * $args.heads * $args.seq_len * $args.seq_len,
+                || {
+                    let _ = standard_relative_shift(rel.clone(), $args.seq_len);
+                },
                 || {
                     let _ = cubecl_kernels::relative_shift(rel.clone(), $args.seq_len);
                 },
                 $device,
             )?);
 
-            cases.push(run_case::<$backend_type, _>(
+            cases.push(run_comparison_case::<$backend_type, _, _>(
                 "mask_time",
                 $args.iters,
                 $args.warmup,
                 $args.batch * $args.seq_len * $args.channels,
+                || {
+                    let _ = standard_mask_time(activation.clone(), &lengths);
+                },
                 || {
                     let _ = cubecl_kernels::mask_time(activation.clone(), &lengths);
                 },
@@ -236,22 +251,28 @@ mod bench {
                 [$args.batch, $args.channels, $args.seq_len],
                 $device,
             );
-            cases.push(run_case::<$backend_type, _>(
+            cases.push(run_comparison_case::<$backend_type, _, _>(
                 "mask_channel_time",
                 $args.iters,
                 $args.warmup,
                 $args.batch * $args.channels * $args.seq_len,
+                || {
+                    let _ = standard_mask_channel_time(channel_time.clone(), &lengths);
+                },
                 || {
                     let _ = cubecl_kernels::mask_channel_time(channel_time.clone(), &lengths);
                 },
                 $device,
             )?);
 
-            cases.push(run_case::<$backend_type, _>(
+            cases.push(run_comparison_case::<$backend_type, _, _>(
                 "sequence_mask",
                 $args.iters,
                 $args.warmup,
                 $args.batch * $args.seq_len,
+                || {
+                    let _ = standard_sequence_mask::<$backend_type>(&lengths, $args.seq_len, $device);
+                },
                 || {
                     let _ = cubecl_kernels::sequence_mask_with_lengths(
                         lengths_tensor.clone(),
@@ -261,11 +282,14 @@ mod bench {
                 $device,
             )?);
 
-            cases.push(run_case::<$backend_type, _>(
+            cases.push(run_comparison_case::<$backend_type, _, _>(
                 "padding_mask",
                 $args.iters,
                 $args.warmup,
                 $args.batch * $args.seq_len,
+                || {
+                    let _ = standard_padding_mask::<$backend_type>(&lengths, $args.seq_len, $device);
+                },
                 || {
                     let _ = cubecl_kernels::padding_mask_with_lengths(
                         lengths_tensor.clone(),
@@ -275,11 +299,18 @@ mod bench {
                 $device,
             )?);
 
-            cases.push(run_case::<$backend_type, _>(
+            cases.push(run_comparison_case::<$backend_type, _, _>(
                 "attention_mask",
                 $args.iters,
                 $args.warmup,
                 $args.batch * $args.seq_len * $args.seq_len,
+                || {
+                    let _ = standard_attention_mask::<$backend_type>(
+                        &lengths,
+                        $args.seq_len,
+                        $device,
+                    );
+                },
                 || {
                     let _ = cubecl_kernels::attention_mask_with_lengths(
                         lengths_tensor.clone(),
@@ -294,11 +325,14 @@ mod bench {
                 [$args.batch, $args.seq_len, $args.channels * 2],
                 $device,
             );
-            cases.push(run_case::<$backend_type, _>(
+            cases.push(run_comparison_case::<$backend_type, _, _>(
                 "glu_last_dim",
                 $args.iters,
                 $args.warmup,
                 $args.batch * $args.seq_len * $args.channels,
+                || {
+                    let _ = standard_glu_last_dim(glu_last.clone());
+                },
                 || {
                     let _ = cubecl_kernels::glu_last_dim(glu_last.clone());
                 },
@@ -309,11 +343,14 @@ mod bench {
                 [$args.batch, $args.channels * 2, $args.seq_len],
                 $device,
             );
-            cases.push(run_case::<$backend_type, _>(
+            cases.push(run_comparison_case::<$backend_type, _, _>(
                 "glu_channel_dim",
                 $args.iters,
                 $args.warmup,
                 $args.batch * $args.channels * $args.seq_len,
+                || {
+                    let _ = standard_glu_channel_dim(glu_channel.clone());
+                },
                 || {
                     let _ = cubecl_kernels::glu_channel_dim(glu_channel.clone());
                 },
@@ -327,51 +364,160 @@ mod bench {
 
     use run_backend_body;
 
-    fn run_case<B, F>(
+    fn run_comparison_case<B, Standard, Kernel>(
         name: &'static str,
         iters: usize,
         warmup: usize,
         elements: usize,
-        mut f: F,
+        mut standard: Standard,
+        mut kernel: Kernel,
         device: &B::Device,
     ) -> Result<BenchCase>
     where
         B: Backend,
-        F: FnMut(),
+        Standard: FnMut(),
+        Kernel: FnMut(),
     {
         for _ in 0..warmup {
-            f();
+            standard();
+        }
+        B::sync(device)?;
+        for _ in 0..warmup {
+            kernel();
         }
         B::sync(device)?;
 
-        let start = Instant::now();
+        let standard_start = Instant::now();
         for _ in 0..iters {
-            f();
+            standard();
         }
         B::sync(device)?;
+        let standard_elapsed = standard_start.elapsed();
+
+        let kernel_start = Instant::now();
+        for _ in 0..iters {
+            kernel();
+        }
+        B::sync(device)?;
+        let kernel_elapsed = kernel_start.elapsed();
 
         Ok(BenchCase {
             name,
             elements,
-            elapsed: start.elapsed(),
+            standard_elapsed,
+            kernel_elapsed,
         })
     }
 
     fn print_results(cases: &[BenchCase], iters: usize) {
         println!();
         println!(
-            "{:<24} {:>14} {:>14} {:>14}",
-            "kernel", "avg_us", "elems/iter", "melems/s"
+            "{:<24} {:>14} {:>14} {:>10} {:>14} {:>14}",
+            "kernel", "standard_us", "cubecl_us", "speedup", "elems/iter", "cubecl_me/s"
         );
         for case in cases {
-            let avg = case.elapsed.as_secs_f64() * 1_000_000.0 / iters as f64;
-            let melems =
-                case.elements as f64 * iters as f64 / case.elapsed.as_secs_f64() / 1_000_000.0;
+            let standard_avg = case.standard_elapsed.as_secs_f64() * 1_000_000.0 / iters as f64;
+            let kernel_avg = case.kernel_elapsed.as_secs_f64() * 1_000_000.0 / iters as f64;
+            let speedup = standard_avg / kernel_avg;
+            let melems = case.elements as f64 * iters as f64
+                / case.kernel_elapsed.as_secs_f64()
+                / 1_000_000.0;
             println!(
-                "{:<24} {:>14.3} {:>14} {:>14.3}",
-                case.name, avg, case.elements, melems
+                "{:<24} {:>14.3} {:>14.3} {:>9.2}x {:>14} {:>14.3}",
+                case.name, standard_avg, kernel_avg, speedup, case.elements, melems
             );
         }
+    }
+
+    fn standard_swoosh_l<B: Backend, const D: usize>(input: Tensor<B, D>) -> Tensor<B, D> {
+        input.clone() * sigmoid(input - 4.0)
+    }
+
+    fn standard_swoosh_r<B: Backend, const D: usize>(input: Tensor<B, D>) -> Tensor<B, D> {
+        input.clone() * sigmoid(input - 1.0)
+    }
+
+    fn standard_relative_shift<B: Backend>(input: Tensor<B, 4>, seq_len: usize) -> Tensor<B, 4> {
+        let [batch_size, n_heads, _, pos_len] = input.dims();
+        let padded = input.pad([(0, 0), (0, 1)], PadMode::Constant(0.0));
+        padded
+            .reshape([batch_size, n_heads, pos_len + 1, seq_len])
+            .slice_dim(2, 1..pos_len + 1)
+            .reshape([batch_size, n_heads, seq_len, pos_len])
+            .slice_dim(3, 0..seq_len)
+    }
+
+    fn standard_sequence_mask<B: Backend>(
+        lengths: &[usize],
+        max_len: usize,
+        device: &B::Device,
+    ) -> Tensor<B, 2, Bool> {
+        let mut values = Vec::with_capacity(lengths.len() * max_len);
+        for length in lengths {
+            for index in 0..max_len {
+                values.push(index < *length);
+            }
+        }
+        Tensor::from_data(TensorData::new(values, [lengths.len(), max_len]), device)
+    }
+
+    fn standard_padding_mask<B: Backend>(
+        lengths: &[usize],
+        max_len: usize,
+        device: &B::Device,
+    ) -> Tensor<B, 2, Bool> {
+        let mut values = Vec::with_capacity(lengths.len() * max_len);
+        for length in lengths {
+            for index in 0..max_len {
+                values.push(index >= *length);
+            }
+        }
+        Tensor::from_data(TensorData::new(values, [lengths.len(), max_len]), device)
+    }
+
+    fn standard_attention_mask<B: Backend>(
+        lengths: &[usize],
+        max_len: usize,
+        device: &B::Device,
+    ) -> Tensor<B, 3, Bool> {
+        let mask = standard_sequence_mask::<B>(lengths, max_len, device);
+        mask.clone()
+            .unsqueeze_dim::<3>(1)
+            .repeat_dim(1, max_len)
+            .bool_and(mask.unsqueeze_dim::<3>(2).repeat_dim(2, max_len))
+    }
+
+    fn standard_mask_time<B: Backend>(input: Tensor<B, 3>, lengths: &[usize]) -> Tensor<B, 3> {
+        let [_, seq_len, _] = input.dims();
+        let mask = standard_sequence_mask::<B>(lengths, seq_len, &input.device())
+            .float()
+            .unsqueeze_dim::<3>(2);
+        input * mask
+    }
+
+    fn standard_mask_channel_time<B: Backend>(
+        input: Tensor<B, 3>,
+        lengths: &[usize],
+    ) -> Tensor<B, 3> {
+        let [_, _, seq_len] = input.dims();
+        let mask = standard_sequence_mask::<B>(lengths, seq_len, &input.device())
+            .float()
+            .unsqueeze_dim::<3>(1);
+        input * mask
+    }
+
+    fn standard_glu_last_dim<B: Backend>(input: Tensor<B, 3>) -> Tensor<B, 3> {
+        let mut chunks = input.chunk(2, 2);
+        let gate = chunks.remove(1);
+        let value = chunks.remove(0);
+        value * sigmoid(gate)
+    }
+
+    fn standard_glu_channel_dim<B: Backend>(input: Tensor<B, 3>) -> Tensor<B, 3> {
+        let mut chunks = input.chunk(2, 1);
+        let gate = chunks.remove(1);
+        let value = chunks.remove(0);
+        value * sigmoid(gate)
     }
 
     fn lengths(batch: usize, seq_len: usize) -> Vec<usize> {
