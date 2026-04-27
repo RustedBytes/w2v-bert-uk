@@ -53,7 +53,7 @@
 - [x] Add feature extraction from audio.
 - [x] Add tokenizer-driven transcript-to-token conversion.
 - [x] Add dataset cache/index support.
-- [ ] Add SpecAugment and waveform augmentation.
+- [x] Add SpecAugment and waveform augmentation.
 
 ## Validation And Inference
 

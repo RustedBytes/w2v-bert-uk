@@ -19,10 +19,14 @@ use burn_optim::{
     adaptor::OptimizerAdaptor, grad_clipping::GradientClippingConfig,
 };
 use kenlm::{Config as KenlmConfig, Model as KenlmModel};
+use rand::Rng;
 use serde_json::{Value, json};
 use splintr::SentencePieceTokenizer;
 
-use crate::audio::{AudioDecodeConfig, audio_file_to_w2v_bert_features_with_config};
+use crate::audio::{
+    AudioDecodeConfig, WaveformAugmentConfig, audio_file_to_w2v_bert_features_with_augmentation,
+    audio_file_to_w2v_bert_features_with_config,
+};
 use crate::ctc::{CtcCandidate, threaded_ctc_beam_search_decode_n_best};
 use crate::paraformer::{
     EnhancedParaformerV2, EnhancedParaformerV2Config, ParaformerAlignmentMode, ParaformerV2,
@@ -114,6 +118,8 @@ pub struct BurnTrainConfig {
     pub sort_by_length_desc: bool,
     pub sort_buffer_size: usize,
     pub dataset_index_dir: Option<PathBuf>,
+    pub spec_augment: SpecAugmentConfig,
+    pub waveform_augment: WaveformAugmentConfig,
     pub epochs: usize,
     pub learning_rate: f64,
     pub lr_warmup_steps: usize,
@@ -171,6 +177,8 @@ impl Default for BurnTrainConfig {
             sort_by_length_desc: false,
             sort_buffer_size: 4096,
             dataset_index_dir: None,
+            spec_augment: SpecAugmentConfig::default(),
+            waveform_augment: WaveformAugmentConfig::default(),
             epochs: 10,
             learning_rate: 1.0e-3,
             lr_warmup_steps: 0,
@@ -238,6 +246,21 @@ pub struct AdaptiveBatchConfig {
     pub unit: AdaptiveBatchUnit,
     pub budget: usize,
     pub max_samples: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SpecAugmentConfig {
+    pub time_masks: usize,
+    pub time_mask_max_frames: usize,
+    pub frequency_masks: usize,
+    pub frequency_mask_max_bins: usize,
+}
+
+impl SpecAugmentConfig {
+    fn is_enabled(&self) -> bool {
+        (self.time_masks > 0 && self.time_mask_max_frames > 0)
+            || (self.frequency_masks > 0 && self.frequency_mask_max_bins > 0)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1627,6 +1650,7 @@ where
             config.max_train_samples,
             config.tokenizer_path.clone(),
             dataset_index_path(config, "train"),
+            config.waveform_augment,
         )?;
         while let Some(batch) = train_batches.next_batch()? {
             let batches = if !config.dry_run && devices.len() > 1 {
@@ -1637,7 +1661,7 @@ where
             let step_started = Instant::now();
             let batch_diagnostics = BatchDiagnostics::from_batches(&batches);
 
-            let loss = ctc_loss_for_batch::<B, M>(&model, &batches[0], config.blank_id, device);
+            let loss = ctc_loss_for_batch::<B, M>(&model, &batches[0], config, device);
             let mut loss_value = scalar_value(loss.clone())?;
             last_train_loss = Some(loss_value);
 
@@ -1653,7 +1677,7 @@ where
                             let loss = ctc_loss_for_batch::<B, M>(
                                 local_model,
                                 batch,
-                                config.blank_id,
+                                config,
                                 local_device,
                             );
                             let loss_value = scalar_value(loss.clone())?;
@@ -1867,6 +1891,7 @@ where
         config.max_val_samples,
         config.tokenizer_path.clone(),
         dataset_index_path(config, "val"),
+        WaveformAugmentConfig::default(),
     )?;
     while let Some(batch) = batches.next_batch()? {
         let (logits_or_log_probs, output_lengths) =
@@ -1963,6 +1988,7 @@ where
             config.max_train_samples,
             config.tokenizer_path.clone(),
             dataset_index_path(config, "train"),
+            config.waveform_augment,
         )?;
         while let Some(batch) = train_batches.next_batch()? {
             let batches = if !config.dry_run && devices.len() > 1 {
@@ -1973,7 +1999,7 @@ where
             let step_started = Instant::now();
             let batch_diagnostics = BatchDiagnostics::from_batches(&batches);
 
-            let loss_output = paraformer_loss_for_batch(&model, &batches[0], config, device);
+            let loss_output = paraformer_loss_for_batch(&model, &batches[0], config, device, true);
             let loss_value = scalar_value(loss_output.loss.clone())?;
             let mut metric_values = [
                 loss_value,
@@ -1991,8 +2017,13 @@ where
                         active_devices,
                         device,
                         &|local_model, batch, local_device| {
-                            let loss_output =
-                                paraformer_loss_for_batch(local_model, batch, config, local_device);
+                            let loss_output = paraformer_loss_for_batch(
+                                local_model,
+                                batch,
+                                config,
+                                local_device,
+                                true,
+                            );
                             let metrics = [
                                 scalar_value(loss_output.loss.clone())?,
                                 scalar_value(loss_output.ctc_loss.clone())?,
@@ -2230,9 +2261,10 @@ where
         config.max_val_samples,
         config.tokenizer_path.clone(),
         dataset_index_path(config, "val"),
+        WaveformAugmentConfig::default(),
     )?;
     while let Some(batch) = batches.next_batch()? {
-        let output = paraformer_loss_for_batch(model, &batch, config, device);
+        let output = paraformer_loss_for_batch(model, &batch, config, device, false);
         total += f64::from(scalar_value(output.loss)?);
         let predictions = decode_validation_batch(
             output.output.ctc_log_probs,
@@ -2319,6 +2351,7 @@ where
             config.max_train_samples,
             config.tokenizer_path.clone(),
             dataset_index_path(config, "train"),
+            config.waveform_augment,
         )?;
         while let Some(batch) = train_batches.next_batch()? {
             let batches = if !config.dry_run && devices.len() > 1 {
@@ -2330,7 +2363,7 @@ where
             let batch_diagnostics = BatchDiagnostics::from_batches(&batches);
 
             let loss_output =
-                enhanced_paraformer_loss_for_batch(&model, &batches[0], config, device);
+                enhanced_paraformer_loss_for_batch(&model, &batches[0], config, device, true);
             let mut metric_values = [
                 scalar_value(loss_output.loss.clone())?,
                 scalar_value(loss_output.ctc_loss.clone())?,
@@ -2355,6 +2388,7 @@ where
                                     batch,
                                     config,
                                     local_device,
+                                    true,
                                 );
                                 let metrics = [
                                     scalar_value(loss_output.loss.clone())?,
@@ -2603,9 +2637,10 @@ where
         config.max_val_samples,
         config.tokenizer_path.clone(),
         dataset_index_path(config, "val"),
+        WaveformAugmentConfig::default(),
     )?;
     while let Some(batch) = batches.next_batch()? {
-        let output = enhanced_paraformer_loss_for_batch(model, &batch, config, device);
+        let output = enhanced_paraformer_loss_for_batch(model, &batch, config, device, false);
         total += f64::from(scalar_value(output.loss)?);
         let predictions = decode_validation_batch(
             output.output.ctc_log_probs,
@@ -2634,13 +2669,14 @@ fn paraformer_loss_for_batch<B>(
     batch: &TrainBatch,
     config: &BurnTrainConfig,
     device: &B::Device,
+    augment: bool,
 ) -> crate::paraformer::ParaformerLossOutput<B>
 where
     B: AutodiffBackend,
 {
     let features = Tensor::<B, 3>::from_data(
         TensorData::new(
-            batch.features.clone(),
+            batch_features_values(batch, augment.then_some(config.spec_augment)),
             [batch.batch_size, batch.max_frames, batch.feature_dim],
         ),
         device,
@@ -2668,13 +2704,14 @@ fn enhanced_paraformer_loss_for_batch<B>(
     batch: &TrainBatch,
     config: &BurnTrainConfig,
     device: &B::Device,
+    augment: bool,
 ) -> crate::paraformer::EnhancedParaformerLossOutput<B>
 where
     B: AutodiffBackend,
 {
     let features = Tensor::<B, 3>::from_data(
         TensorData::new(
-            batch.features.clone(),
+            batch_features_values(batch, augment.then_some(config.spec_augment)),
             [batch.batch_size, batch.max_frames, batch.feature_dim],
         ),
         device,
@@ -2700,15 +2737,23 @@ where
 fn ctc_loss_for_batch<B, M>(
     model: &M,
     batch: &TrainBatch,
-    blank_id: usize,
+    config: &BurnTrainConfig,
     device: &B::Device,
 ) -> Tensor<B, 1>
 where
     B: AutodiffBackend,
     M: TrainableCtc<B>,
 {
-    let (logits_or_log_probs, output_lengths) = ctc_logits_for_batch(model, batch, device);
-    ctc_loss_from_logits(logits_or_log_probs, output_lengths, batch, blank_id, device)
+    let features = batch_features_tensor_with_augment(batch, device, Some(config.spec_augment));
+    let (logits_or_log_probs, output_lengths) =
+        model.ctc_logits(features, batch.feature_lengths.clone());
+    ctc_loss_from_logits(
+        logits_or_log_probs,
+        output_lengths,
+        batch,
+        config.blank_id,
+        device,
+    )
 }
 
 fn ctc_logits_for_batch<B, M>(
@@ -2725,13 +2770,58 @@ where
 }
 
 fn batch_features_tensor<B: Backend>(batch: &TrainBatch, device: &B::Device) -> Tensor<B, 3> {
+    batch_features_tensor_with_augment(batch, device, None)
+}
+
+fn batch_features_tensor_with_augment<B: Backend>(
+    batch: &TrainBatch,
+    device: &B::Device,
+    spec_augment: Option<SpecAugmentConfig>,
+) -> Tensor<B, 3> {
     Tensor::<B, 3>::from_data(
         TensorData::new(
-            batch.features.clone(),
+            batch_features_values(batch, spec_augment),
             [batch.batch_size, batch.max_frames, batch.feature_dim],
         ),
         device,
     )
+}
+
+fn batch_features_values(batch: &TrainBatch, spec_augment: Option<SpecAugmentConfig>) -> Vec<f32> {
+    let mut features = batch.features.clone();
+    if let Some(config) = spec_augment.filter(SpecAugmentConfig::is_enabled) {
+        apply_spec_augment(&mut features, batch, config);
+    }
+    features
+}
+
+fn apply_spec_augment(features: &mut [f32], batch: &TrainBatch, config: SpecAugmentConfig) {
+    let mut rng = rand::rng();
+    for sample_index in 0..batch.batch_size {
+        let length = batch.feature_lengths[sample_index].min(batch.max_frames);
+        for _ in 0..config.time_masks {
+            if length == 0 || config.time_mask_max_frames == 0 {
+                continue;
+            }
+            let width = rng.random_range(1..=config.time_mask_max_frames.min(length));
+            let start = rng.random_range(0..=length - width);
+            for frame in start..start + width {
+                let offset = (sample_index * batch.max_frames + frame) * batch.feature_dim;
+                features[offset..offset + batch.feature_dim].fill(0.0);
+            }
+        }
+        for _ in 0..config.frequency_masks {
+            if batch.feature_dim == 0 || config.frequency_mask_max_bins == 0 {
+                continue;
+            }
+            let width = rng.random_range(1..=config.frequency_mask_max_bins.min(batch.feature_dim));
+            let start = rng.random_range(0..=batch.feature_dim - width);
+            for frame in 0..length {
+                let offset = (sample_index * batch.max_frames + frame) * batch.feature_dim + start;
+                features[offset..offset + width].fill(0.0);
+            }
+        }
+    }
 }
 
 fn ctc_loss_from_logits<B: AutodiffBackend>(
@@ -3059,6 +3149,7 @@ where
         config.max_train_samples,
         config.tokenizer_path.clone(),
         None,
+        WaveformAugmentConfig::default(),
     )?;
     let mut decoded_samples = 0usize;
     while let Some(batch) = batches.next_batch()? {
@@ -3180,6 +3271,7 @@ pub struct StreamingBatchLoader {
     tokenizer: Option<SentencePieceTokenizer>,
     audio_decode: AudioDecodeConfig,
     audio_frontend: asr_features::W2vBertFrontendConfig,
+    waveform_augment: WaveformAugmentConfig,
     pending: Option<FeatureRecord>,
     sort_buffer: Vec<FeatureRecordMetadata>,
     index_records: Vec<FeatureRecordMetadata>,
@@ -3214,6 +3306,7 @@ impl StreamingBatchLoader {
         limit: Option<usize>,
         tokenizer_path: Option<PathBuf>,
         index_path: Option<PathBuf>,
+        waveform_augment: WaveformAugmentConfig,
     ) -> Result<Self> {
         if batch_size == 0 {
             bail!("batch_size must be > 0");
@@ -3252,6 +3345,7 @@ impl StreamingBatchLoader {
             tokenizer,
             audio_decode: AudioDecodeConfig::default(),
             audio_frontend: W2vBertEncoderConfig::default().to_frontend_config(),
+            waveform_augment,
             pending: None,
             sort_buffer: Vec::new(),
             index_records,
@@ -3346,6 +3440,7 @@ impl StreamingBatchLoader {
                     self.tokenizer.as_ref(),
                     &self.audio_decode,
                     &self.audio_frontend,
+                    self.waveform_augment,
                 )
                 .map(Some)
         }
@@ -3362,6 +3457,7 @@ impl StreamingBatchLoader {
                 self.tokenizer.as_ref(),
                 &self.audio_decode,
                 &self.audio_frontend,
+                self.waveform_augment,
             )
             .map(Some)
     }
@@ -3373,6 +3469,7 @@ impl StreamingBatchLoader {
                     self.tokenizer.as_ref(),
                     &self.audio_decode,
                     &self.audio_frontend,
+                    self.waveform_augment,
                 )
             })
             .transpose()
@@ -3440,6 +3537,7 @@ impl RawManifestLine {
         tokenizer: Option<&SentencePieceTokenizer>,
         audio_decode: &AudioDecodeConfig,
         audio_frontend: &asr_features::W2vBertFrontendConfig,
+        waveform_augment: WaveformAugmentConfig,
     ) -> Result<FeatureRecord> {
         if self.line.starts_with('{') {
             parse_json_record(
@@ -3449,6 +3547,7 @@ impl RawManifestLine {
                 tokenizer,
                 audio_decode,
                 audio_frontend,
+                waveform_augment,
             )
         } else {
             parse_tsv_record(&self.line, &self.base_dir, self.line_number)
@@ -3478,6 +3577,7 @@ impl FeatureRecordMetadata {
         tokenizer: Option<&SentencePieceTokenizer>,
         audio_decode: &AudioDecodeConfig,
         audio_frontend: &asr_features::W2vBertFrontendConfig,
+        waveform_augment: WaveformAugmentConfig,
     ) -> Result<FeatureRecord> {
         let mut reader =
             BufReader::new(fs::File::open(&self.manifest_path).with_context(|| {
@@ -3499,6 +3599,7 @@ impl FeatureRecordMetadata {
                 tokenizer,
                 audio_decode,
                 audio_frontend,
+                waveform_augment,
             )
         } else {
             parse_tsv_record(line, &self.base_dir, self.line_number)
@@ -3774,6 +3875,7 @@ fn load_manifest_file(path: &Path, limit: Option<usize>) -> Result<Vec<FeatureRe
                 None,
                 &AudioDecodeConfig::default(),
                 &W2vBertEncoderConfig::default().to_frontend_config(),
+                WaveformAugmentConfig::default(),
             )?
         } else {
             parse_tsv_record(line, base_dir, line_index + 1)?
@@ -3797,6 +3899,7 @@ fn parse_json_record(
     tokenizer: Option<&SentencePieceTokenizer>,
     audio_decode: &AudioDecodeConfig,
     audio_frontend: &asr_features::W2vBertFrontendConfig,
+    waveform_augment: WaveformAugmentConfig,
 ) -> Result<FeatureRecord> {
     let value: Value = serde_json::from_str(line)
         .with_context(|| format!("invalid JSON manifest line {line_number}"))?;
@@ -3867,11 +3970,17 @@ fn parse_json_record(
         .ok_or_else(|| {
             anyhow!("record '{id}' is missing features, features_path, or audio_path")
         })?;
-    let audio = audio_file_to_w2v_bert_features_with_config(
-        resolve_path(base_dir, audio_path),
-        audio_decode,
-        audio_frontend,
-    )?;
+    let audio_path = resolve_path(base_dir, audio_path);
+    let audio = if waveform_augment.is_enabled() {
+        audio_file_to_w2v_bert_features_with_augmentation(
+            audio_path,
+            audio_decode,
+            audio_frontend,
+            waveform_augment,
+        )?
+    } else {
+        audio_file_to_w2v_bert_features_with_config(audio_path, audio_decode, audio_frontend)?
+    };
     Ok(FeatureRecord {
         id,
         rows: audio.features.rows,
@@ -4191,6 +4300,23 @@ fn validate_config(config: &BurnTrainConfig) -> Result<()> {
     if config.dataset_index_dir.is_some() && !config.sort_by_length_desc {
         bail!("dataset_index_dir requires sort_by_length_desc so cached row metadata is used");
     }
+    if config.spec_augment.time_masks > 0 && config.spec_augment.time_mask_max_frames == 0 {
+        bail!("spec_augment.time_mask_max_frames must be > 0 when time masks are enabled");
+    }
+    if config.spec_augment.frequency_masks > 0 && config.spec_augment.frequency_mask_max_bins == 0 {
+        bail!("spec_augment.frequency_mask_max_bins must be > 0 when frequency masks are enabled");
+    }
+    if config.waveform_augment.noise_std < 0.0 {
+        bail!("waveform_augment.noise_std must be >= 0");
+    }
+    if let (Some(min_gain), Some(max_gain)) = (
+        config.waveform_augment.gain_min_db,
+        config.waveform_augment.gain_max_db,
+    ) {
+        if min_gain > max_gain {
+            bail!("waveform_augment.gain_min_db must be <= gain_max_db");
+        }
+    }
     if config.epochs == 0 {
         bail!("epochs must be > 0");
     }
@@ -4360,6 +4486,23 @@ fn adaptive_batch_json(config: &BurnTrainConfig) -> Option<Value> {
     })
 }
 
+fn spec_augment_json(config: SpecAugmentConfig) -> Value {
+    json!({
+        "time_masks": config.time_masks,
+        "time_mask_max_frames": config.time_mask_max_frames,
+        "frequency_masks": config.frequency_masks,
+        "frequency_mask_max_bins": config.frequency_mask_max_bins,
+    })
+}
+
+fn waveform_augment_json(config: WaveformAugmentConfig) -> Value {
+    json!({
+        "gain_min_db": config.gain_min_db,
+        "gain_max_db": config.gain_max_db,
+        "noise_std": config.noise_std,
+    })
+}
+
 fn run_config_json(config: &BurnTrainConfig) -> Value {
     json!({
         "architecture": architecture_name(&config.architecture),
@@ -4377,6 +4520,8 @@ fn run_config_json(config: &BurnTrainConfig) -> Value {
         "sort_by_length_desc": config.sort_by_length_desc,
         "sort_buffer_size": config.sort_buffer_size,
         "dataset_index_dir": config.dataset_index_dir,
+        "spec_augment": spec_augment_json(config.spec_augment),
+        "waveform_augment": waveform_augment_json(config.waveform_augment),
         "epochs": config.epochs,
         "learning_rate": config.learning_rate,
         "lr_warmup_steps": config.lr_warmup_steps,
@@ -4501,6 +4646,8 @@ fn train_config_from_json(value: &Value) -> Result<BurnTrainConfig> {
     config.sort_buffer_size =
         json_usize(value, "sort_buffer_size").unwrap_or(config.sort_buffer_size);
     config.dataset_index_dir = json_path(value, "dataset_index_dir");
+    config.spec_augment = json_spec_augment(value);
+    config.waveform_augment = json_waveform_augment(value);
     config.epochs = json_usize(value, "epochs").unwrap_or(config.epochs);
     config.learning_rate = json_f64(value, "learning_rate").unwrap_or(config.learning_rate);
     config.lr_warmup_steps = json_usize(value, "lr_warmup_steps").unwrap_or(config.lr_warmup_steps);
@@ -4616,6 +4763,29 @@ fn json_adaptive_batch(value: &Value) -> Result<Option<AdaptiveBatchConfig>> {
         budget,
         max_samples,
     }))
+}
+
+fn json_spec_augment(value: &Value) -> SpecAugmentConfig {
+    let Some(augment) = value.get("spec_augment") else {
+        return SpecAugmentConfig::default();
+    };
+    SpecAugmentConfig {
+        time_masks: json_usize(augment, "time_masks").unwrap_or(0),
+        time_mask_max_frames: json_usize(augment, "time_mask_max_frames").unwrap_or(0),
+        frequency_masks: json_usize(augment, "frequency_masks").unwrap_or(0),
+        frequency_mask_max_bins: json_usize(augment, "frequency_mask_max_bins").unwrap_or(0),
+    }
+}
+
+fn json_waveform_augment(value: &Value) -> WaveformAugmentConfig {
+    let Some(augment) = value.get("waveform_augment") else {
+        return WaveformAugmentConfig::default();
+    };
+    WaveformAugmentConfig {
+        gain_min_db: json_f32(augment, "gain_min_db"),
+        gain_max_db: json_f32(augment, "gain_max_db"),
+        noise_std: json_f32(augment, "noise_std").unwrap_or(0.0),
+    }
 }
 
 fn save_training_checkpoint<B, M, O>(
@@ -4997,6 +5167,7 @@ mod tests {
             None,
             &AudioDecodeConfig::default(),
             &W2vBertEncoderConfig::default().to_frontend_config(),
+            WaveformAugmentConfig::default(),
         )
         .unwrap();
 
@@ -5174,6 +5345,68 @@ mod tests {
     }
 
     #[test]
+    fn spec_augment_masks_feature_values() {
+        let records = vec![FeatureRecord {
+            id: "utt".to_string(),
+            rows: 4,
+            cols: 3,
+            features: vec![1.0; 12],
+            tokens: vec![1],
+            text: None,
+        }];
+        let batch = make_batch(&records, 3).unwrap();
+        let mut features = batch.features.clone();
+
+        apply_spec_augment(
+            &mut features,
+            &batch,
+            SpecAugmentConfig {
+                time_masks: 1,
+                time_mask_max_frames: 4,
+                frequency_masks: 1,
+                frequency_mask_max_bins: 3,
+            },
+        );
+
+        assert!(features.iter().any(|value| *value == 0.0));
+    }
+
+    #[test]
+    fn augmentation_validation_rejects_invalid_values() {
+        let config = BurnTrainConfig {
+            spec_augment: SpecAugmentConfig {
+                time_masks: 1,
+                time_mask_max_frames: 0,
+                ..SpecAugmentConfig::default()
+            },
+            ..BurnTrainConfig::default()
+        };
+        let err = validate_config(&config).unwrap_err();
+        assert!(err.to_string().contains("time_mask_max_frames"));
+
+        let config = BurnTrainConfig {
+            waveform_augment: WaveformAugmentConfig {
+                noise_std: -0.1,
+                ..WaveformAugmentConfig::default()
+            },
+            ..BurnTrainConfig::default()
+        };
+        let err = validate_config(&config).unwrap_err();
+        assert!(err.to_string().contains("noise_std"));
+
+        let config = BurnTrainConfig {
+            waveform_augment: WaveformAugmentConfig {
+                gain_min_db: Some(3.0),
+                gain_max_db: Some(-3.0),
+                noise_std: 0.0,
+            },
+            ..BurnTrainConfig::default()
+        };
+        let err = validate_config(&config).unwrap_err();
+        assert!(err.to_string().contains("gain_min_db"));
+    }
+
+    #[test]
     fn manifest_directory_loads_jsonl_shards_in_order() {
         let dir = std::env::temp_dir().join(format!(
             "w2v_bert_uk_manifest_dir_test_{}",
@@ -5231,6 +5464,7 @@ mod tests {
             None,
             None,
             None,
+            WaveformAugmentConfig::default(),
         )
         .unwrap();
 
@@ -5272,6 +5506,7 @@ mod tests {
             None,
             None,
             None,
+            WaveformAugmentConfig::default(),
         )
         .unwrap();
 
@@ -5309,6 +5544,7 @@ mod tests {
             None,
             None,
             Some(index_path.clone()),
+            WaveformAugmentConfig::default(),
         )
         .unwrap();
         let first = first_loader.next_batch().unwrap().unwrap();
@@ -5325,6 +5561,7 @@ mod tests {
             None,
             None,
             Some(index_path),
+            WaveformAugmentConfig::default(),
         )
         .unwrap();
         let second = second_loader.next_batch().unwrap().unwrap();

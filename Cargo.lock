@@ -5406,6 +5406,7 @@ dependencies = [
  "prost",
  "pyo3",
  "pyo3-build-config",
+ "rand 0.9.4",
  "rayon",
  "rb-sys-build",
  "safetensors",

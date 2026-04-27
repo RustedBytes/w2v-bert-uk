@@ -7,6 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use asr_features::{
     FeatureMatrix, extract_w2v_bert_features_from_samples, w2v_bert_frontend_config,
 };
+use rand::Rng;
 use symphonia::core::audio::{AudioBufferRef, SampleBuffer};
 use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
@@ -39,6 +40,19 @@ pub struct AudioFeatures {
     pub feature_elapsed: Duration,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WaveformAugmentConfig {
+    pub gain_min_db: Option<f32>,
+    pub gain_max_db: Option<f32>,
+    pub noise_std: f32,
+}
+
+impl WaveformAugmentConfig {
+    pub fn is_enabled(&self) -> bool {
+        self.gain_min_db.is_some() || self.gain_max_db.is_some() || self.noise_std > 0.0
+    }
+}
+
 impl AudioFeatures {
     pub fn duration_seconds(&self) -> f64 {
         self.sample_count as f64 / self.sample_rate as f64
@@ -60,6 +74,18 @@ pub fn audio_file_to_w2v_bert_features_with_config(
 ) -> Result<AudioFeatures> {
     let decode_start = Instant::now();
     let (samples, sample_rate) = decode_audio_file_to_mono_f32(path.as_ref(), decode_config)?;
+    samples_to_w2v_bert_features(samples, sample_rate, decode_start, frontend_config)
+}
+
+pub fn audio_file_to_w2v_bert_features_with_augmentation(
+    path: impl AsRef<Path>,
+    decode_config: &AudioDecodeConfig,
+    frontend_config: &asr_features::W2vBertFrontendConfig,
+    augment: WaveformAugmentConfig,
+) -> Result<AudioFeatures> {
+    let decode_start = Instant::now();
+    let (mut samples, sample_rate) = decode_audio_file_to_mono_f32(path.as_ref(), decode_config)?;
+    apply_waveform_augmentation(&mut samples, augment);
     samples_to_w2v_bert_features(samples, sample_rate, decode_start, frontend_config)
 }
 
@@ -107,6 +133,29 @@ fn samples_to_w2v_bert_features(
         decode_elapsed,
         feature_elapsed: feature_start.elapsed(),
     })
+}
+
+fn apply_waveform_augmentation(samples: &mut [f32], config: WaveformAugmentConfig) {
+    if !config.is_enabled() || samples.is_empty() {
+        return;
+    }
+    let mut rng = rand::rng();
+    let min_gain = config.gain_min_db.unwrap_or(0.0);
+    let max_gain = config.gain_max_db.unwrap_or(min_gain);
+    let gain_db = if (max_gain - min_gain).abs() > f32::EPSILON {
+        rng.random_range(min_gain..=max_gain)
+    } else {
+        min_gain
+    };
+    let gain = 10.0_f32.powf(gain_db / 20.0);
+    for sample in samples.iter_mut() {
+        let noise = if config.noise_std > 0.0 {
+            rng.random_range(-config.noise_std..=config.noise_std)
+        } else {
+            0.0
+        };
+        *sample = (*sample * gain + noise).clamp(-1.0, 1.0);
+    }
 }
 
 fn decode_audio_file_to_mono_f32(

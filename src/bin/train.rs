@@ -3,10 +3,11 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use env_logger::Env;
+use w2v_bert_uk::audio::WaveformAugmentConfig;
 use w2v_bert_uk::paraformer::ParaformerAlignmentMode;
 use w2v_bert_uk::train::{
-    AdaptiveBatchConfig, AdaptiveBatchUnit, BurnTrainConfig, TrainArchitecture, TrainBackendKind,
-    TrainPrecision, run_burn_training,
+    AdaptiveBatchConfig, AdaptiveBatchUnit, BurnTrainConfig, SpecAugmentConfig, TrainArchitecture,
+    TrainBackendKind, TrainPrecision, run_burn_training,
 };
 
 #[derive(Parser)]
@@ -104,6 +105,34 @@ struct Args {
     /// Directory for reusable manifest offset/length indexes.
     #[arg(long)]
     dataset_index_dir: Option<PathBuf>,
+
+    /// Number of SpecAugment time masks per training batch.
+    #[arg(long, default_value_t = 0)]
+    spec_time_masks: usize,
+
+    /// Maximum SpecAugment time-mask width in frames.
+    #[arg(long, default_value_t = 0)]
+    spec_time_mask_max_frames: usize,
+
+    /// Number of SpecAugment frequency masks per training batch.
+    #[arg(long, default_value_t = 0)]
+    spec_freq_masks: usize,
+
+    /// Maximum SpecAugment frequency-mask width in feature bins.
+    #[arg(long, default_value_t = 0)]
+    spec_freq_mask_max_bins: usize,
+
+    /// Minimum random waveform gain in dB for audio_path records.
+    #[arg(long)]
+    waveform_gain_min_db: Option<f32>,
+
+    /// Maximum random waveform gain in dB for audio_path records.
+    #[arg(long)]
+    waveform_gain_max_db: Option<f32>,
+
+    /// Uniform waveform noise amplitude for audio_path records.
+    #[arg(long, default_value_t = 0.0)]
+    waveform_noise_std: f32,
 
     /// Number of epochs.
     #[arg(long, default_value_t = 10)]
@@ -316,6 +345,17 @@ fn main() -> Result<()> {
         sort_by_length_desc: args.sort_by_length_desc,
         sort_buffer_size: args.sort_buffer_size,
         dataset_index_dir: args.dataset_index_dir,
+        spec_augment: SpecAugmentConfig {
+            time_masks: args.spec_time_masks,
+            time_mask_max_frames: args.spec_time_mask_max_frames,
+            frequency_masks: args.spec_freq_masks,
+            frequency_mask_max_bins: args.spec_freq_mask_max_bins,
+        },
+        waveform_augment: WaveformAugmentConfig {
+            gain_min_db: args.waveform_gain_min_db,
+            gain_max_db: args.waveform_gain_max_db,
+            noise_std: args.waveform_noise_std,
+        },
         epochs: args.epochs,
         learning_rate: args.learning_rate,
         lr_warmup_steps: args.lr_warmup_steps,
