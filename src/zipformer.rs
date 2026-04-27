@@ -1,13 +1,9 @@
-use burn::module::Module;
-use burn::tensor::activation::{sigmoid, silu};
+use burn::module::{Initializer, Module, Param};
+use burn::tensor::activation::{sigmoid, silu, softmax, tanh};
 use burn::tensor::ops::PadMode;
 use burn::tensor::{Bool, Tensor, TensorData, backend::Backend};
-use burn_nn::attention::{MhaInput, MultiHeadAttention, MultiHeadAttentionConfig};
 use burn_nn::conv::{Conv1d, Conv1dConfig, Conv2d, Conv2dConfig};
-use burn_nn::{
-    Dropout, DropoutConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig, PaddingConfig1d,
-    PaddingConfig2d,
-};
+use burn_nn::{Dropout, DropoutConfig, Linear, LinearConfig, PaddingConfig1d, PaddingConfig2d};
 
 const DEFAULT_DOWNSAMPLING: [usize; 6] = [1, 2, 4, 8, 4, 2];
 const DEFAULT_ENCODER_DIM: [usize; 6] = [192, 256, 384, 512, 384, 256];
@@ -24,8 +20,12 @@ pub struct ZipformerConfig {
     pub encoder_dim: Vec<usize>,
     pub num_encoder_layers: Vec<usize>,
     pub num_heads: Vec<usize>,
+    pub query_head_dim: Vec<usize>,
+    pub value_head_dim: Vec<usize>,
+    pub pos_head_dim: Vec<usize>,
     pub feedforward_dim: Vec<usize>,
     pub cnn_module_kernel: Vec<usize>,
+    pub pos_dim: usize,
     pub dropout: f64,
 }
 
@@ -38,8 +38,12 @@ impl Default for ZipformerConfig {
             encoder_dim: DEFAULT_ENCODER_DIM.to_vec(),
             num_encoder_layers: DEFAULT_NUM_LAYERS.to_vec(),
             num_heads: DEFAULT_NUM_HEADS.to_vec(),
+            query_head_dim: vec![32],
+            value_head_dim: vec![12],
+            pos_head_dim: vec![4],
             feedforward_dim: DEFAULT_FEEDFORWARD_DIM.to_vec(),
             cnn_module_kernel: DEFAULT_CNN_KERNELS.to_vec(),
+            pos_dim: 48,
             dropout: 0.1,
         }
     }
@@ -59,14 +63,20 @@ impl ZipformerConfig {
                 encoder_dim: vec![64, 96, 128, 160, 128, 96],
                 num_encoder_layers: vec![1, 1, 1, 1, 1, 1],
                 num_heads: vec![4, 4, 4, 4, 4, 4],
+                query_head_dim: vec![16],
+                value_head_dim: vec![8],
                 feedforward_dim: vec![192, 256, 384, 512, 384, 256],
+                pos_dim: 24,
                 ..Self::default()
             }),
             "s" => Some(Self {
                 encoder_dim: vec![192, 256, 256, 256, 256, 256],
                 num_encoder_layers: vec![2, 2, 2, 2, 2, 2],
                 num_heads: vec![4, 4, 4, 8, 4, 4],
+                query_head_dim: vec![32],
+                value_head_dim: vec![12],
                 feedforward_dim: vec![512, 768, 768, 768, 768, 768],
+                pos_dim: 48,
                 ..Self::default()
             }),
             "m" | "sm" => Some(Self::default()),
@@ -74,7 +84,10 @@ impl ZipformerConfig {
                 encoder_dim: vec![192, 256, 512, 768, 512, 256],
                 num_encoder_layers: vec![2, 2, 4, 5, 4, 2],
                 num_heads: vec![4, 4, 4, 8, 4, 4],
+                query_head_dim: vec![32],
+                value_head_dim: vec![12],
                 feedforward_dim: vec![512, 768, 1536, 2048, 1536, 768],
+                pos_dim: 48,
                 ..Self::default()
             }),
             _ => None,
@@ -96,6 +109,9 @@ impl ZipformerConfig {
         assert_eq!(self.num_heads.len(), self.encoder_dim.len());
         assert_eq!(self.feedforward_dim.len(), self.encoder_dim.len());
         assert_eq!(self.cnn_module_kernel.len(), self.encoder_dim.len());
+        let query_head_dim = expand_stack_values(&self.query_head_dim, self.encoder_dim.len());
+        let value_head_dim = expand_stack_values(&self.value_head_dim, self.encoder_dim.len());
+        let pos_head_dim = expand_stack_values(&self.pos_head_dim, self.encoder_dim.len());
 
         let stacks = self
             .encoder_dim
@@ -106,8 +122,12 @@ impl ZipformerConfig {
                     dim: *dim,
                     num_layers: self.num_encoder_layers[index],
                     num_heads: self.num_heads[index],
+                    query_head_dim: query_head_dim[index],
+                    value_head_dim: value_head_dim[index],
+                    pos_head_dim: pos_head_dim[index],
                     feedforward_dim: self.feedforward_dim[index],
                     conv_kernel_size: self.cnn_module_kernel[index],
+                    pos_dim: self.pos_dim,
                     dropout: self.dropout,
                     downsample: self.downsampling_factor[index],
                 }
@@ -123,6 +143,440 @@ impl ZipformerConfig {
             output_downsample: PairwiseDownsample::new(self.output_downsampling_factor),
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct BiasNormConfig {
+    num_features: usize,
+    eps: f64,
+}
+
+impl BiasNormConfig {
+    fn new(num_features: usize) -> Self {
+        Self {
+            num_features,
+            eps: 1.0e-8,
+        }
+    }
+
+    fn init<B: Backend>(&self, device: &B::Device) -> BiasNorm<B> {
+        BiasNorm {
+            bias: Initializer::Zeros.init([self.num_features], device),
+            log_scale: Initializer::Zeros.init([1], device),
+            num_features: self.num_features,
+            eps: self.eps,
+        }
+    }
+}
+
+#[derive(Module, Debug)]
+struct BiasNorm<B: Backend> {
+    bias: Param<Tensor<B, 1>>,
+    log_scale: Param<Tensor<B, 1>>,
+    num_features: usize,
+    eps: f64,
+}
+
+impl<B: Backend> BiasNorm<B> {
+    fn forward<const D: usize>(&self, input: Tensor<B, D>) -> Tensor<B, D> {
+        let mut channel_shape = [1; D];
+        channel_shape[D - 1] = self.num_features;
+        let bias = self.bias.val().reshape(channel_shape);
+        let centered = input - bias;
+        let rms = (centered.clone() * centered.clone())
+            .mean_dim(D - 1)
+            .add_scalar(self.eps)
+            .sqrt();
+        let scale = self.log_scale.val().exp().reshape([1; D]);
+        (centered / rms) * scale
+    }
+}
+
+#[derive(Module, Debug, Clone)]
+struct ActivationBalancer {
+    min_positive: f64,
+    max_positive: f64,
+    sign_gain_factor: f64,
+    scale_gain_factor: f64,
+    min_abs: f64,
+    max_abs: f64,
+}
+
+impl ActivationBalancer {
+    fn new() -> Self {
+        Self {
+            min_positive: 0.05,
+            max_positive: 0.95,
+            sign_gain_factor: 0.01,
+            scale_gain_factor: 0.02,
+            min_abs: 0.2,
+            max_abs: 100.0,
+        }
+    }
+
+    fn with_positive_range(mut self, min_positive: f64, max_positive: f64) -> Self {
+        self.min_positive = min_positive;
+        self.max_positive = max_positive;
+        self
+    }
+
+    fn with_abs_range(mut self, min_abs: f64, max_abs: f64) -> Self {
+        self.min_abs = min_abs;
+        self.max_abs = max_abs;
+        self
+    }
+
+    fn forward<B: Backend, const D: usize>(&self, input: Tensor<B, D>) -> Tensor<B, D> {
+        // Burn 0.21.0-pre.3 does not expose a clean PyTorch-style custom backward hook
+        // for generic model code. Keep the forward value unchanged while attaching a
+        // differentiable penalty to the graph.
+        let abs_mean = input.clone().abs().mean();
+        let too_small = (Tensor::full([1], self.min_abs, &input.device()) - abs_mean.clone())
+            .clamp_min(0.0)
+            .powf_scalar(2.0);
+        let too_large = (abs_mean - self.max_abs).clamp_min(0.0).powf_scalar(2.0);
+
+        let positive_mean = input.clone().greater_elem(0.0).float().mean();
+        let too_negative = (Tensor::full([1], self.min_positive, &input.device())
+            - positive_mean.clone())
+        .clamp_min(0.0)
+        .powf_scalar(2.0);
+        let too_positive = (positive_mean - self.max_positive)
+            .clamp_min(0.0)
+            .powf_scalar(2.0);
+
+        let penalty = (too_small + too_large) * self.scale_gain_factor
+            + (too_negative + too_positive) * self.sign_gain_factor;
+        add_zero_forward_penalty(input, penalty)
+    }
+}
+
+#[derive(Module, Debug, Clone)]
+struct Whiten {
+    whitening_limit: f64,
+    grad_scale: f64,
+}
+
+impl Whiten {
+    fn new() -> Self {
+        Self {
+            whitening_limit: 5.0,
+            grad_scale: 0.01,
+        }
+    }
+
+    fn attention() -> Self {
+        Self {
+            whitening_limit: 2.0,
+            grad_scale: 0.025,
+        }
+    }
+
+    fn forward<B: Backend, const D: usize>(&self, input: Tensor<B, D>) -> Tensor<B, D> {
+        // This approximates Zipformer's custom whitening backward as a zero-forward
+        // regularizer. It is intentionally value-preserving during inference.
+        let centered = input.clone() - input.clone().mean_dim(D - 1);
+        let variance = (centered.clone() * centered.clone())
+            .mean_dim(D - 1)
+            .add_scalar(1.0e-6);
+        let normalized = centered / variance.sqrt();
+        let metric = normalized.powf_scalar(2.0).mean();
+        let penalty = (metric - self.whitening_limit)
+            .clamp_min(0.0)
+            .powf_scalar(2.0)
+            * self.grad_scale;
+        add_zero_forward_penalty(input, penalty)
+    }
+}
+
+fn add_zero_forward_penalty<B: Backend, const D: usize>(
+    input: Tensor<B, D>,
+    penalty: Tensor<B, 1>,
+) -> Tensor<B, D> {
+    let zero_forward = penalty.clone() - penalty.detach();
+    input + zero_forward.reshape([1; D])
+}
+
+#[derive(Module, Debug, Clone)]
+struct CompactRelPositionalEncoding {
+    embed_dim: usize,
+}
+
+impl CompactRelPositionalEncoding {
+    fn new(embed_dim: usize) -> Self {
+        assert!(embed_dim.is_multiple_of(2));
+        Self { embed_dim }
+    }
+
+    fn forward<B: Backend>(&self, sequence_length: usize, device: &B::Device) -> Tensor<B, 2> {
+        let pos_len = sequence_length.saturating_mul(2).saturating_sub(1);
+        let half = self.embed_dim / 2;
+        let compression_length = (self.embed_dim as f32).sqrt();
+        let length_scale = self.embed_dim as f32 / (2.0 * std::f32::consts::PI);
+        let mut values = Vec::with_capacity(pos_len * self.embed_dim);
+        for offset in 0..pos_len {
+            let position = offset as isize - sequence_length as isize + 1;
+            let abs_position = position.unsigned_abs() as f32;
+            let sign = if position < 0 {
+                -1.0
+            } else if position > 0 {
+                1.0
+            } else {
+                0.0
+            };
+            let compressed = compression_length
+                * sign
+                * ((abs_position + compression_length).ln() - compression_length.ln());
+            let angle = (compressed / length_scale).atan();
+            for channel in 0..half {
+                let frequency = (channel + 1) as f32;
+                values.push((angle * frequency).cos());
+                values.push((angle * frequency).sin());
+            }
+            if let Some(last) = values.last_mut() {
+                *last = 1.0;
+            }
+        }
+        Tensor::from_data(TensorData::new(values, [pos_len, self.embed_dim]), device)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MultiHeadAttentionWeightsConfig {
+    embed_dim: usize,
+    pos_dim: usize,
+    num_heads: usize,
+    query_head_dim: usize,
+    pos_head_dim: usize,
+    dropout: f64,
+}
+
+impl MultiHeadAttentionWeightsConfig {
+    fn init<B: Backend>(&self, device: &B::Device) -> MultiHeadAttentionWeights<B> {
+        MultiHeadAttentionWeights {
+            query_proj: LinearConfig::new(self.embed_dim, self.num_heads * self.query_head_dim)
+                .init(device),
+            key_proj: LinearConfig::new(self.embed_dim, self.num_heads * self.query_head_dim)
+                .init(device),
+            key_whiten: Whiten::attention(),
+            pos_query_proj: LinearConfig::new(self.embed_dim, self.num_heads * self.pos_head_dim)
+                .init(device),
+            pos_proj: LinearConfig::new(self.pos_dim, self.num_heads * self.pos_head_dim)
+                .init(device),
+            dropout: DropoutConfig::new(self.dropout).init(),
+            num_heads: self.num_heads,
+            query_head_dim: self.query_head_dim,
+            pos_head_dim: self.pos_head_dim,
+        }
+    }
+}
+
+#[derive(Module, Debug)]
+struct MultiHeadAttentionWeights<B: Backend> {
+    query_proj: Linear<B>,
+    key_proj: Linear<B>,
+    key_whiten: Whiten,
+    pos_query_proj: Linear<B>,
+    pos_proj: Linear<B>,
+    dropout: Dropout,
+    num_heads: usize,
+    query_head_dim: usize,
+    pos_head_dim: usize,
+}
+
+impl<B: Backend> MultiHeadAttentionWeights<B> {
+    fn forward(
+        &self,
+        input: Tensor<B, 3>,
+        pos_emb: Tensor<B, 2>,
+        mask: Tensor<B, 2, Bool>,
+    ) -> Tensor<B, 4> {
+        let [batch_size, seq_len, _] = input.dims();
+        let q = self
+            .query_proj
+            .forward(input.clone())
+            .reshape([batch_size, seq_len, self.num_heads, self.query_head_dim])
+            .swap_dims(1, 2);
+        let k = self
+            .key_whiten
+            .forward(self.key_proj.forward(input.clone()))
+            .reshape([batch_size, seq_len, self.num_heads, self.query_head_dim])
+            .swap_dims(1, 2);
+        let p_query = self
+            .pos_query_proj
+            .forward(input)
+            .reshape([batch_size, seq_len, self.num_heads, self.pos_head_dim])
+            .swap_dims(1, 2);
+
+        let content_scores = q.matmul(k.swap_dims(2, 3)) / (self.query_head_dim as f64).sqrt();
+        let rel = self
+            .pos_proj
+            .forward(pos_emb.unsqueeze_dim::<3>(0))
+            .reshape([1, seq_len * 2 - 1, self.num_heads, self.pos_head_dim])
+            .swap_dims(1, 2);
+        let pos_scores = relative_shift(p_query.matmul(rel.swap_dims(2, 3)), seq_len);
+        let mut scores = content_scores + pos_scores;
+
+        let expanded_key_mask = mask
+            .clone()
+            .unsqueeze_dim::<3>(1)
+            .unsqueeze_dim::<4>(2)
+            .repeat_dim(1, self.num_heads)
+            .repeat_dim(2, seq_len);
+        let negative = Tensor::full(
+            [batch_size, self.num_heads, seq_len, seq_len],
+            -1.0e4,
+            &scores.device(),
+        );
+        scores = scores.mask_where(expanded_key_mask.bool_not(), negative);
+        let mut attn = softmax(scores, 3);
+        let expanded_query_mask = mask
+            .unsqueeze_dim::<3>(1)
+            .unsqueeze_dim::<4>(3)
+            .repeat_dim(1, self.num_heads)
+            .repeat_dim(3, seq_len);
+        let zeros = Tensor::zeros(
+            [batch_size, self.num_heads, seq_len, seq_len],
+            &attn.device(),
+        );
+        attn = attn.mask_where(expanded_query_mask.bool_not(), zeros);
+        self.dropout.forward(attn)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SelfAttentionConfig {
+    embed_dim: usize,
+    num_heads: usize,
+    value_head_dim: usize,
+    dropout: f64,
+}
+
+impl SelfAttentionConfig {
+    fn new(embed_dim: usize, num_heads: usize, value_head_dim: usize, dropout: f64) -> Self {
+        Self {
+            embed_dim,
+            num_heads,
+            value_head_dim,
+            dropout,
+        }
+    }
+
+    fn init<B: Backend>(&self, device: &B::Device) -> SelfAttention<B> {
+        SelfAttention {
+            value_proj: LinearConfig::new(self.embed_dim, self.num_heads * self.value_head_dim)
+                .init(device),
+            value_whiten: Whiten::attention(),
+            output_proj: LinearConfig::new(self.num_heads * self.value_head_dim, self.embed_dim)
+                .init(device),
+            dropout: DropoutConfig::new(self.dropout).init(),
+            num_heads: self.num_heads,
+            value_head_dim: self.value_head_dim,
+        }
+    }
+}
+
+#[derive(Module, Debug)]
+struct SelfAttention<B: Backend> {
+    value_proj: Linear<B>,
+    value_whiten: Whiten,
+    output_proj: Linear<B>,
+    dropout: Dropout,
+    num_heads: usize,
+    value_head_dim: usize,
+}
+
+impl<B: Backend> SelfAttention<B> {
+    fn forward(&self, input: Tensor<B, 3>, attn_weights: Tensor<B, 4>) -> Tensor<B, 3> {
+        let [batch_size, seq_len, _] = input.dims();
+        let value = self
+            .value_whiten
+            .forward(self.value_proj.forward(input))
+            .reshape([batch_size, seq_len, self.num_heads, self.value_head_dim])
+            .swap_dims(1, 2);
+        let output = attn_weights.matmul(value).swap_dims(1, 2).reshape([
+            batch_size,
+            seq_len,
+            self.num_heads * self.value_head_dim,
+        ]);
+        self.dropout.forward(self.output_proj.forward(output))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct NonLinearAttentionConfig {
+    embed_dim: usize,
+    hidden_dim: usize,
+    dropout: f64,
+}
+
+impl NonLinearAttentionConfig {
+    fn new(embed_dim: usize, hidden_dim: usize, dropout: f64) -> Self {
+        Self {
+            embed_dim,
+            hidden_dim,
+            dropout,
+        }
+    }
+
+    fn init<B: Backend>(&self, device: &B::Device) -> NonLinearAttention<B> {
+        NonLinearAttention {
+            proj: LinearConfig::new(self.embed_dim, self.hidden_dim * 3).init(device),
+            output_proj: LinearConfig::new(self.hidden_dim, self.embed_dim).init(device),
+            dropout: DropoutConfig::new(self.dropout).init(),
+            hidden_dim: self.hidden_dim,
+        }
+    }
+}
+
+#[derive(Module, Debug)]
+struct NonLinearAttention<B: Backend> {
+    proj: Linear<B>,
+    output_proj: Linear<B>,
+    dropout: Dropout,
+    hidden_dim: usize,
+}
+
+impl<B: Backend> NonLinearAttention<B> {
+    fn forward(&self, input: Tensor<B, 3>, attn_weights: Tensor<B, 4>) -> Tensor<B, 3> {
+        let [batch_size, seq_len, _] = input.dims();
+        let projected = self.proj.forward(input);
+        let mut chunks = projected.chunk(3, 2);
+        let c = chunks.pop().unwrap();
+        let b = chunks.pop().unwrap();
+        let a = chunks.pop().unwrap();
+        let values = tanh(b) * c;
+        let weights = attn_weights.slice_dim(1, 0..1).squeeze::<3>();
+        let attended = weights.matmul(values);
+        let output = self.output_proj.forward((a * attended).reshape([
+            batch_size,
+            seq_len,
+            self.hidden_dim,
+        ]));
+        self.dropout.forward(output)
+    }
+}
+
+fn relative_shift<B: Backend>(input: Tensor<B, 4>, seq_len: usize) -> Tensor<B, 4> {
+    let [batch_size, n_heads, _, pos_len] = input.dims();
+    let padded = input.pad([(0, 0), (0, 1)], PadMode::Constant(0.0));
+    padded
+        .reshape([batch_size, n_heads, pos_len + 1, seq_len])
+        .slice_dim(2, 1..pos_len + 1)
+        .reshape([batch_size, n_heads, seq_len, pos_len])
+        .slice_dim(3, 0..seq_len)
+}
+
+fn output_bypass<B: Backend>(residual: Tensor<B, 3>, update: Tensor<B, 3>) -> Tensor<B, 3> {
+    residual.clone() + (update - residual) * 0.5
+}
+
+fn swoosh_l<B: Backend, const D: usize>(input: Tensor<B, D>) -> Tensor<B, D> {
+    input.clone() * sigmoid(input - 4.0)
+}
+
+fn swoosh_r<B: Backend, const D: usize>(input: Tensor<B, D>) -> Tensor<B, D> {
+    input.clone() * sigmoid(input - 1.0)
 }
 
 #[derive(Clone, Debug)]
@@ -161,7 +615,10 @@ impl ConvEmbedConfig {
             convnext_in: LinearConfig::new(128, 384).init(device),
             convnext_out: LinearConfig::new(384, 128).init(device),
             output_projection: LinearConfig::new(128 * freq_dim, self.output_dim).init(device),
-            output_norm: LayerNormConfig::new(self.output_dim).init(device),
+            output_norm: BiasNormConfig::new(self.output_dim).init(device),
+            conv1_balancer: ActivationBalancer::new(),
+            conv2_balancer: ActivationBalancer::new(),
+            conv3_balancer: ActivationBalancer::new(),
         }
     }
 }
@@ -175,15 +632,18 @@ struct ConvEmbed<B: Backend> {
     convnext_in: Linear<B>,
     convnext_out: Linear<B>,
     output_projection: Linear<B>,
-    output_norm: LayerNorm<B>,
+    output_norm: BiasNorm<B>,
+    conv1_balancer: ActivationBalancer,
+    conv2_balancer: ActivationBalancer,
+    conv3_balancer: ActivationBalancer,
 }
 
 impl<B: Backend> ConvEmbed<B> {
     fn forward(&self, input: Tensor<B, 3>, lengths: Vec<usize>) -> (Tensor<B, 3>, Vec<usize>) {
         let mut output = input.unsqueeze_dim::<4>(1);
-        output = silu(self.conv1.forward(output));
-        output = silu(self.conv2.forward(output));
-        output = silu(self.conv3.forward(output));
+        output = swoosh_r(self.conv1_balancer.forward(self.conv1.forward(output)));
+        output = swoosh_r(self.conv2_balancer.forward(self.conv2.forward(output)));
+        output = swoosh_r(self.conv3_balancer.forward(self.conv3.forward(output)));
 
         let residual = output.clone();
         output = self.convnext_depthwise.forward(output);
@@ -220,8 +680,12 @@ struct ZipformerStackConfig {
     dim: usize,
     num_layers: usize,
     num_heads: usize,
+    query_head_dim: usize,
+    value_head_dim: usize,
+    pos_head_dim: usize,
     feedforward_dim: usize,
     conv_kernel_size: usize,
+    pos_dim: usize,
     dropout: f64,
     downsample: usize,
 }
@@ -231,11 +695,16 @@ impl ZipformerStackConfig {
         ZipformerStack {
             downsample: PairwiseDownsample::new(self.downsample),
             upsample: PairwiseUpsample::new(self.downsample),
+            positional_encoding: CompactRelPositionalEncoding::new(self.pos_dim),
             blocks: (0..self.num_layers)
                 .map(|_| {
                     ZipformerBlockConfig {
                         dim: self.dim,
                         heads: self.num_heads,
+                        query_head_dim: self.query_head_dim,
+                        value_head_dim: self.value_head_dim,
+                        pos_head_dim: self.pos_head_dim,
+                        pos_dim: self.pos_dim,
                         feedforward_dim: self.feedforward_dim,
                         conv_kernel_size: self.conv_kernel_size,
                         dropout: self.dropout,
@@ -251,6 +720,7 @@ impl ZipformerStackConfig {
 struct ZipformerStack<B: Backend> {
     downsample: PairwiseDownsample,
     upsample: PairwiseUpsample,
+    positional_encoding: CompactRelPositionalEncoding,
     blocks: Vec<ZipformerBlock<B>>,
 }
 
@@ -259,11 +729,14 @@ impl<B: Backend> ZipformerStack<B> {
         let target_len = input.dims()[1];
         let residual = input.clone();
         let (mut output, down_lengths) = self.downsample.forward(input, lengths);
+        let pos_emb = self
+            .positional_encoding
+            .forward::<B>(output.dims()[1], &output.device());
         for block in self.blocks.iter() {
-            output = block.forward(output, &down_lengths);
+            output = block.forward(output, pos_emb.clone(), &down_lengths);
         }
         output = self.upsample.forward(output, target_len);
-        mask_time((residual.clone() + output) * 0.5, lengths)
+        mask_time(output_bypass(residual, output), lengths)
     }
 }
 
@@ -271,6 +744,10 @@ impl<B: Backend> ZipformerStack<B> {
 struct ZipformerBlockConfig {
     dim: usize,
     heads: usize,
+    query_head_dim: usize,
+    value_head_dim: usize,
+    pos_head_dim: usize,
+    pos_dim: usize,
     feedforward_dim: usize,
     conv_kernel_size: usize,
     dropout: f64,
@@ -279,25 +756,45 @@ struct ZipformerBlockConfig {
 impl ZipformerBlockConfig {
     fn init<B: Backend>(&self, device: &B::Device) -> ZipformerBlock<B> {
         ZipformerBlock {
+            attention_weights: MultiHeadAttentionWeightsConfig {
+                embed_dim: self.dim,
+                pos_dim: self.pos_dim,
+                num_heads: self.heads,
+                query_head_dim: self.query_head_dim,
+                pos_head_dim: self.pos_head_dim,
+                dropout: self.dropout,
+            }
+            .init(device),
             feed_forward1: FeedForwardConfig::new(
                 self.dim,
                 (self.feedforward_dim * 3) / 4,
                 self.dropout,
             )
             .init(device),
-            self_attention1_norm: LayerNormConfig::new(self.dim).init(device),
-            self_attention1: MultiHeadAttentionConfig::new(self.dim, self.heads)
-                .with_dropout(self.dropout)
-                .init(device),
+            non_linear_attention: NonLinearAttentionConfig::new(
+                self.dim,
+                (self.dim * 3) / 4,
+                self.dropout,
+            )
+            .init(device),
+            self_attention1: SelfAttentionConfig::new(
+                self.dim,
+                self.heads,
+                self.value_head_dim,
+                self.dropout,
+            )
+            .init(device),
             conv1: ZipformerConvModuleConfig::new(self.dim, self.conv_kernel_size, self.dropout)
                 .init(device),
             feed_forward2: FeedForwardConfig::new(self.dim, self.feedforward_dim, self.dropout)
                 .init(device),
-            mid_norm: LayerNormConfig::new(self.dim).init(device),
-            self_attention2_norm: LayerNormConfig::new(self.dim).init(device),
-            self_attention2: MultiHeadAttentionConfig::new(self.dim, self.heads)
-                .with_dropout(self.dropout)
-                .init(device),
+            self_attention2: SelfAttentionConfig::new(
+                self.dim,
+                self.heads,
+                self.value_head_dim,
+                self.dropout,
+            )
+            .init(device),
             conv2: ZipformerConvModuleConfig::new(self.dim, self.conv_kernel_size, self.dropout)
                 .init(device),
             feed_forward3: FeedForwardConfig::new(
@@ -306,56 +803,81 @@ impl ZipformerBlockConfig {
                 self.dropout,
             )
             .init(device),
-            output_norm: LayerNormConfig::new(self.dim).init(device),
-            dropout: DropoutConfig::new(self.dropout).init(),
+            block_balancer: ActivationBalancer::new()
+                .with_positive_range(0.45, 0.55)
+                .with_abs_range(0.2, 6.0),
+            output_norm: BiasNormConfig::new(self.dim).init(device),
+            whiten: Whiten::new(),
         }
     }
 }
 
 #[derive(Module, Debug)]
 struct ZipformerBlock<B: Backend> {
+    attention_weights: MultiHeadAttentionWeights<B>,
     feed_forward1: FeedForward<B>,
-    self_attention1_norm: LayerNorm<B>,
-    self_attention1: MultiHeadAttention<B>,
+    non_linear_attention: NonLinearAttention<B>,
+    self_attention1: SelfAttention<B>,
     conv1: ZipformerConvModule<B>,
     feed_forward2: FeedForward<B>,
-    mid_norm: LayerNorm<B>,
-    self_attention2_norm: LayerNorm<B>,
-    self_attention2: MultiHeadAttention<B>,
+    self_attention2: SelfAttention<B>,
     conv2: ZipformerConvModule<B>,
     feed_forward3: FeedForward<B>,
-    output_norm: LayerNorm<B>,
-    dropout: Dropout,
+    block_balancer: ActivationBalancer,
+    output_norm: BiasNorm<B>,
+    whiten: Whiten,
 }
 
 impl<B: Backend> ZipformerBlock<B> {
-    fn forward(&self, input: Tensor<B, 3>, lengths: &[usize]) -> Tensor<B, 3> {
+    fn forward(
+        &self,
+        input: Tensor<B, 3>,
+        pos_emb: Tensor<B, 2>,
+        lengths: &[usize],
+    ) -> Tensor<B, 3> {
         let device = input.device();
-        let mask = padding_mask::<B>(lengths, input.dims()[1], &device);
+        let mask = sequence_mask::<B>(lengths, input.dims()[1], &device);
+        let attn_weights = self
+            .attention_weights
+            .forward(input.clone(), pos_emb, mask.clone());
 
-        let mut output = input.clone() + self.feed_forward1.forward(input.clone());
-        let attn = self.self_attention1.forward(
-            MhaInput::self_attn(self.self_attention1_norm.forward(output.clone()))
-                .mask_pad(mask.clone()),
+        let residual = input.clone();
+        let mut output = mask_time(input.clone() + self.feed_forward1.forward(input), lengths);
+        output = mask_time(
+            output.clone()
+                + self
+                    .non_linear_attention
+                    .forward(output.clone(), attn_weights.clone()),
+            lengths,
         );
-        output = mask_time(output + self.dropout.forward(attn.context), lengths);
+        output = mask_time(
+            output.clone()
+                + self
+                    .self_attention1
+                    .forward(output.clone(), attn_weights.clone()),
+            lengths,
+        );
         output = mask_time(
             output.clone() + self.conv1.forward(output, lengths),
             lengths,
         );
         output = mask_time(output.clone() + self.feed_forward2.forward(output), lengths);
-        output = self.mid_norm.forward((input + output) * 0.5);
+        output = mask_time(output_bypass(residual.clone(), output), lengths);
 
-        let attn = self.self_attention2.forward(
-            MhaInput::self_attn(self.self_attention2_norm.forward(output.clone())).mask_pad(mask),
+        output = mask_time(
+            output.clone() + self.self_attention2.forward(output.clone(), attn_weights),
+            lengths,
         );
-        output = mask_time(output + self.dropout.forward(attn.context), lengths);
         output = mask_time(
             output.clone() + self.conv2.forward(output, lengths),
             lengths,
         );
         output = output.clone() + self.feed_forward3.forward(output);
-        self.output_norm.forward(mask_time(output, lengths))
+        output = self
+            .output_norm
+            .forward(self.block_balancer.forward(output));
+        self.whiten
+            .forward(mask_time(output_bypass(residual, output), lengths))
     }
 }
 
@@ -377,27 +899,30 @@ impl FeedForwardConfig {
 
     fn init<B: Backend>(&self, device: &B::Device) -> FeedForward<B> {
         FeedForward {
-            norm: LayerNormConfig::new(self.dim).init(device),
             linear_in: LinearConfig::new(self.dim, self.hidden).init(device),
+            balancer: ActivationBalancer::new().with_abs_range(0.2, 10.0),
             linear_out: LinearConfig::new(self.hidden, self.dim).init(device),
             dropout: DropoutConfig::new(self.dropout).init(),
+            out_dropout: DropoutConfig::new(self.dropout).init(),
         }
     }
 }
 
 #[derive(Module, Debug)]
 struct FeedForward<B: Backend> {
-    norm: LayerNorm<B>,
     linear_in: Linear<B>,
+    balancer: ActivationBalancer,
     linear_out: Linear<B>,
     dropout: Dropout,
+    out_dropout: Dropout,
 }
 
 impl<B: Backend> FeedForward<B> {
     fn forward(&self, input: Tensor<B, 3>) -> Tensor<B, 3> {
-        let output = self.norm.forward(input);
-        let output = silu(self.linear_in.forward(output));
-        self.dropout.forward(self.linear_out.forward(output))
+        let output = self.linear_in.forward(input);
+        let output = swoosh_l(self.balancer.forward(output));
+        let output = self.dropout.forward(output);
+        self.out_dropout.forward(self.linear_out.forward(output))
     }
 }
 
@@ -419,8 +944,10 @@ impl ZipformerConvModuleConfig {
 
     fn init<B: Backend>(&self, device: &B::Device) -> ZipformerConvModule<B> {
         ZipformerConvModule {
-            norm: LayerNormConfig::new(self.dim).init(device),
-            pointwise_in: Conv1dConfig::new(self.dim, self.dim * 2, 1).init(device),
+            input_proj: LinearConfig::new(self.dim, self.dim * 2).init(device),
+            input_balancer: ActivationBalancer::new()
+                .with_positive_range(0.05, 1.0)
+                .with_abs_range(0.2, 10.0),
             depthwise: Conv1dConfig::new(self.dim, self.dim, self.kernel_size)
                 .with_groups(self.dim)
                 .with_padding(PaddingConfig1d::Explicit(
@@ -428,7 +955,10 @@ impl ZipformerConvModuleConfig {
                     self.kernel_size / 2,
                 ))
                 .init(device),
-            pointwise_out: Conv1dConfig::new(self.dim, self.dim, 1).init(device),
+            depthwise_balancer: ActivationBalancer::new()
+                .with_positive_range(0.05, 1.0)
+                .with_abs_range(0.2, 20.0),
+            output_proj: LinearConfig::new(self.dim, self.dim).init(device),
             dropout: DropoutConfig::new(self.dropout).init(),
         }
     }
@@ -436,25 +966,28 @@ impl ZipformerConvModuleConfig {
 
 #[derive(Module, Debug)]
 struct ZipformerConvModule<B: Backend> {
-    norm: LayerNorm<B>,
-    pointwise_in: Conv1d<B>,
+    input_proj: Linear<B>,
+    input_balancer: ActivationBalancer,
     depthwise: Conv1d<B>,
-    pointwise_out: Conv1d<B>,
+    depthwise_balancer: ActivationBalancer,
+    output_proj: Linear<B>,
     dropout: Dropout,
 }
 
 impl<B: Backend> ZipformerConvModule<B> {
     fn forward(&self, input: Tensor<B, 3>, lengths: &[usize]) -> Tensor<B, 3> {
         let [batch_size, seq_len, dim] = input.dims();
-        let output = self.norm.forward(input).swap_dims(1, 2);
-        let output = self.pointwise_in.forward(output);
-        let mut chunks = output.chunk(2, 1);
+        let output = self.input_balancer.forward(self.input_proj.forward(input));
+        let mut chunks = output.chunk(2, 2);
         let gate = chunks.remove(1);
         let value = chunks.remove(0);
-        let output = value * sigmoid(gate);
+        let output = (value * sigmoid(gate)).swap_dims(1, 2);
         let output = silu(self.depthwise.forward(output));
-        let output = self.dropout.forward(self.pointwise_out.forward(output));
-        let output = output.swap_dims(1, 2).reshape([batch_size, seq_len, dim]);
+        let output = self.depthwise_balancer.forward(output.swap_dims(1, 2));
+        let output = self
+            .dropout
+            .forward(self.output_proj.forward(swoosh_r(output)));
+        let output = output.reshape([batch_size, seq_len, dim]);
         mask_time(output, lengths)
     }
 }
@@ -647,18 +1180,12 @@ fn ceil_divide(value: usize, factor: usize) -> usize {
     }
 }
 
-fn padding_mask<B: Backend>(
-    lengths: &[usize],
-    max_len: usize,
-    device: &B::Device,
-) -> Tensor<B, 2, Bool> {
-    let mut values = Vec::with_capacity(lengths.len() * max_len);
-    for length in lengths {
-        for index in 0..max_len {
-            values.push(index >= *length);
-        }
+fn expand_stack_values(values: &[usize], num_stacks: usize) -> Vec<usize> {
+    match values.len() {
+        1 => vec![values[0]; num_stacks],
+        len if len == num_stacks => values.to_vec(),
+        len => panic!("Zipformer stack value must have length 1 or {num_stacks}, got {len}."),
     }
-    Tensor::from_data(TensorData::new(values, [lengths.len(), max_len]), device)
 }
 
 fn sequence_mask<B: Backend>(
@@ -712,5 +1239,20 @@ mod tests {
 
         assert_eq!(output.dims(), [2, 4, 32]);
         assert_eq!(lengths, vec![4, 3]);
+    }
+
+    #[test]
+    fn zipformer_regularizers_preserve_forward_values() {
+        let device = Default::default();
+        let input = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![0.0, 1.0, -2.0, 3.0], [1, 2, 2]),
+            &device,
+        );
+
+        let balanced = ActivationBalancer::new().forward(input.clone());
+        let whitened = Whiten::new().forward(input.clone());
+
+        assert!(balanced.all_close(input.clone(), Some(1e-6), Some(1e-6)));
+        assert!(whitened.all_close(input, Some(1e-6), Some(1e-6)));
     }
 }
