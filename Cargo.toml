@@ -47,9 +47,9 @@ burn-optim = { version = "0.21.0-pre.3", default-features = false, features = ["
 burn-wgpu = { version = "0.21.0-pre.3", default-features = false, features = ["std"], optional = true }
 clap = { version = "4.6.1", features = ["derive"] }
 crossterm = "0.29"
-cubecl = { version = "0.10.0-pre.3", default-features = false, features = ["std"], optional = true }
+cubecl = { version = "0.10.0-pre.4", default-features = false, features = ["std"], optional = true }
 env_logger = "0.11"
-half = { version = "2.1", default-features = false }
+half = { version = "2.7", default-features = false }
 kenlm-rs = { version = "0.1.0" }
 jni = { version = "0.22.4", optional = true }
 log = "0.4"
@@ -59,9 +59,9 @@ napi-derive = { version = "2.16.13", optional = true }
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["api-24", "half", "ndarray", "std"] }
 polars = { version = "0.53", default-features = false, features = ["fmt", "polars-io", "parquet", "dtype-array", "dtype-struct"] }
 prost = "0.14"
-pyo3 = { version = "0.27.1", optional = true, features = ["abi3-py310"] }
+pyo3 = { version = "0.27.2", optional = true, features = ["abi3-py310"] }
 rand = "0.9"
-rayon = "1.11"
+rayon = "1.12"
 safetensors = "0.6"
 serde_json = "1.0"
 splintr = "0.9.1"
@@ -72,9 +72,9 @@ uniffi = { version = "0.31.1", optional = true }
 [build-dependencies]
 cbindgen = "0.29.2"
 csbindgen = "1.9.7"
-napi-build = "2.2.4"
-pyo3-build-config = "0.27.1"
-rb-sys-build = { version = "0.9.126", optional = true }
+napi-build = "2.3.1"
+pyo3-build-config = "0.27.2"
+rb-sys-build = { version = "0.9.127", optional = true }
 swift-bridge-build = "0.1.59"
 
 [dev-dependencies]

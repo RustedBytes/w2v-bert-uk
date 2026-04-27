@@ -176,7 +176,7 @@ struct RunArgs {
     #[arg(long)]
     epochs: Option<usize>,
 
-    /// AdamW learning rate. Defaults to the PositiveLoss variant recipe.
+    /// AdamW learning rate. Defaults to the architecture recipe.
     #[arg(long)]
     learning_rate: Option<f64>,
 
@@ -728,21 +728,35 @@ struct TrainingDefaults {
     lr_decay_exponent: f64,
 }
 
-fn training_defaults(_architecture: TrainArchitecture, variant: Option<&str>) -> TrainingDefaults {
-    const ADAMW_LR_CAP: f64 = 3.0e-4;
-    let peak_lr: f64 = match variant.unwrap_or("sm") {
-        "xs" | "s" | "sm" => 2.0e-3,
-        "m" => 1.5e-3,
-        "ml" | "l" => 1.0e-3,
-        _ => 1.0e-3,
-    };
+fn training_defaults(architecture: TrainArchitecture, variant: Option<&str>) -> TrainingDefaults {
     TrainingDefaults {
         epochs: 500,
-        learning_rate: peak_lr.min(ADAMW_LR_CAP),
+        learning_rate: architecture_default_learning_rate(architecture, variant),
         weight_decay: 5.0e-4,
         lr_warmup_epochs: 20,
         lr_hold_epochs: 160,
         lr_decay_exponent: 1.0,
+    }
+}
+
+fn architecture_default_learning_rate(
+    architecture: TrainArchitecture,
+    variant: Option<&str>,
+) -> f64 {
+    const ADAMW_LR_CAP: f64 = 3.0e-4;
+    match architecture {
+        TrainArchitecture::Squeezeformer => variant_peak_learning_rate(variant).min(ADAMW_LR_CAP),
+        TrainArchitecture::Zipformer | TrainArchitecture::Paraformer => 1.0e-3,
+        TrainArchitecture::Wav2VecBert => 1.0e-4,
+    }
+}
+
+fn variant_peak_learning_rate(variant: Option<&str>) -> f64 {
+    match variant.unwrap_or("sm") {
+        "xs" | "s" | "sm" => 2.0e-3,
+        "m" => 1.5e-3,
+        "ml" | "l" => 1.0e-3,
+        _ => 1.0e-3,
     }
 }
 
@@ -1774,6 +1788,36 @@ mod tests {
         assert_eq!(train.len(), 9);
         assert_eq!(val.len(), 1);
         assert_eq!(val[0], "record-9");
+    }
+
+    #[test]
+    fn variant_peak_learning_rates_match_positiveloss_recipe() {
+        assert_eq!(variant_peak_learning_rate(Some("xs")), 2.0e-3);
+        assert_eq!(variant_peak_learning_rate(Some("s")), 2.0e-3);
+        assert_eq!(variant_peak_learning_rate(Some("sm")), 2.0e-3);
+        assert_eq!(variant_peak_learning_rate(Some("m")), 1.5e-3);
+        assert_eq!(variant_peak_learning_rate(Some("ml")), 1.0e-3);
+        assert_eq!(variant_peak_learning_rate(Some("l")), 1.0e-3);
+    }
+
+    #[test]
+    fn architecture_default_learning_rates_follow_train_recipes() {
+        for variant in ["xs", "s", "sm", "m", "ml", "l"] {
+            let defaults = training_defaults(TrainArchitecture::Squeezeformer, Some(variant));
+            assert_eq!(defaults.learning_rate, 3.0e-4);
+        }
+        assert_eq!(
+            training_defaults(TrainArchitecture::Zipformer, Some("sm")).learning_rate,
+            1.0e-3
+        );
+        assert_eq!(
+            training_defaults(TrainArchitecture::Paraformer, Some("sm")).learning_rate,
+            1.0e-3
+        );
+        assert_eq!(
+            training_defaults(TrainArchitecture::Wav2VecBert, Some("sm")).learning_rate,
+            1.0e-4
+        );
     }
 
     #[test]

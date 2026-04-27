@@ -392,7 +392,7 @@ The trainer uses AdamW.
 | Argument | Default | Description |
 | --- | --- | --- |
 | `--epochs <N>` | `500` | Number of epochs. |
-| `--learning-rate <F>` | variant recipe | Peak AdamW learning rate. Defaults to `min(variant_peak_lr, 0.0003)`. |
+| `--learning-rate <F>` | architecture recipe | Peak AdamW learning rate. Defaults: Squeezeformer `min(variant_peak_lr, 0.0003)`, Zipformer/Paraformer `0.001`, W2V-BERT `0.0001`. |
 | `--weight-decay <F>` | `0.0005` | AdamW weight decay. |
 | `--lr-warmup-epochs <N>` / `--warmup-epochs <N>` | `20` | Linear warmup epochs. |
 | `--lr-hold-epochs <N>` / `--hold-epochs <N>` | `160` | Hold peak LR after warmup. |
