@@ -30,7 +30,12 @@ struct Args {
 
     /// Training manifest, JSONL or TSV.
     #[arg(long)]
-    train_manifest: PathBuf,
+    train_manifest: Option<PathBuf>,
+
+    /// Directory containing JSONL manifests. Uses train.jsonl for training and val.jsonl,
+    /// validation.jsonl, or dev.jsonl for validation when present.
+    #[arg(long)]
+    manifest_dir: Option<PathBuf>,
 
     /// Optional validation manifest, JSONL or TSV.
     #[arg(long)]
@@ -117,10 +122,11 @@ enum ArchitectureArg {
 fn main() -> Result<()> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
     let args = Args::parse();
+    let (train_manifest, val_manifest) = resolve_manifest_paths(&args)?;
     let config = BurnTrainConfig {
         architecture: resolve_architecture(&args),
-        train_manifest: args.train_manifest,
-        val_manifest: args.val_manifest,
+        train_manifest,
+        val_manifest,
         output_dir: args.output_dir,
         variant: args.variant,
         input_dim: args.input_dim,
@@ -164,4 +170,25 @@ fn resolve_architecture(args: &Args) -> TrainArchitecture {
         ArchitectureArg::Paraformer => TrainArchitecture::Paraformer,
         ArchitectureArg::W2vBert => TrainArchitecture::Wav2VecBert,
     }
+}
+
+fn resolve_manifest_paths(args: &Args) -> Result<(PathBuf, Option<PathBuf>)> {
+    if let Some(manifest_dir) = &args.manifest_dir {
+        let train_manifest = args
+            .train_manifest
+            .clone()
+            .unwrap_or_else(|| manifest_dir.join("train.jsonl"));
+        let val_manifest = args.val_manifest.clone().or_else(|| {
+            ["val.jsonl", "validation.jsonl", "dev.jsonl"]
+                .into_iter()
+                .map(|name| manifest_dir.join(name))
+                .find(|path| path.exists())
+        });
+        return Ok((train_manifest, val_manifest));
+    }
+
+    let train_manifest = args.train_manifest.clone().ok_or_else(|| {
+        anyhow::anyhow!("--train-manifest is required unless --manifest-dir is provided")
+    })?;
+    Ok((train_manifest, args.val_manifest.clone()))
 }

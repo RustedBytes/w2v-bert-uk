@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -132,17 +133,6 @@ pub fn run_burn_training(config: BurnTrainConfig) -> Result<TrainSummary> {
     validate_config(&config)?;
     write_run_config(&config)?;
 
-    let train_records = load_manifest(&config.train_manifest, config.max_train_samples)
-        .with_context(|| format!("failed to load {}", config.train_manifest.display()))?;
-    let val_records = config
-        .val_manifest
-        .as_ref()
-        .map(|path| {
-            load_manifest(path, config.max_val_samples)
-                .with_context(|| format!("failed to load {}", path.display()))
-        })
-        .transpose()?;
-
     match config.architecture {
         TrainArchitecture::Squeezeformer => {
             let encoder = config
@@ -162,13 +152,7 @@ pub fn run_burn_training(config: BurnTrainConfig) -> Result<TrainSummary> {
                 vocab_size: config.vocab_size,
             }
             .init::<TrainBackend>(&device);
-            train_ctc_model(
-                model,
-                &train_records,
-                val_records.as_deref(),
-                &config,
-                &device,
-            )
+            train_ctc_model(model, &config, &device)
         }
         TrainArchitecture::Zipformer => {
             let mut encoder = config
@@ -182,13 +166,7 @@ pub fn run_burn_training(config: BurnTrainConfig) -> Result<TrainSummary> {
                 vocab_size: config.vocab_size,
             }
             .init::<TrainBackend>(&device);
-            train_ctc_model(
-                model,
-                &train_records,
-                val_records.as_deref(),
-                &config,
-                &device,
-            )
+            train_ctc_model(model, &config, &device)
         }
         TrainArchitecture::Paraformer => {
             let model_config = config
@@ -212,13 +190,7 @@ pub fn run_burn_training(config: BurnTrainConfig) -> Result<TrainSummary> {
                     value
                 });
             let model = model_config.init::<TrainBackend>(&device);
-            train_ctc_model(
-                model,
-                &train_records,
-                val_records.as_deref(),
-                &config,
-                &device,
-            )
+            train_ctc_model(model, &config, &device)
         }
         TrainArchitecture::Wav2VecBert => {
             let encoder = Wav2VecBertConfig::new(config.input_dim, config.d_model)
@@ -228,13 +200,7 @@ pub fn run_burn_training(config: BurnTrainConfig) -> Result<TrainSummary> {
                 vocab_size: config.vocab_size,
             }
             .init::<TrainBackend>(&device);
-            train_ctc_model(
-                model,
-                &train_records,
-                val_records.as_deref(),
-                &config,
-                &device,
-            )
+            train_ctc_model(model, &config, &device)
         }
     }
 }
@@ -287,8 +253,6 @@ impl<B: AutodiffBackend> TrainableCtc<B> for ParaformerV2<B> {
 
 fn train_ctc_model<B, M>(
     mut model: M,
-    train_records: &[FeatureRecord],
-    val_records: Option<&[FeatureRecord]>,
     config: &BurnTrainConfig,
     device: &B::Device,
 ) -> Result<TrainSummary>
@@ -305,8 +269,13 @@ where
     let started = Instant::now();
 
     for epoch in 1..=config.epochs {
-        for chunk in train_records.chunks(config.batch_size) {
-            let batch = make_batch(chunk, config.input_dim)?;
+        let mut train_batches = StreamingBatchLoader::new(
+            config.train_manifest.clone(),
+            config.batch_size,
+            config.input_dim,
+            config.max_train_samples,
+        )?;
+        while let Some(batch) = train_batches.next_batch()? {
             let loss = ctc_loss_for_batch::<B, M>(&model, &batch, config.blank_id, device);
             let loss_value = scalar_value(loss.clone())?;
             last_train_loss = Some(loss_value);
@@ -324,9 +293,9 @@ where
                 );
             }
 
-            if let (Some(records), Some(every)) = (val_records, config.validate_every_steps) {
+            if let (Some(_), Some(every)) = (&config.val_manifest, config.validate_every_steps) {
                 if every > 0 && global_step % every == 0 {
-                    let val_loss = evaluate_ctc_model::<B, M>(&model, records, config, device)?;
+                    let val_loss = evaluate_ctc_model::<B, M>(&model, config, device)?;
                     println!("epoch={epoch} step={global_step} val_ctc_loss={val_loss:.6}");
                     last_val_loss = Some(val_loss);
                     write_checkpoint_metadata(
@@ -340,8 +309,8 @@ where
             }
         }
 
-        if let Some(records) = val_records {
-            let val_loss = evaluate_ctc_model::<B, M>(&model, records, config, device)?;
+        if config.val_manifest.is_some() {
+            let val_loss = evaluate_ctc_model::<B, M>(&model, config, device)?;
             println!("epoch={epoch} val_ctc_loss={val_loss:.6}");
             last_val_loss = Some(val_loss);
         }
@@ -356,20 +325,24 @@ where
     })
 }
 
-fn evaluate_ctc_model<B, M>(
-    model: &M,
-    records: &[FeatureRecord],
-    config: &BurnTrainConfig,
-    device: &B::Device,
-) -> Result<f32>
+fn evaluate_ctc_model<B, M>(model: &M, config: &BurnTrainConfig, device: &B::Device) -> Result<f32>
 where
     B: AutodiffBackend,
     M: TrainableCtc<B>,
 {
     let mut total = 0.0f64;
     let mut count = 0usize;
-    for chunk in records.chunks(config.batch_size) {
-        let batch = make_batch(chunk, config.input_dim)?;
+    let val_manifest = config
+        .val_manifest
+        .as_ref()
+        .ok_or_else(|| anyhow!("validation requested without val_manifest"))?;
+    let mut batches = StreamingBatchLoader::new(
+        val_manifest.clone(),
+        config.batch_size,
+        config.input_dim,
+        config.max_val_samples,
+    )?;
+    while let Some(batch) = batches.next_batch()? {
         let loss = ctc_loss_for_batch::<B, M>(model, &batch, config.blank_id, device);
         total += f64::from(scalar_value(loss)?);
         count += 1;
@@ -482,6 +455,167 @@ fn make_batch(records: &[FeatureRecord], expected_dim: usize) -> Result<TrainBat
 }
 
 pub fn load_manifest(path: &Path, limit: Option<usize>) -> Result<Vec<FeatureRecord>> {
+    let files = manifest_files(path)?;
+    let mut records = Vec::new();
+    for file in files {
+        let remaining = limit.map(|limit| limit.saturating_sub(records.len()));
+        if remaining == Some(0) {
+            break;
+        }
+        records.extend(load_manifest_file(&file, remaining)?);
+    }
+    if records.is_empty() {
+        bail!("manifest {} contains no records", path.display());
+    }
+    Ok(records)
+}
+
+pub struct StreamingBatchLoader {
+    files: Vec<PathBuf>,
+    file_index: usize,
+    current: Option<CurrentManifestFile>,
+    batch_size: usize,
+    expected_dim: usize,
+    yielded: usize,
+    limit: Option<usize>,
+}
+
+struct CurrentManifestFile {
+    path: PathBuf,
+    base_dir: PathBuf,
+    reader: BufReader<fs::File>,
+    line_number: usize,
+}
+
+impl StreamingBatchLoader {
+    pub fn new(
+        manifest: PathBuf,
+        batch_size: usize,
+        expected_dim: usize,
+        limit: Option<usize>,
+    ) -> Result<Self> {
+        if batch_size == 0 {
+            bail!("batch_size must be > 0");
+        }
+        Ok(Self {
+            files: manifest_files(&manifest)?,
+            file_index: 0,
+            current: None,
+            batch_size,
+            expected_dim,
+            yielded: 0,
+            limit,
+        })
+    }
+
+    pub fn next_batch(&mut self) -> Result<Option<TrainBatch>> {
+        let mut records = Vec::with_capacity(self.batch_size);
+        while records.len() < self.batch_size {
+            if self.limit.is_some_and(|limit| self.yielded >= limit) {
+                break;
+            }
+            match self.next_record()? {
+                Some(record) => {
+                    self.yielded += 1;
+                    records.push(record);
+                }
+                None => break,
+            }
+        }
+
+        if records.is_empty() {
+            Ok(None)
+        } else {
+            make_batch(&records, self.expected_dim).map(Some)
+        }
+    }
+
+    fn next_record(&mut self) -> Result<Option<FeatureRecord>> {
+        loop {
+            if self.current.is_none() {
+                if self.file_index >= self.files.len() {
+                    return Ok(None);
+                }
+                let path = self.files[self.file_index].clone();
+                self.file_index += 1;
+                self.current = Some(CurrentManifestFile::open(path)?);
+            }
+
+            let current = self.current.as_mut().expect("manifest file must be open");
+            let mut line = String::new();
+            let bytes = current
+                .reader
+                .read_line(&mut line)
+                .with_context(|| format!("failed reading {}", current.path.display()))?;
+            if bytes == 0 {
+                self.current = None;
+                continue;
+            }
+            current.line_number += 1;
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            let record = if line.starts_with('{') {
+                parse_json_record(line, &current.base_dir, current.line_number)?
+            } else {
+                parse_tsv_record(line, &current.base_dir, current.line_number)?
+            };
+            return Ok(Some(record));
+        }
+    }
+}
+
+impl CurrentManifestFile {
+    fn open(path: PathBuf) -> Result<Self> {
+        let file = fs::File::open(&path)
+            .with_context(|| format!("failed to open manifest {}", path.display()))?;
+        let base_dir = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        Ok(Self {
+            path,
+            base_dir,
+            reader: BufReader::new(file),
+            line_number: 0,
+        })
+    }
+}
+
+fn manifest_files(path: &Path) -> Result<Vec<PathBuf>> {
+    if path.is_dir() {
+        let mut files = fs::read_dir(path)
+            .with_context(|| format!("failed to read manifest directory {}", path.display()))?
+            .map(|entry| {
+                entry
+                    .map(|entry| entry.path())
+                    .with_context(|| format!("failed to read entry in {}", path.display()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        files.retain(|path| is_manifest_file(path));
+        files.sort();
+        if files.is_empty() {
+            bail!(
+                "manifest directory {} contains no .jsonl/.json files",
+                path.display()
+            );
+        }
+        return Ok(files);
+    }
+    Ok(vec![path.to_path_buf()])
+}
+
+fn is_manifest_file(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| matches!(extension, "jsonl" | "json"))
+}
+
+fn load_manifest_file(path: &Path, limit: Option<usize>) -> Result<Vec<FeatureRecord>> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("failed to read manifest {}", path.display()))?;
     let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
@@ -846,5 +980,30 @@ mod tests {
         assert_eq!(batch.max_frames, 2);
         assert_eq!(batch.feature_lengths, vec![2, 1]);
         assert_eq!(batch.target_lengths, vec![2, 1]);
+    }
+
+    #[test]
+    fn manifest_directory_loads_jsonl_shards_in_order() {
+        let dir = std::env::temp_dir().join(format!(
+            "w2v_bert_uk_manifest_dir_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("b.jsonl"),
+            r#"{"id":"b","features":[[0.2,0.3]],"tokens":[2]}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("a.jsonl"),
+            r#"{"id":"a","features":[[0.1,0.2]],"tokens":[1]}"#,
+        )
+        .unwrap();
+
+        let records = load_manifest(&dir, Some(1)).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, "a");
     }
 }
