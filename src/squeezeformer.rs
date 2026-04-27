@@ -1,45 +1,224 @@
-use burn::module::Module;
-use burn::tensor::activation::{gelu, sigmoid, silu};
-use burn::tensor::{Tensor, backend::Backend};
-use burn_nn::attention::{MhaInput, MultiHeadAttention, MultiHeadAttentionConfig};
-use burn_nn::conv::{Conv1d, Conv1dConfig};
+use burn::module::{Initializer, Module, Param};
+use burn::tensor::activation::{relu, silu, softmax};
+use burn::tensor::ops::PadMode;
+use burn::tensor::{Bool, Tensor, TensorData, backend::Backend};
+use burn_nn::conv::{Conv1d, Conv1dConfig, Conv2d, Conv2dConfig};
 use burn_nn::{
-    BatchNorm, BatchNormConfig, Dropout, DropoutConfig, LayerNorm, LayerNormConfig, Linear,
-    LinearConfig, PaddingConfig1d,
+    Dropout, DropoutConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig, PaddingConfig1d,
 };
 
 pub mod transcribe;
 
-#[derive(Clone, Copy, Debug)]
-pub enum SqueezeformerActivation {
-    Gelu,
-    Silu,
+const DEFAULT_MAX_POSITION: usize = 5000;
+
+#[derive(Clone, Debug)]
+pub struct ScaleBiasLayerConfig {
+    pub dim: usize,
 }
 
-impl SqueezeformerActivation {
-    fn forward<B: Backend, const D: usize>(&self, input: Tensor<B, D>) -> Tensor<B, D> {
-        match self {
-            Self::Gelu => gelu(input),
-            Self::Silu => silu(input),
+impl ScaleBiasLayerConfig {
+    pub fn new(dim: usize) -> Self {
+        Self { dim }
+    }
+
+    pub fn init<B: Backend>(&self, device: &B::Device) -> ScaleBiasLayer<B> {
+        ScaleBiasLayer {
+            scale: Initializer::Ones.init([self.dim], device),
+            bias: Initializer::Zeros.init([self.dim], device),
         }
     }
 }
 
+#[derive(Module, Debug)]
+pub struct ScaleBiasLayer<B: Backend> {
+    scale: Param<Tensor<B, 1>>,
+    bias: Param<Tensor<B, 1>>,
+}
+
+impl<B: Backend> ScaleBiasLayer<B> {
+    pub fn forward(&self, input: Tensor<B, 3>) -> Tensor<B, 3> {
+        let [_, _, dim] = input.dims();
+        input * self.scale.val().reshape([1, 1, dim]) + self.bias.val().reshape([1, 1, dim])
+    }
+}
+
 #[derive(Clone, Debug)]
-pub struct SqueezeformerFeedForwardConfig {
+pub struct RelativePositionalEncoding {
+    dim: usize,
+    max_length: usize,
+}
+
+impl RelativePositionalEncoding {
+    pub fn new(dim: usize) -> Self {
+        Self {
+            dim,
+            max_length: DEFAULT_MAX_POSITION,
+        }
+    }
+
+    pub fn forward<B: Backend>(&self, length: usize, device: &B::Device) -> Tensor<B, 3> {
+        let center = self.max_length - 1;
+        let start = center - length + 1;
+        let end = center + length;
+        let mut values = Vec::with_capacity((end - start) * self.dim);
+
+        for index in start..end {
+            let position = center as isize - index as isize;
+            for channel in 0..self.dim {
+                let div_term =
+                    (-(10000.0f32).ln() * (2 * (channel / 2)) as f32 / self.dim as f32).exp();
+                let value = position as f32 * div_term;
+                values.push(if channel % 2 == 0 {
+                    value.sin()
+                } else {
+                    value.cos()
+                });
+            }
+        }
+
+        Tensor::from_data(
+            TensorData::new(values, [1, 2 * length - 1, self.dim]),
+            device,
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RelPositionMultiHeadAttentionConfig {
+    pub d_model: usize,
+    pub n_heads: usize,
+    pub dropout: f64,
+}
+
+impl RelPositionMultiHeadAttentionConfig {
+    pub fn new(d_model: usize, n_heads: usize) -> Self {
+        Self {
+            d_model,
+            n_heads,
+            dropout: 0.1,
+        }
+    }
+
+    pub fn with_dropout(mut self, dropout: f64) -> Self {
+        self.dropout = dropout;
+        self
+    }
+
+    pub fn init<B: Backend>(&self, device: &B::Device) -> RelPositionMultiHeadAttention<B> {
+        assert!(
+            self.d_model % self.n_heads == 0,
+            "d_model must be divisible by n_heads"
+        );
+
+        let head_dim = self.d_model / self.n_heads;
+        RelPositionMultiHeadAttention {
+            query_proj: LinearConfig::new(self.d_model, self.d_model).init(device),
+            key_proj: LinearConfig::new(self.d_model, self.d_model).init(device),
+            value_proj: LinearConfig::new(self.d_model, self.d_model).init(device),
+            pos_proj: LinearConfig::new(self.d_model, self.d_model)
+                .with_bias(false)
+                .init(device),
+            out_proj: LinearConfig::new(self.d_model, self.d_model).init(device),
+            pos_bias_u: Initializer::Zeros.init([self.n_heads, head_dim], device),
+            pos_bias_v: Initializer::Zeros.init([self.n_heads, head_dim], device),
+            dropout: DropoutConfig::new(self.dropout).init(),
+            n_heads: self.n_heads,
+            head_dim,
+        }
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct RelPositionMultiHeadAttention<B: Backend> {
+    query_proj: Linear<B>,
+    key_proj: Linear<B>,
+    value_proj: Linear<B>,
+    pos_proj: Linear<B>,
+    out_proj: Linear<B>,
+    pos_bias_u: Param<Tensor<B, 2>>,
+    pos_bias_v: Param<Tensor<B, 2>>,
+    dropout: Dropout,
+    n_heads: usize,
+    head_dim: usize,
+}
+
+impl<B: Backend> RelPositionMultiHeadAttention<B> {
+    pub fn forward(
+        &self,
+        query: Tensor<B, 3>,
+        pos_embedding: Tensor<B, 3>,
+        mask: Tensor<B, 3, Bool>,
+    ) -> Tensor<B, 3> {
+        let [batch_size, seq_len, d_model] = query.dims();
+
+        let q = self.project_heads(self.query_proj.forward(query.clone()));
+        let k = self.project_heads(self.key_proj.forward(query.clone()));
+        let v = self.project_heads(self.value_proj.forward(query));
+        let p = self.project_heads(self.pos_proj.forward(pos_embedding));
+
+        let q_u = q.clone()
+            + self
+                .pos_bias_u
+                .val()
+                .reshape([1, self.n_heads, 1, self.head_dim]);
+        let q_v = q + self
+            .pos_bias_v
+            .val()
+            .reshape([1, self.n_heads, 1, self.head_dim]);
+
+        let content_scores = q_u.matmul(k.swap_dims(2, 3));
+        let position_scores = self.relative_shift(q_v.matmul(p.swap_dims(2, 3)), seq_len);
+        let mut scores = (content_scores + position_scores) / (self.head_dim as f64).sqrt();
+
+        let expanded_mask = mask.unsqueeze_dim::<4>(1).repeat_dim(1, self.n_heads);
+        let scores_device = scores.device();
+        let negative = Tensor::full(
+            [batch_size, self.n_heads, seq_len, seq_len],
+            -1.0e9,
+            &scores_device,
+        );
+        scores = scores.mask_where(expanded_mask.bool_not(), negative);
+
+        let attn = self.dropout.forward(softmax(scores, 3));
+        let context = attn
+            .matmul(v)
+            .swap_dims(1, 2)
+            .reshape([batch_size, seq_len, d_model]);
+
+        self.out_proj.forward(context)
+    }
+
+    fn project_heads(&self, input: Tensor<B, 3>) -> Tensor<B, 4> {
+        let [batch_size, seq_len, _] = input.dims();
+        input
+            .reshape([batch_size, seq_len, self.n_heads, self.head_dim])
+            .swap_dims(1, 2)
+    }
+
+    fn relative_shift(&self, input: Tensor<B, 4>, seq_len: usize) -> Tensor<B, 4> {
+        let [batch_size, n_heads, _, pos_len] = input.dims();
+        let padded = input.pad([(0, 0), (0, 1)], PadMode::Constant(0.0));
+        padded
+            .reshape([batch_size, n_heads, pos_len + 1, seq_len])
+            .slice_dim(2, 1..pos_len + 1)
+            .reshape([batch_size, n_heads, seq_len, pos_len])
+            .slice_dim(3, 0..seq_len)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct FeedForwardModuleConfig {
     pub d_model: usize,
     pub expansion_factor: usize,
     pub dropout: f64,
-    pub activation: SqueezeformerActivation,
 }
 
-impl SqueezeformerFeedForwardConfig {
+impl FeedForwardModuleConfig {
     pub fn new(d_model: usize) -> Self {
         Self {
             d_model,
             expansion_factor: 4,
             dropout: 0.1,
-            activation: SqueezeformerActivation::Silu,
         }
     }
 
@@ -53,56 +232,104 @@ impl SqueezeformerFeedForwardConfig {
         self
     }
 
-    pub fn with_activation(mut self, activation: SqueezeformerActivation) -> Self {
-        self.activation = activation;
-        self
-    }
-
-    pub fn init<B: Backend>(&self, device: &B::Device) -> SqueezeformerFeedForward<B> {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> FeedForwardModule<B> {
         let hidden = self.d_model * self.expansion_factor;
-
-        SqueezeformerFeedForward {
-            norm: LayerNormConfig::new(self.d_model).init(device),
+        FeedForwardModule {
+            input_transform: ScaleBiasLayerConfig::new(self.d_model).init(device),
             linear_in: LinearConfig::new(self.d_model, hidden).init(device),
             linear_out: LinearConfig::new(hidden, self.d_model).init(device),
             dropout: DropoutConfig::new(self.dropout).init(),
-            activation: self.activation,
         }
     }
 }
 
 #[derive(Module, Debug)]
-pub struct SqueezeformerFeedForward<B: Backend> {
-    norm: LayerNorm<B>,
+pub struct FeedForwardModule<B: Backend> {
+    input_transform: ScaleBiasLayer<B>,
     linear_in: Linear<B>,
     linear_out: Linear<B>,
     dropout: Dropout,
-    activation: SqueezeformerActivation,
 }
 
-impl<B: Backend> SqueezeformerFeedForward<B> {
+impl<B: Backend> FeedForwardModule<B> {
     pub fn forward(&self, input: Tensor<B, 3>) -> Tensor<B, 3> {
-        let output = self.norm.forward(input);
+        let residual = input.clone();
+        let output = self.input_transform.forward(input);
         let output = self.linear_in.forward(output);
-        let output = self.activation.forward(output);
+        let output = silu(output);
         let output = self.dropout.forward(output);
         let output = self.linear_out.forward(output);
-        self.dropout.forward(output)
+        residual + self.dropout.forward(output)
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct SqueezeformerConvolutionConfig {
+pub struct AttentionModuleConfig {
     pub d_model: usize,
-    pub kernel_size: usize,
+    pub n_heads: usize,
     pub dropout: f64,
 }
 
-impl SqueezeformerConvolutionConfig {
+impl AttentionModuleConfig {
+    pub fn new(d_model: usize, n_heads: usize) -> Self {
+        Self {
+            d_model,
+            n_heads,
+            dropout: 0.1,
+        }
+    }
+
+    pub fn with_dropout(mut self, dropout: f64) -> Self {
+        self.dropout = dropout;
+        self
+    }
+
+    pub fn init<B: Backend>(&self, device: &B::Device) -> AttentionModule<B> {
+        AttentionModule {
+            input_transform: ScaleBiasLayerConfig::new(self.d_model).init(device),
+            attention: RelPositionMultiHeadAttentionConfig::new(self.d_model, self.n_heads)
+                .with_dropout(self.dropout)
+                .init(device),
+            dropout: DropoutConfig::new(self.dropout).init(),
+        }
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct AttentionModule<B: Backend> {
+    input_transform: ScaleBiasLayer<B>,
+    attention: RelPositionMultiHeadAttention<B>,
+    dropout: Dropout,
+}
+
+impl<B: Backend> AttentionModule<B> {
+    pub fn forward(
+        &self,
+        input: Tensor<B, 3>,
+        pos_embedding: Tensor<B, 3>,
+        mask: Tensor<B, 3, Bool>,
+    ) -> Tensor<B, 3> {
+        let residual = input.clone();
+        let output = self.input_transform.forward(input);
+        let output = self.attention.forward(output, pos_embedding, mask);
+        residual + self.dropout.forward(output)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ConvolutionModuleConfig {
+    pub d_model: usize,
+    pub kernel_size: usize,
+    pub expansion_factor: usize,
+    pub dropout: f64,
+}
+
+impl ConvolutionModuleConfig {
     pub fn new(d_model: usize) -> Self {
         Self {
             d_model,
             kernel_size: 31,
+            expansion_factor: 2,
             dropout: 0.1,
         }
     }
@@ -112,56 +339,63 @@ impl SqueezeformerConvolutionConfig {
         self
     }
 
+    pub fn with_expansion_factor(mut self, expansion_factor: usize) -> Self {
+        self.expansion_factor = expansion_factor;
+        self
+    }
+
     pub fn with_dropout(mut self, dropout: f64) -> Self {
         self.dropout = dropout;
         self
     }
 
-    pub fn init<B: Backend>(&self, device: &B::Device) -> SqueezeformerConvolution<B> {
-        SqueezeformerConvolution {
-            norm: LayerNormConfig::new(self.d_model).init(device),
-            pointwise_in: Conv1dConfig::new(self.d_model, self.d_model * 2, 1).init(device),
-            depthwise: Conv1dConfig::new(self.d_model, self.d_model, self.kernel_size)
-                .with_groups(self.d_model)
-                .with_padding(PaddingConfig1d::Same)
+    pub fn init<B: Backend>(&self, device: &B::Device) -> ConvolutionModule<B> {
+        let hidden = self.d_model * self.expansion_factor;
+        ConvolutionModule {
+            input_transform: ScaleBiasLayerConfig::new(self.d_model).init(device),
+            pointwise_in: Conv1dConfig::new(self.d_model, hidden, 1).init(device),
+            depthwise: Conv1dConfig::new(hidden, hidden, self.kernel_size)
+                .with_groups(hidden)
+                .with_padding(PaddingConfig1d::Explicit(
+                    self.kernel_size / 2,
+                    self.kernel_size / 2,
+                ))
                 .init(device),
-            batch_norm: BatchNormConfig::new(self.d_model).init(device),
-            pointwise_out: Conv1dConfig::new(self.d_model, self.d_model, 1).init(device),
+            pointwise_out: Conv1dConfig::new(hidden, self.d_model, 1).init(device),
             dropout: DropoutConfig::new(self.dropout).init(),
         }
     }
 }
 
 #[derive(Module, Debug)]
-pub struct SqueezeformerConvolution<B: Backend> {
-    norm: LayerNorm<B>,
+pub struct ConvolutionModule<B: Backend> {
+    input_transform: ScaleBiasLayer<B>,
     pointwise_in: Conv1d<B>,
     depthwise: Conv1d<B>,
-    batch_norm: BatchNorm<B>,
     pointwise_out: Conv1d<B>,
     dropout: Dropout,
 }
 
-impl<B: Backend> SqueezeformerConvolution<B> {
-    pub fn forward(&self, input: Tensor<B, 3>) -> Tensor<B, 3> {
+impl<B: Backend> ConvolutionModule<B> {
+    pub fn forward(&self, input: Tensor<B, 3>, lengths: &[usize]) -> Tensor<B, 3> {
+        let residual = input.clone();
         let [batch_size, seq_len, d_model] = input.dims();
 
-        let output = self.norm.forward(input);
+        let output = self.input_transform.forward(input);
         let output = output.swap_dims(1, 2);
         let output = self.pointwise_in.forward(output);
-        let mut chunks = output.chunk(2, 1);
-        let gate = chunks.remove(1);
-        let value = chunks.remove(0);
-        let output = value * sigmoid(gate);
-        let output = self.depthwise.forward(output);
-        let output = self.batch_norm.forward(output);
         let output = silu(output);
+        let output = apply_channel_time_mask(output, lengths);
+        let output = self.depthwise.forward(output);
+        let output = silu(output);
+        let output = apply_channel_time_mask(output, lengths);
         let output = self.pointwise_out.forward(output);
         let output = self.dropout.forward(output);
 
-        output
-            .swap_dims(1, 2)
-            .reshape([batch_size, seq_len, d_model])
+        residual
+            + output
+                .swap_dims(1, 2)
+                .reshape([batch_size, seq_len, d_model])
     }
 }
 
@@ -170,9 +404,9 @@ pub struct SqueezeformerBlockConfig {
     pub d_model: usize,
     pub n_heads: usize,
     pub ff_expansion_factor: usize,
+    pub conv_expansion_factor: usize,
     pub conv_kernel_size: usize,
     pub dropout: f64,
-    pub activation: SqueezeformerActivation,
 }
 
 impl SqueezeformerBlockConfig {
@@ -181,14 +415,19 @@ impl SqueezeformerBlockConfig {
             d_model,
             n_heads,
             ff_expansion_factor: 4,
+            conv_expansion_factor: 2,
             conv_kernel_size: 31,
             dropout: 0.1,
-            activation: SqueezeformerActivation::Silu,
         }
     }
 
     pub fn with_ff_expansion_factor(mut self, ff_expansion_factor: usize) -> Self {
         self.ff_expansion_factor = ff_expansion_factor;
+        self
+    }
+
+    pub fn with_conv_expansion_factor(mut self, conv_expansion_factor: usize) -> Self {
+        self.conv_expansion_factor = conv_expansion_factor;
         self
     }
 
@@ -199,94 +438,304 @@ impl SqueezeformerBlockConfig {
 
     pub fn with_dropout(mut self, dropout: f64) -> Self {
         self.dropout = dropout;
-        self
-    }
-
-    pub fn with_activation(mut self, activation: SqueezeformerActivation) -> Self {
-        self.activation = activation;
         self
     }
 
     pub fn init<B: Backend>(&self, device: &B::Device) -> SqueezeformerBlock<B> {
         SqueezeformerBlock {
-            ff1: SqueezeformerFeedForwardConfig::new(self.d_model)
-                .with_expansion_factor(self.ff_expansion_factor)
-                .with_dropout(self.dropout)
-                .with_activation(self.activation)
-                .init(device),
-            attention_norm: LayerNormConfig::new(self.d_model).init(device),
-            attention: MultiHeadAttentionConfig::new(self.d_model, self.n_heads)
-                .with_dropout(self.dropout)
-                .init(device),
-            attention_dropout: DropoutConfig::new(self.dropout).init(),
-            convolution: SqueezeformerConvolutionConfig::new(self.d_model)
-                .with_kernel_size(self.conv_kernel_size)
-                .with_dropout(self.dropout)
-                .init(device),
-            ff2: SqueezeformerFeedForwardConfig::new(self.d_model)
-                .with_expansion_factor(self.ff_expansion_factor)
-                .with_dropout(self.dropout)
-                .with_activation(self.activation)
-                .init(device),
-            final_norm: LayerNormConfig::new(self.d_model).init(device),
+            mhsa_ff: MhsaFfModule {
+                attention: AttentionModuleConfig::new(self.d_model, self.n_heads)
+                    .with_dropout(self.dropout)
+                    .init(device),
+                mid_norm: LayerNormConfig::new(self.d_model).init(device),
+                feed_forward: FeedForwardModuleConfig::new(self.d_model)
+                    .with_expansion_factor(self.ff_expansion_factor)
+                    .with_dropout(self.dropout)
+                    .init(device),
+                out_norm: LayerNormConfig::new(self.d_model).init(device),
+            },
+            conv_ff: ConvFfModule {
+                convolution: ConvolutionModuleConfig::new(self.d_model)
+                    .with_kernel_size(self.conv_kernel_size)
+                    .with_expansion_factor(self.conv_expansion_factor)
+                    .with_dropout(self.dropout)
+                    .init(device),
+                mid_norm: LayerNormConfig::new(self.d_model).init(device),
+                feed_forward: FeedForwardModuleConfig::new(self.d_model)
+                    .with_expansion_factor(self.ff_expansion_factor)
+                    .with_dropout(self.dropout)
+                    .init(device),
+                out_norm: LayerNormConfig::new(self.d_model).init(device),
+            },
         }
     }
 }
 
 #[derive(Module, Debug)]
+pub struct MhsaFfModule<B: Backend> {
+    attention: AttentionModule<B>,
+    mid_norm: LayerNorm<B>,
+    feed_forward: FeedForwardModule<B>,
+    out_norm: LayerNorm<B>,
+}
+
+impl<B: Backend> MhsaFfModule<B> {
+    pub fn forward(
+        &self,
+        input: Tensor<B, 3>,
+        pos_embedding: Tensor<B, 3>,
+        mask: Tensor<B, 3, Bool>,
+    ) -> Tensor<B, 3> {
+        let output = self.attention.forward(input, pos_embedding, mask);
+        let output = self.mid_norm.forward(output);
+        let output = self.feed_forward.forward(output);
+        self.out_norm.forward(output)
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct ConvFfModule<B: Backend> {
+    convolution: ConvolutionModule<B>,
+    mid_norm: LayerNorm<B>,
+    feed_forward: FeedForwardModule<B>,
+    out_norm: LayerNorm<B>,
+}
+
+impl<B: Backend> ConvFfModule<B> {
+    pub fn forward(&self, input: Tensor<B, 3>, lengths: &[usize]) -> Tensor<B, 3> {
+        let output = self.convolution.forward(input, lengths);
+        let output = self.mid_norm.forward(output);
+        let output = self.feed_forward.forward(output);
+        self.out_norm.forward(output)
+    }
+}
+
+#[derive(Module, Debug)]
 pub struct SqueezeformerBlock<B: Backend> {
-    ff1: SqueezeformerFeedForward<B>,
-    attention_norm: LayerNorm<B>,
-    attention: MultiHeadAttention<B>,
-    attention_dropout: Dropout,
-    convolution: SqueezeformerConvolution<B>,
-    ff2: SqueezeformerFeedForward<B>,
-    final_norm: LayerNorm<B>,
+    mhsa_ff: MhsaFfModule<B>,
+    conv_ff: ConvFfModule<B>,
 }
 
 impl<B: Backend> SqueezeformerBlock<B> {
+    pub fn forward(
+        &self,
+        input: Tensor<B, 3>,
+        lengths: &[usize],
+        pos_embedding: Tensor<B, 3>,
+        mask: Tensor<B, 3, Bool>,
+    ) -> Tensor<B, 3> {
+        let output = self.mhsa_ff.forward(input, pos_embedding, mask);
+        self.conv_ff.forward(output, lengths)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Conv2dSubsamplingConfig {
+    pub input_features: usize,
+    pub d_model: usize,
+}
+
+impl Conv2dSubsamplingConfig {
+    pub fn new(input_features: usize, d_model: usize) -> Self {
+        Self {
+            input_features,
+            d_model,
+        }
+    }
+
+    pub fn output_dim(&self) -> usize {
+        self.d_model * subsample_once(subsample_once(self.input_features))
+    }
+
+    pub fn init<B: Backend>(&self, device: &B::Device) -> Conv2dSubsampling<B> {
+        Conv2dSubsampling {
+            conv1: Conv2dConfig::new([1, self.d_model], [3, 3])
+                .with_stride([2, 2])
+                .init(device),
+            depthwise: Conv2dConfig::new([self.d_model, self.d_model], [3, 3])
+                .with_stride([2, 2])
+                .with_groups(self.d_model)
+                .init(device),
+            pointwise: Conv2dConfig::new([self.d_model, self.d_model], [1, 1]).init(device),
+        }
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct Conv2dSubsampling<B: Backend> {
+    conv1: Conv2d<B>,
+    depthwise: Conv2d<B>,
+    pointwise: Conv2d<B>,
+}
+
+impl<B: Backend> Conv2dSubsampling<B> {
     pub fn forward(&self, input: Tensor<B, 3>) -> Tensor<B, 3> {
-        let residual = input.clone();
-        let output = input + self.ff1.forward(residual) * 0.5;
+        let mut output = input.unsqueeze_dim::<4>(1);
+        output = pad_for_stride2_conv(output);
+        output = relu(self.conv1.forward(output));
+        output = pad_for_stride2_conv(output);
+        output = self.depthwise.forward(output);
+        output = relu(self.pointwise.forward(output));
 
-        let residual = output.clone();
-        let attention_input = self.attention_norm.forward(output);
-        let attention_output = self.attention.forward(MhaInput::self_attn(attention_input));
-        let output = residual + self.attention_dropout.forward(attention_output.context);
+        let [batch_size, channels, time, features] = output.dims();
+        output
+            .swap_dims(1, 2)
+            .reshape([batch_size, time, channels * features])
+    }
+}
 
-        let residual = output.clone();
-        let output = output + self.convolution.forward(residual);
+#[derive(Clone, Debug)]
+pub struct TimeReductionLayerConfig {
+    pub d_model: usize,
+    pub kernel_size: usize,
+    pub stride: usize,
+}
 
-        let residual = output.clone();
-        let output = output + self.ff2.forward(residual) * 0.5;
-        self.final_norm.forward(output)
+impl TimeReductionLayerConfig {
+    pub fn new(d_model: usize) -> Self {
+        Self {
+            d_model,
+            kernel_size: 3,
+            stride: 2,
+        }
+    }
+
+    pub fn with_kernel_size(mut self, kernel_size: usize) -> Self {
+        self.kernel_size = kernel_size;
+        self
+    }
+
+    pub fn init<B: Backend>(&self, device: &B::Device) -> TimeReductionLayer<B> {
+        TimeReductionLayer {
+            depthwise: Conv1dConfig::new(self.d_model, self.d_model, self.kernel_size)
+                .with_stride(self.stride)
+                .with_groups(self.d_model)
+                .init(device),
+            pointwise: Conv1dConfig::new(self.d_model, self.d_model, 1).init(device),
+            kernel_size: self.kernel_size,
+            stride: self.stride,
+        }
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct TimeReductionLayer<B: Backend> {
+    depthwise: Conv1d<B>,
+    pointwise: Conv1d<B>,
+    kernel_size: usize,
+    stride: usize,
+}
+
+impl<B: Backend> TimeReductionLayer<B> {
+    pub fn forward(&self, input: Tensor<B, 3>, lengths: &[usize]) -> (Tensor<B, 3>, Vec<usize>) {
+        let output = apply_time_mask(input, lengths).swap_dims(1, 2);
+        let output = output.pad(
+            [(0, self.kernel_size.saturating_sub(self.stride))],
+            PadMode::Constant(0.0),
+        );
+        let output = self
+            .pointwise
+            .forward(self.depthwise.forward(output))
+            .swap_dims(1, 2);
+        let next_lengths = lengths
+            .iter()
+            .map(|length| {
+                if *length == 0 {
+                    0
+                } else {
+                    (length / self.stride).max(1)
+                }
+            })
+            .collect();
+
+        (output, next_lengths)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TimeRecoveryLayerConfig {
+    pub d_model: usize,
+    pub stride: usize,
+}
+
+impl TimeRecoveryLayerConfig {
+    pub fn new(d_model: usize) -> Self {
+        Self { d_model, stride: 2 }
+    }
+
+    pub fn init<B: Backend>(&self, device: &B::Device) -> TimeRecoveryLayer<B> {
+        TimeRecoveryLayer {
+            projection: LinearConfig::new(self.d_model, self.d_model).init(device),
+            stride: self.stride,
+        }
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct TimeRecoveryLayer<B: Backend> {
+    projection: Linear<B>,
+    stride: usize,
+}
+
+impl<B: Backend> TimeRecoveryLayer<B> {
+    pub fn forward(&self, input: Tensor<B, 3>, skip: Tensor<B, 3>) -> Tensor<B, 3> {
+        let [_, target_len, _] = skip.dims();
+        let mut output = input.repeat_dim(1, self.stride);
+        let [_, current_len, _] = output.dims();
+        output = if current_len < target_len {
+            output.pad([(0, target_len - current_len), (0, 0)], PadMode::Edge)
+        } else {
+            output.slice_dim(1, 0..target_len)
+        };
+
+        skip + self.projection.forward(output)
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct SqueezeformerEncoderConfig {
-    pub input_dim: usize,
+    pub input_features: usize,
     pub d_model: usize,
-    pub n_layers: usize,
-    pub n_heads: usize,
+    pub num_layers: usize,
+    pub num_heads: usize,
+    pub kernel_size: usize,
     pub ff_expansion_factor: usize,
-    pub conv_kernel_size: usize,
+    pub conv_expansion_factor: usize,
     pub dropout: f64,
-    pub activation: SqueezeformerActivation,
+    pub time_reduction_kernel_size: usize,
+    pub time_reduce_idx: Vec<usize>,
+    pub time_recover_idx: Vec<usize>,
 }
 
 impl SqueezeformerEncoderConfig {
-    pub fn new(input_dim: usize, d_model: usize, n_layers: usize, n_heads: usize) -> Self {
+    pub fn new(input_features: usize, d_model: usize, num_layers: usize, num_heads: usize) -> Self {
         Self {
-            input_dim,
+            input_features,
             d_model,
-            n_layers,
-            n_heads,
+            num_layers,
+            num_heads,
+            kernel_size: 31,
             ff_expansion_factor: 4,
-            conv_kernel_size: 31,
+            conv_expansion_factor: 2,
             dropout: 0.1,
-            activation: SqueezeformerActivation::Silu,
+            time_reduction_kernel_size: 3,
+            time_reduce_idx: vec![7],
+            time_recover_idx: vec![15],
         }
+    }
+
+    pub fn variant(name: &str) -> Option<Self> {
+        let config = match name {
+            "xs" => Self::new(80, 144, 16, 4),
+            "s" => Self::new(80, 196, 18, 4).with_time_indices(vec![8], vec![17]),
+            "sm" => Self::new(80, 256, 16, 4),
+            "m" => Self::new(80, 324, 20, 4).with_time_indices(vec![9], vec![19]),
+            "ml" => Self::new(80, 512, 18, 8).with_time_indices(vec![8], vec![17]),
+            "l" => Self::new(80, 640, 22, 8).with_time_indices(vec![10], vec![21]),
+            _ => return None,
+        };
+
+        Some(config)
     }
 
     pub fn with_ff_expansion_factor(mut self, ff_expansion_factor: usize) -> Self {
@@ -294,8 +743,13 @@ impl SqueezeformerEncoderConfig {
         self
     }
 
-    pub fn with_conv_kernel_size(mut self, conv_kernel_size: usize) -> Self {
-        self.conv_kernel_size = conv_kernel_size;
+    pub fn with_conv_expansion_factor(mut self, conv_expansion_factor: usize) -> Self {
+        self.conv_expansion_factor = conv_expansion_factor;
+        self
+    }
+
+    pub fn with_conv_kernel_size(mut self, kernel_size: usize) -> Self {
+        self.kernel_size = kernel_size;
         self
     }
 
@@ -304,48 +758,109 @@ impl SqueezeformerEncoderConfig {
         self
     }
 
-    pub fn with_activation(mut self, activation: SqueezeformerActivation) -> Self {
-        self.activation = activation;
+    pub fn with_time_indices(mut self, reduce: Vec<usize>, recover: Vec<usize>) -> Self {
+        self.time_reduce_idx = reduce;
+        self.time_recover_idx = recover;
         self
     }
 
     pub fn init<B: Backend>(&self, device: &B::Device) -> SqueezeformerEncoder<B> {
-        let blocks = (0..self.n_layers)
+        let subsampling_config = Conv2dSubsamplingConfig::new(self.input_features, self.d_model);
+        let blocks = (0..self.num_layers)
             .map(|_| {
-                SqueezeformerBlockConfig::new(self.d_model, self.n_heads)
+                SqueezeformerBlockConfig::new(self.d_model, self.num_heads)
                     .with_ff_expansion_factor(self.ff_expansion_factor)
-                    .with_conv_kernel_size(self.conv_kernel_size)
+                    .with_conv_expansion_factor(self.conv_expansion_factor)
+                    .with_conv_kernel_size(self.kernel_size)
                     .with_dropout(self.dropout)
-                    .with_activation(self.activation)
                     .init(device)
             })
             .collect();
 
         SqueezeformerEncoder {
-            input_projection: LinearConfig::new(self.input_dim, self.d_model).init(device),
+            subsampling: subsampling_config.init(device),
+            input_projection: LinearConfig::new(subsampling_config.output_dim(), self.d_model)
+                .init(device),
             input_dropout: DropoutConfig::new(self.dropout).init(),
+            input_norm: LayerNormConfig::new(self.d_model).init(device),
+            pos_encoding: RelativePositionalEncoding::new(self.d_model),
             blocks,
+            time_reduction: TimeReductionLayerConfig::new(self.d_model)
+                .with_kernel_size(self.time_reduction_kernel_size)
+                .init(device),
+            time_recovery: TimeRecoveryLayerConfig::new(self.d_model).init(device),
+            time_reduce_idx: self.time_reduce_idx.clone(),
+            time_recover_idx: self.time_recover_idx.clone(),
+            d_model: self.d_model,
         }
     }
 }
 
 #[derive(Module, Debug)]
 pub struct SqueezeformerEncoder<B: Backend> {
+    subsampling: Conv2dSubsampling<B>,
     input_projection: Linear<B>,
     input_dropout: Dropout,
+    input_norm: LayerNorm<B>,
+    pos_encoding: RelativePositionalEncoding,
     blocks: Vec<SqueezeformerBlock<B>>,
+    time_reduction: TimeReductionLayer<B>,
+    time_recovery: TimeRecoveryLayer<B>,
+    time_reduce_idx: Vec<usize>,
+    time_recover_idx: Vec<usize>,
+    d_model: usize,
 }
 
 impl<B: Backend> SqueezeformerEncoder<B> {
     pub fn forward(&self, input: Tensor<B, 3>) -> Tensor<B, 3> {
-        let mut output = self.input_projection.forward(input);
-        output = self.input_dropout.forward(output);
+        let [batch_size, seq_len, _] = input.dims();
+        self.forward_with_lengths(input, vec![seq_len; batch_size])
+            .0
+    }
 
-        for block in self.blocks.iter() {
-            output = block.forward(output);
+    pub fn forward_with_lengths(
+        &self,
+        input: Tensor<B, 3>,
+        lengths: Vec<usize>,
+    ) -> (Tensor<B, 3>, Vec<usize>) {
+        let device = input.device();
+        let mut lengths = subsample_lengths(&lengths);
+        let mut output = self.subsampling.forward(input);
+        output = self.input_projection.forward(output) * (self.d_model as f64).sqrt();
+        output = self.input_dropout.forward(output);
+        output = self.input_norm.forward(output);
+        output = apply_time_mask(output, &lengths);
+
+        let mut stack = Vec::new();
+        for (index, block) in self.blocks.iter().enumerate() {
+            if self.time_reduce_idx.contains(&index) {
+                stack.push((output.clone(), lengths.clone()));
+                (output, lengths) = self.time_reduction.forward(output, &lengths);
+            }
+
+            if self.time_recover_idx.contains(&index) {
+                if let Some((skip, skip_lengths)) = stack.pop() {
+                    output = self.time_recovery.forward(output, skip);
+                    lengths = skip_lengths;
+                } else {
+                    panic!("encountered a recovery layer without a matching reduced activation");
+                }
+            }
+
+            let max_len = lengths.iter().copied().max().unwrap_or(0);
+            let current_len = output.dims()[1];
+            if max_len > 0 && current_len > max_len {
+                output = output.slice_dim(1, 0..max_len);
+            }
+
+            let seq_len = output.dims()[1];
+            let pos_embedding = self.pos_encoding.forward::<B>(seq_len, &device);
+            let mask = attention_mask::<B>(&lengths, seq_len, &device);
+            output = block.forward(output, &lengths, pos_embedding, mask);
+            output = apply_time_mask(output, &lengths);
         }
 
-        output
+        (output, lengths)
     }
 }
 
@@ -357,14 +872,19 @@ pub struct SqueezeformerCtcConfig {
 
 impl SqueezeformerCtcConfig {
     pub fn new(
-        input_dim: usize,
+        input_features: usize,
         d_model: usize,
-        n_layers: usize,
-        n_heads: usize,
+        num_layers: usize,
+        num_heads: usize,
         vocab_size: usize,
     ) -> Self {
         Self {
-            encoder: SqueezeformerEncoderConfig::new(input_dim, d_model, n_layers, n_heads),
+            encoder: SqueezeformerEncoderConfig::new(
+                input_features,
+                d_model,
+                num_layers,
+                num_heads,
+            ),
             vocab_size,
         }
     }
@@ -390,8 +910,84 @@ pub struct SqueezeformerCtc<B: Backend> {
 
 impl<B: Backend> SqueezeformerCtc<B> {
     pub fn forward(&self, input: Tensor<B, 3>) -> Tensor<B, 3> {
-        self.classifier.forward(self.encoder.forward(input))
+        self.forward_with_lengths(input, None).0
     }
+
+    pub fn forward_with_lengths(
+        &self,
+        input: Tensor<B, 3>,
+        lengths: Option<Vec<usize>>,
+    ) -> (Tensor<B, 3>, Vec<usize>) {
+        let [batch_size, seq_len, _] = input.dims();
+        let lengths = lengths.unwrap_or_else(|| vec![seq_len; batch_size]);
+        let (encoded, lengths) = self.encoder.forward_with_lengths(input, lengths);
+        (self.classifier.forward(encoded), lengths)
+    }
+}
+
+fn pad_for_stride2_conv<B: Backend>(input: Tensor<B, 4>) -> Tensor<B, 4> {
+    let [_, _, height, width] = input.dims();
+    let pad_bottom = 1.max(3usize.saturating_sub(height));
+    let pad_right = 1.max(3usize.saturating_sub(width));
+    input.pad((0, pad_right, 0, pad_bottom), PadMode::Constant(0.0))
+}
+
+fn sequence_mask<B: Backend>(
+    lengths: &[usize],
+    max_len: usize,
+    device: &B::Device,
+) -> Tensor<B, 2, Bool> {
+    let mut values = Vec::with_capacity(lengths.len() * max_len);
+    for length in lengths {
+        for index in 0..max_len {
+            values.push(index < *length);
+        }
+    }
+
+    Tensor::from_data(TensorData::new(values, [lengths.len(), max_len]), device)
+}
+
+fn attention_mask<B: Backend>(
+    lengths: &[usize],
+    max_len: usize,
+    device: &B::Device,
+) -> Tensor<B, 3, Bool> {
+    let mask = sequence_mask::<B>(lengths, max_len, device);
+    mask.clone()
+        .unsqueeze_dim::<3>(1)
+        .repeat_dim(1, max_len)
+        .bool_and(mask.unsqueeze_dim::<3>(2).repeat_dim(2, max_len))
+}
+
+fn apply_time_mask<B: Backend>(input: Tensor<B, 3>, lengths: &[usize]) -> Tensor<B, 3> {
+    let [_, seq_len, _] = input.dims();
+    let mask = sequence_mask::<B>(lengths, seq_len, &input.device())
+        .float()
+        .unsqueeze_dim::<3>(2);
+    input * mask
+}
+
+fn apply_channel_time_mask<B: Backend>(input: Tensor<B, 3>, lengths: &[usize]) -> Tensor<B, 3> {
+    let [_, _, seq_len] = input.dims();
+    let mask = sequence_mask::<B>(lengths, seq_len, &input.device())
+        .float()
+        .unsqueeze_dim::<3>(1);
+    input * mask
+}
+
+fn subsample_once(length: usize) -> usize {
+    if length == 0 {
+        0
+    } else {
+        ((length - 1) / 2) + 1
+    }
+}
+
+fn subsample_lengths(lengths: &[usize]) -> Vec<usize> {
+    lengths
+        .iter()
+        .map(|length| subsample_once(subsample_once(*length)).max(usize::from(*length > 0)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -402,13 +998,14 @@ mod tests {
     type TestBackend = NdArray<f32>;
 
     #[test]
-    fn ctc_model_preserves_batch_and_time_axes() {
+    fn ctc_model_subsamples_time_and_preserves_batch_axis() {
         let device = Default::default();
         let model = SqueezeformerCtcConfig::new(80, 16, 2, 4, 32).init::<TestBackend>(&device);
-        let input = Tensor::<TestBackend, 3>::zeros([2, 7, 80], &device);
+        let input = Tensor::<TestBackend, 3>::zeros([2, 16, 80], &device);
 
-        let output = model.forward(input);
+        let (output, lengths) = model.forward_with_lengths(input, None);
 
-        assert_eq!(output.dims(), [2, 7, 32]);
+        assert_eq!(output.dims(), [2, 4, 32]);
+        assert_eq!(lengths, vec![4, 4]);
     }
 }
