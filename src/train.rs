@@ -6718,6 +6718,10 @@ where
     if resume.is_some() {
         bail!("--init-from cannot be combined with --resume-from");
     }
+    if is_positiveloss_weights_json(path) {
+        let weights_path = resolve_positiveloss_weights_json(path)?;
+        return load_safetensors_initial_weights(model, &weights_path, device);
+    }
     if is_safetensors_path(path) {
         return load_safetensors_initial_weights(model, path, device);
     }
@@ -6729,6 +6733,36 @@ where
 
 fn is_safetensors_path(path: &Path) -> bool {
     path.extension().and_then(|value| value.to_str()) == Some("safetensors")
+}
+
+fn is_positiveloss_weights_json(path: &Path) -> bool {
+    path.file_name().and_then(|value| value.to_str()) == Some("weights.json")
+}
+
+fn resolve_positiveloss_weights_json(path: &Path) -> Result<PathBuf> {
+    let sibling = path.with_file_name("model.safetensors");
+    if sibling.exists() {
+        return Ok(sibling);
+    }
+    let text = fs::read_to_string(path).with_context(|| {
+        format!(
+            "failed to read PositiveLoss weights metadata {}",
+            path.display()
+        )
+    })?;
+    let metadata: Value = serde_json::from_str(&text).with_context(|| {
+        format!(
+            "failed to parse PositiveLoss weights metadata {}",
+            path.display()
+        )
+    })?;
+    let weights = json_path(&metadata, "weights").with_context(|| {
+        format!(
+            "PositiveLoss weights metadata {} does not contain a weights path and sibling model.safetensors is missing",
+            path.display()
+        )
+    })?;
+    Ok(weights)
 }
 
 fn resolve_model_checkpoint_base_path(path: &Path) -> PathBuf {
@@ -6771,27 +6805,31 @@ where
         }
     }
 
-    let mut collector = WarmStartPathCollector::<B> {
-        paths: HashMap::new(),
-        phantom: std::marker::PhantomData,
-    };
-    model.visit(&mut collector);
     let mut mapper = WarmStartMapper::<B> {
         weights,
-        paths: collector.paths,
+        path: Vec::new(),
         device,
         loaded: 0,
         skipped_shape: 0,
+        transposed: 0,
+        skipped_shape_examples: Vec::new(),
         phantom: std::marker::PhantomData,
     };
     let model = model.map(&mut mapper);
     log::info!(
-        "initialized {} tensor(s) from {}, skipped_shape={}, skipped_dtype={}",
+        "initialized {} tensor(s) from {}, transposed={}, skipped_shape={}, skipped_dtype={}",
         mapper.loaded,
         path.display(),
+        mapper.transposed,
         mapper.skipped_shape,
-        skipped_dtype
+        skipped_dtype,
     );
+    if !mapper.skipped_shape_examples.is_empty() {
+        log::warn!(
+            "warm-start skipped shape examples: {}",
+            mapper.skipped_shape_examples.join(", ")
+        );
+    }
     Ok(model)
 }
 
@@ -6817,48 +6855,205 @@ fn safetensor_name_aliases(name: &str) -> Vec<String> {
     aliases
 }
 
-struct WarmStartPathCollector<B: AutodiffBackend> {
-    paths: HashMap<ParamId, String>,
-    phantom: std::marker::PhantomData<B>,
-}
-
-impl<B: AutodiffBackend> ModuleVisitor<B> for WarmStartPathCollector<B> {
-    fn visit_float_with_path<const D: usize>(
-        &mut self,
-        path: &[String],
-        id: ParamId,
-        _tensor: &Tensor<B, D>,
-    ) {
-        self.paths.insert(id, path.join("."));
-    }
-}
-
 struct WarmStartMapper<'a, B: AutodiffBackend> {
     weights: HashMap<String, TensorData>,
-    paths: HashMap<ParamId, String>,
+    path: Vec<String>,
     device: &'a B::Device,
     loaded: usize,
     skipped_shape: usize,
+    transposed: usize,
+    skipped_shape_examples: Vec<String>,
     phantom: std::marker::PhantomData<B>,
 }
 
 impl<B: AutodiffBackend> ModuleMapper<B> for WarmStartMapper<'_, B> {
+    fn enter_module(&mut self, name: &str, _container_type: &str) {
+        self.path.push(name.to_string());
+    }
+
+    fn exit_module(&mut self, _name: &str, _container_type: &str) {
+        self.path.pop();
+    }
+
     fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
         let (id, current, mapper) = param.consume();
-        let Some(path) = self.paths.get(&id) else {
+        let path = self.path.join(".");
+        let data = warm_start_name_candidates(&path)
+            .into_iter()
+            .find_map(|candidate| self.weights.get(&candidate).cloned());
+        let Some(data) = data else {
             return Param::from_mapped_value(id, current, mapper);
         };
-        let Some(data) = self.weights.get(path).cloned() else {
-            return Param::from_mapped_value(id, current, mapper);
-        };
+        let (data, transposed) = maybe_transpose_warm_start_data(&path, data, &current.dims());
+        if transposed {
+            self.transposed += 1;
+        }
         if data.shape.as_slice() != current.dims() {
             self.skipped_shape += 1;
+            if self.skipped_shape_examples.len() < 8 {
+                self.skipped_shape_examples.push(format!(
+                    "{path}: source={:?} target={:?}",
+                    data.shape.as_slice(),
+                    current.dims()
+                ));
+            }
             return Param::from_mapped_value(id, current, mapper);
         }
         let require_grad = current.is_require_grad();
         let tensor = Tensor::<B, D>::from_data(data, self.device).set_require_grad(require_grad);
         self.loaded += 1;
         Param::from_mapped_value(id, tensor, mapper)
+    }
+}
+
+fn maybe_transpose_warm_start_data<const D: usize>(
+    path: &str,
+    data: TensorData,
+    target_shape: &[usize; D],
+) -> (TensorData, bool) {
+    if !should_transpose_warm_start_2d(path) || data.shape.as_slice().len() != 2 {
+        return (data, false);
+    }
+    let source_shape = data.shape.as_slice();
+    let [rows, cols] = [source_shape[0], source_shape[1]];
+    if target_shape.as_slice() != [cols, rows] && target_shape.as_slice() != [rows, cols] {
+        return (data, false);
+    }
+    let Ok(values) = data.into_vec::<f32>() else {
+        return (TensorData::new(Vec::<f32>::new(), [0]), false);
+    };
+    let mut transposed = vec![0.0f32; values.len()];
+    for row in 0..rows {
+        for col in 0..cols {
+            transposed[col * rows + row] = values[row * cols + col];
+        }
+    }
+    (TensorData::new(transposed, [cols, rows]), true)
+}
+
+fn should_transpose_warm_start_2d(path: &str) -> bool {
+    path.ends_with(".weight")
+        && (path == "classifier.weight"
+            || path.contains("input_projection.")
+            || path.contains(".attention.")
+            || path.contains(".feed_forward.")
+            || path.contains("time_recovery.projection."))
+}
+
+fn warm_start_name_candidates(path: &str) -> Vec<String> {
+    let mut candidates = vec![path.to_string()];
+    if let Some(alias) = squeezeformer_positiveloss_alias(path) {
+        candidates.push(alias);
+    }
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+fn squeezeformer_positiveloss_alias(path: &str) -> Option<String> {
+    if let Some(suffix) = path.strip_prefix("encoder.subsampling.depthwise.") {
+        return Some(format!("encoder.subsampling.conv2_dw.{suffix}"));
+    }
+    if let Some(suffix) = path.strip_prefix("encoder.subsampling.pointwise.") {
+        return Some(format!("encoder.subsampling.conv2_pw.{suffix}"));
+    }
+    if let Some(suffix) = path.strip_prefix("encoder.time_reduction.") {
+        return Some(format!("encoder.time_reduce.7.{suffix}"));
+    }
+    if let Some(suffix) = path.strip_prefix("encoder.time_recovery.projection.") {
+        return Some(format!("encoder.time_recover.15.proj.{suffix}"));
+    }
+
+    let parts = path.split('.').collect::<Vec<_>>();
+    if parts.len() < 5 || parts[0] != "encoder" || parts[1] != "blocks" {
+        return None;
+    }
+    let block = parts[2];
+    let rest = &parts[3..];
+    if rest.first() == Some(&"mhsa_ff") {
+        return squeezeformer_mhsa_ff_alias(block, &rest[1..]);
+    }
+    if rest.first() == Some(&"conv_ff") {
+        return squeezeformer_conv_ff_alias(block, &rest[1..]);
+    }
+    None
+}
+
+fn squeezeformer_mhsa_ff_alias(block: &str, rest: &[&str]) -> Option<String> {
+    match rest {
+        ["attention", "input_transform", tail @ ..] => Some(format!(
+            "encoder.blocks.{block}.layers.0.attn.input_transform.{}",
+            tail.join(".")
+        )),
+        ["attention", "attention", projection, tail @ ..] => {
+            let projection = match *projection {
+                "query_proj" => "query",
+                "key_proj" => "key",
+                "value_proj" => "value",
+                other => other,
+            };
+            Some(format!(
+                "encoder.blocks.{block}.layers.0.attn.attn.{projection}.{}",
+                tail.join(".")
+            ))
+        }
+        ["mid_norm", tail @ ..] => Some(format!(
+            "encoder.blocks.{block}.layers.0.mid_norm.{}",
+            tail.join(".")
+        )),
+        ["feed_forward", "input_transform", tail @ ..] => Some(format!(
+            "encoder.blocks.{block}.layers.0.ff.input_transform.{}",
+            tail.join(".")
+        )),
+        ["feed_forward", linear, tail @ ..] => {
+            let linear = match *linear {
+                "linear_in" => "linear1",
+                "linear_out" => "linear2",
+                other => other,
+            };
+            Some(format!(
+                "encoder.blocks.{block}.layers.0.ff.{linear}.{}",
+                tail.join(".")
+            ))
+        }
+        ["out_norm", tail @ ..] => Some(format!(
+            "encoder.blocks.{block}.layers.0.out_norm.{}",
+            tail.join(".")
+        )),
+        _ => None,
+    }
+}
+
+fn squeezeformer_conv_ff_alias(block: &str, rest: &[&str]) -> Option<String> {
+    match rest {
+        ["convolution", tail @ ..] => Some(format!(
+            "encoder.blocks.{block}.layers.2.conv.{}",
+            tail.join(".")
+        )),
+        ["mid_norm", tail @ ..] => Some(format!(
+            "encoder.blocks.{block}.layers.2.mid_norm.{}",
+            tail.join(".")
+        )),
+        ["feed_forward", "input_transform", tail @ ..] => Some(format!(
+            "encoder.blocks.{block}.layers.2.ff.input_transform.{}",
+            tail.join(".")
+        )),
+        ["feed_forward", linear, tail @ ..] => {
+            let linear = match *linear {
+                "linear_in" => "linear1",
+                "linear_out" => "linear2",
+                other => other,
+            };
+            Some(format!(
+                "encoder.blocks.{block}.layers.2.ff.{linear}.{}",
+                tail.join(".")
+            ))
+        }
+        ["out_norm", tail @ ..] => Some(format!(
+            "encoder.blocks.{block}.layers.2.out_norm.{}",
+            tail.join(".")
+        )),
+        _ => None,
     }
 }
 
