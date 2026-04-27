@@ -6,7 +6,10 @@
 //! This module keeps the custom architecture-specific pieces isolated behind
 //! `asr-cubecl-kernels` while Burn's default path remains the portable fallback.
 
-use burn::tensor::{Int as BurnInt, Shape, Tensor as BurnTensor, TensorMetadata, TensorPrimitive};
+use burn::tensor::{
+    Bool as BurnBool, Int as BurnInt, Shape, Tensor as BurnTensor, TensorMetadata, TensorPrimitive,
+    get_device_settings,
+};
 use burn_cubecl::cubecl::prelude::InputScalar;
 use burn_cubecl::{
     CubeBackend, CubeRuntime, FloatElement, IntElement,
@@ -32,6 +35,14 @@ pub enum AsrKernelTarget {
     MaskTime,
     /// Apply a `[batch, time]` length mask to `[batch, channels, time]`.
     MaskChannelTime,
+    /// Build a `[batch, time]` boolean mask where valid frames are true.
+    SequenceMask,
+    /// Build a `[batch, time]` boolean mask where padded frames are true.
+    PaddingMask,
+    /// Build a `[batch, query_time, key_time]` boolean attention mask.
+    AttentionMask,
+    /// Fuse `value * sigmoid(gate)` after splitting channels.
+    Glu,
 }
 
 /// Static analysis of the current ASR architectures and where custom CubeCL
@@ -42,6 +53,10 @@ pub const ASR_KERNEL_TARGETS: &[AsrKernelTarget] = &[
     AsrKernelTarget::RelativeShift,
     AsrKernelTarget::MaskTime,
     AsrKernelTarget::MaskChannelTime,
+    AsrKernelTarget::SequenceMask,
+    AsrKernelTarget::PaddingMask,
+    AsrKernelTarget::AttentionMask,
+    AsrKernelTarget::Glu,
 ];
 
 /// Fused Zipformer Swoosh-L activation for non-fusion CubeCL backends.
@@ -186,6 +201,135 @@ where
     let primitive = into_float_cube(input);
     let lengths = lengths.into_primitive();
     let output = mask_time_cube(primitive, lengths, MaskLayout::BatchChannelsTime);
+    BurnTensor::from_primitive(TensorPrimitive::Float(output))
+}
+
+/// Build a `[batch, max_len]` mask where valid time steps are true.
+pub fn sequence_mask<R, F, I, BT>(
+    lengths: &[usize],
+    max_len: usize,
+    device: &<AsrCubeBackend<R, F, I, BT> as burn::tensor::backend::Backend>::Device,
+) -> BurnTensor<AsrCubeBackend<R, F, I, BT>, 2, BurnBool>
+where
+    R: CubeRuntime,
+    F: FloatElement,
+    I: IntElement,
+    BT: BoolElement,
+{
+    let lengths = lengths_tensor::<R, F, I, BT>(lengths, device);
+    sequence_mask_with_lengths(lengths, max_len)
+}
+
+/// Build a `[batch, max_len]` mask where valid time steps are true using an
+/// existing device-side lengths tensor.
+pub fn sequence_mask_with_lengths<R, F, I, BT>(
+    lengths: BurnTensor<AsrCubeBackend<R, F, I, BT>, 1, BurnInt>,
+    max_len: usize,
+) -> BurnTensor<AsrCubeBackend<R, F, I, BT>, 2, BurnBool>
+where
+    R: CubeRuntime,
+    F: FloatElement,
+    I: IntElement,
+    BT: BoolElement,
+{
+    let output = sequence_mask_cube::<R, F, I, BT>(lengths.into_primitive(), max_len, false);
+    BurnTensor::from_primitive(output)
+}
+
+/// Build a `[batch, max_len]` mask where padded time steps are true.
+pub fn padding_mask<R, F, I, BT>(
+    lengths: &[usize],
+    max_len: usize,
+    device: &<AsrCubeBackend<R, F, I, BT> as burn::tensor::backend::Backend>::Device,
+) -> BurnTensor<AsrCubeBackend<R, F, I, BT>, 2, BurnBool>
+where
+    R: CubeRuntime,
+    F: FloatElement,
+    I: IntElement,
+    BT: BoolElement,
+{
+    let lengths = lengths_tensor::<R, F, I, BT>(lengths, device);
+    padding_mask_with_lengths(lengths, max_len)
+}
+
+/// Build a `[batch, max_len]` mask where padded time steps are true using an
+/// existing device-side lengths tensor.
+pub fn padding_mask_with_lengths<R, F, I, BT>(
+    lengths: BurnTensor<AsrCubeBackend<R, F, I, BT>, 1, BurnInt>,
+    max_len: usize,
+) -> BurnTensor<AsrCubeBackend<R, F, I, BT>, 2, BurnBool>
+where
+    R: CubeRuntime,
+    F: FloatElement,
+    I: IntElement,
+    BT: BoolElement,
+{
+    let output = sequence_mask_cube::<R, F, I, BT>(lengths.into_primitive(), max_len, true);
+    BurnTensor::from_primitive(output)
+}
+
+/// Build a `[batch, query_len, key_len]` attention mask where both query and key
+/// positions must be valid.
+pub fn attention_mask<R, F, I, BT>(
+    lengths: &[usize],
+    query_len: usize,
+    key_len: usize,
+    device: &<AsrCubeBackend<R, F, I, BT> as burn::tensor::backend::Backend>::Device,
+) -> BurnTensor<AsrCubeBackend<R, F, I, BT>, 3, BurnBool>
+where
+    R: CubeRuntime,
+    F: FloatElement,
+    I: IntElement,
+    BT: BoolElement,
+{
+    let lengths = lengths_tensor::<R, F, I, BT>(lengths, device);
+    attention_mask_with_lengths(lengths, query_len, key_len)
+}
+
+/// Build a `[batch, query_len, key_len]` attention mask using an existing
+/// device-side lengths tensor.
+pub fn attention_mask_with_lengths<R, F, I, BT>(
+    lengths: BurnTensor<AsrCubeBackend<R, F, I, BT>, 1, BurnInt>,
+    query_len: usize,
+    key_len: usize,
+) -> BurnTensor<AsrCubeBackend<R, F, I, BT>, 3, BurnBool>
+where
+    R: CubeRuntime,
+    F: FloatElement,
+    I: IntElement,
+    BT: BoolElement,
+{
+    let output = attention_mask_cube::<R, F, I, BT>(lengths.into_primitive(), query_len, key_len);
+    BurnTensor::from_primitive(output)
+}
+
+/// Fused GLU for tensors shaped `[batch, time, 2 * channels]`.
+pub fn glu_last_dim<R, F, I, BT>(
+    input: BurnTensor<AsrCubeBackend<R, F, I, BT>, 3>,
+) -> BurnTensor<AsrCubeBackend<R, F, I, BT>, 3>
+where
+    R: CubeRuntime,
+    F: FloatElement,
+    I: IntElement,
+    BT: BoolElement,
+{
+    let primitive = into_float_cube(input);
+    let output = glu_cube(primitive, GluLayout::BatchTimeChannels);
+    BurnTensor::from_primitive(TensorPrimitive::Float(output))
+}
+
+/// Fused GLU for tensors shaped `[batch, 2 * channels, time]`.
+pub fn glu_channel_dim<R, F, I, BT>(
+    input: BurnTensor<AsrCubeBackend<R, F, I, BT>, 3>,
+) -> BurnTensor<AsrCubeBackend<R, F, I, BT>, 3>
+where
+    R: CubeRuntime,
+    F: FloatElement,
+    I: IntElement,
+    BT: BoolElement,
+{
+    let primitive = into_float_cube(input);
+    let output = glu_cube(primitive, GluLayout::BatchChannelsTime);
     BurnTensor::from_primitive(TensorPrimitive::Float(output))
 }
 
@@ -354,6 +498,149 @@ fn mask_time_cube<R: CubeRuntime>(
     output
 }
 
+fn bool_output<R, F, I, BT>(lengths: &CubeTensor<R>, shape: Shape) -> CubeTensor<R>
+where
+    R: CubeRuntime,
+    F: FloatElement,
+    I: IntElement,
+    BT: BoolElement,
+{
+    let dtype = get_device_settings::<AsrCubeBackend<R, F, I, BT>>(&lengths.device).bool_dtype;
+    empty_device_dtype(
+        lengths.client.clone(),
+        lengths.device.clone(),
+        shape,
+        dtype.into(),
+    )
+}
+
+fn sequence_mask_cube<R, F, I, BT>(
+    lengths: CubeTensor<R>,
+    max_len: usize,
+    inverted: bool,
+) -> CubeTensor<R>
+where
+    R: CubeRuntime,
+    F: FloatElement,
+    I: IntElement,
+    BT: BoolElement,
+{
+    let [batch] = lengths.shape().dims::<1>();
+    let output_shape = Shape::new([batch, max_len]);
+    let output = bool_output::<R, F, I, BT>(&lengths, output_shape);
+    let num_elems = output.meta.num_elements();
+    let cube_dim = CubeDim::new(&output.client, num_elems);
+    let cube_count = calculate_cube_count_elemwise(&output.client, num_elems, cube_dim);
+    let int_dtype = lengths.dtype;
+    let bool_dtype = output.dtype;
+
+    sequence_mask_kernel::launch(
+        &output.client,
+        cube_count,
+        cube_dim,
+        lengths.into_tensor_arg(),
+        output.clone().into_tensor_arg(),
+        SequenceMaskArgsLaunch::new(batch, max_len, inverted),
+        int_dtype.into(),
+        bool_dtype.into(),
+    );
+
+    output
+}
+
+fn attention_mask_cube<R, F, I, BT>(
+    lengths: CubeTensor<R>,
+    query_len: usize,
+    key_len: usize,
+) -> CubeTensor<R>
+where
+    R: CubeRuntime,
+    F: FloatElement,
+    I: IntElement,
+    BT: BoolElement,
+{
+    let [batch] = lengths.shape().dims::<1>();
+    let output_shape = Shape::new([batch, query_len, key_len]);
+    let output = bool_output::<R, F, I, BT>(&lengths, output_shape);
+    let num_elems = output.meta.num_elements();
+    let cube_dim = CubeDim::new(&output.client, num_elems);
+    let cube_count = calculate_cube_count_elemwise(&output.client, num_elems, cube_dim);
+    let int_dtype = lengths.dtype;
+    let bool_dtype = output.dtype;
+
+    attention_mask_kernel::launch(
+        &output.client,
+        cube_count,
+        cube_dim,
+        lengths.into_tensor_arg(),
+        output.clone().into_tensor_arg(),
+        AttentionMaskArgsLaunch::new(batch, query_len, key_len),
+        int_dtype.into(),
+        bool_dtype.into(),
+    );
+
+    output
+}
+
+#[derive(Clone, Copy)]
+enum GluLayout {
+    BatchTimeChannels,
+    BatchChannelsTime,
+}
+
+fn glu_cube<R: CubeRuntime>(input: CubeTensor<R>, layout: GluLayout) -> CubeTensor<R> {
+    let [batch, dim1, dim2] = input.shape().dims();
+    let output_shape = match layout {
+        GluLayout::BatchTimeChannels => {
+            assert!(
+                dim2.is_multiple_of(2),
+                "GLU last dim must have an even channel count"
+            );
+            Shape::new([batch, dim1, dim2 / 2])
+        }
+        GluLayout::BatchChannelsTime => {
+            assert!(
+                dim1.is_multiple_of(2),
+                "GLU channel dim must have an even channel count"
+            );
+            Shape::new([batch, dim1 / 2, dim2])
+        }
+    };
+    let output = empty_device_dtype(
+        input.client.clone(),
+        input.device.clone(),
+        output_shape,
+        input.dtype,
+    );
+    let num_elems = output.meta.num_elements();
+    let cube_dim = CubeDim::new(&output.client, num_elems);
+    let cube_count = calculate_cube_count_elemwise(&output.client, num_elems, cube_dim);
+    let dtype = output.dtype;
+
+    match layout {
+        GluLayout::BatchTimeChannels => glu_last_dim_kernel::launch(
+            &output.client,
+            cube_count,
+            cube_dim,
+            input.into_tensor_arg(),
+            output.clone().into_tensor_arg(),
+            GluArgsLaunch::new(batch, dim1, dim2),
+            dtype.into(),
+        ),
+        GluLayout::BatchChannelsTime => glu_channel_dim_kernel::launch(
+            &output.client,
+            cube_count,
+            cube_dim,
+            input.into_tensor_arg(),
+            output.clone().into_tensor_arg(),
+            GluArgsLaunch::new(batch, dim1, dim2),
+            dtype.into(),
+        ),
+    }
+
+    output
+}
+
 #[cube(launch)]
 fn swoosh_kernel<E: Float>(
     input: &Tensor<E>,
@@ -386,6 +673,36 @@ struct RelativeShiftArgs {
 
 #[derive(CubeLaunch, CubeType)]
 struct MaskTimeArgs {
+    #[cube(comptime)]
+    batch: usize,
+    #[cube(comptime)]
+    dim1: usize,
+    #[cube(comptime)]
+    dim2: usize,
+}
+
+#[derive(CubeLaunch, CubeType)]
+struct SequenceMaskArgs {
+    #[cube(comptime)]
+    batch: usize,
+    #[cube(comptime)]
+    max_len: usize,
+    #[cube(comptime)]
+    inverted: bool,
+}
+
+#[derive(CubeLaunch, CubeType)]
+struct AttentionMaskArgs {
+    #[cube(comptime)]
+    batch: usize,
+    #[cube(comptime)]
+    query_len: usize,
+    #[cube(comptime)]
+    key_len: usize,
+}
+
+#[derive(CubeLaunch, CubeType)]
+struct GluArgs {
     #[cube(comptime)]
     batch: usize,
     #[cube(comptime)]
@@ -433,6 +750,64 @@ fn relative_shift_kernel<E: Float>(
 }
 
 #[cube(launch)]
+fn sequence_mask_kernel<I: Int, O: Numeric>(
+    lengths: &Tensor<I>,
+    output: &mut Tensor<O>,
+    args: &SequenceMaskArgs,
+    #[define(I)] _int_dtype: StorageType,
+    #[define(O)] _bool_dtype: StorageType,
+) {
+    let pos = ABSOLUTE_POS;
+    if pos >= output.len() {
+        terminate!();
+    }
+
+    let batch = comptime![args.batch];
+    let max_len = comptime![args.max_len];
+    let inverted = comptime![args.inverted];
+
+    let time_index = pos % max_len;
+    let batch_index = pos / max_len;
+
+    if batch_index >= batch {
+        terminate!();
+    }
+
+    let length = usize::cast_from(lengths[batch_index]);
+    let valid = time_index < length;
+    output[pos] = O::cast_from(valid != inverted);
+}
+
+#[cube(launch)]
+fn attention_mask_kernel<I: Int, O: Numeric>(
+    lengths: &Tensor<I>,
+    output: &mut Tensor<O>,
+    args: &AttentionMaskArgs,
+    #[define(I)] _int_dtype: StorageType,
+    #[define(O)] _bool_dtype: StorageType,
+) {
+    let pos = ABSOLUTE_POS;
+    if pos >= output.len() {
+        terminate!();
+    }
+
+    let batch = comptime![args.batch];
+    let query_len = comptime![args.query_len];
+    let key_len = comptime![args.key_len];
+
+    let key_index = pos % key_len;
+    let query_index = (pos / key_len) % query_len;
+    let batch_index = pos / (query_len * key_len);
+
+    if batch_index >= batch {
+        terminate!();
+    }
+
+    let length = usize::cast_from(lengths[batch_index]);
+    output[pos] = O::cast_from(query_index < length && key_index < length);
+}
+
+#[cube(launch)]
 fn mask_time_kernel<E: Float, I: Int>(
     input: &Tensor<E>,
     lengths: &Tensor<I>,
@@ -464,6 +839,70 @@ fn mask_time_kernel<E: Float, I: Int>(
     } else {
         output[pos] = E::new(0.0);
     }
+}
+
+#[cube(launch)]
+fn glu_last_dim_kernel<E: Float>(
+    input: &Tensor<E>,
+    output: &mut Tensor<E>,
+    args: &GluArgs,
+    #[define(E)] _dtype: StorageType,
+) {
+    let pos = ABSOLUTE_POS;
+    if pos >= output.len() {
+        terminate!();
+    }
+
+    let batch = comptime![args.batch];
+    let time = comptime![args.dim1];
+    let input_channels = comptime![args.dim2];
+    let output_channels = input_channels / 2;
+
+    let channel_index = pos % output_channels;
+    let time_index = (pos / output_channels) % time;
+    let batch_index = pos / (time * output_channels);
+
+    if batch_index >= batch {
+        terminate!();
+    }
+
+    let value_pos = ((batch_index * time + time_index) * input_channels) + channel_index;
+    let gate_pos = value_pos + output_channels;
+    let gate = input[gate_pos];
+    let sigmoid = E::new(1.0) / (E::new(1.0) + E::exp(-gate));
+    output[pos] = input[value_pos] * sigmoid;
+}
+
+#[cube(launch)]
+fn glu_channel_dim_kernel<E: Float>(
+    input: &Tensor<E>,
+    output: &mut Tensor<E>,
+    args: &GluArgs,
+    #[define(E)] _dtype: StorageType,
+) {
+    let pos = ABSOLUTE_POS;
+    if pos >= output.len() {
+        terminate!();
+    }
+
+    let batch = comptime![args.batch];
+    let input_channels = comptime![args.dim1];
+    let time = comptime![args.dim2];
+    let output_channels = input_channels / 2;
+
+    let time_index = pos % time;
+    let channel_index = (pos / time) % output_channels;
+    let batch_index = pos / (output_channels * time);
+
+    if batch_index >= batch {
+        terminate!();
+    }
+
+    let value_pos = ((batch_index * input_channels + channel_index) * time) + time_index;
+    let gate_pos = value_pos + output_channels * time;
+    let gate = input[gate_pos];
+    let sigmoid = E::new(1.0) / (E::new(1.0) + E::exp(-gate));
+    output[pos] = input[value_pos] * sigmoid;
 }
 
 #[cube(launch)]
