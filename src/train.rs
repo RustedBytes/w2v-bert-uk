@@ -12,12 +12,14 @@ use burn_autodiff::checkpoint::strategy::BalancedCheckpointing;
 use burn_nn::loss::{CTCLossConfig, Reduction};
 use burn_optim::{AdamWConfig, GradientsParams, Optimizer};
 use serde_json::{Value, json};
+use splintr::SentencePieceTokenizer;
 
 use crate::paraformer::{
     EnhancedParaformerV2, EnhancedParaformerV2Config, ParaformerAlignmentMode, ParaformerV2,
     ParaformerV2Config,
 };
 use crate::squeezeformer::{SqueezeformerCtc, SqueezeformerCtcConfig, SqueezeformerEncoderConfig};
+use crate::tokenizer::load_sentencepiece_tokenizer;
 use crate::wav2vec::{Wav2VecBertConfig, Wav2VecBertCtc, Wav2VecBertCtcConfig};
 use crate::zipformer::{ZipformerConfig, ZipformerCtc, ZipformerCtcConfig};
 
@@ -67,6 +69,7 @@ pub struct BurnTrainConfig {
     pub validate_every_steps: Option<usize>,
     pub max_train_samples: Option<usize>,
     pub max_val_samples: Option<usize>,
+    pub tokenizer_path: Option<PathBuf>,
     pub dry_run: bool,
     pub paraformer_alignment_mode: ParaformerAlignmentMode,
     pub paraformer_enhanced: bool,
@@ -100,6 +103,7 @@ impl Default for BurnTrainConfig {
             validate_every_steps: None,
             max_train_samples: None,
             max_val_samples: None,
+            tokenizer_path: None,
             dry_run: false,
             paraformer_alignment_mode: ParaformerAlignmentMode::Viterbi,
             paraformer_enhanced: false,
@@ -146,6 +150,7 @@ pub struct FeatureRecord {
     pub cols: usize,
     pub features: Vec<f32>,
     pub tokens: Vec<i64>,
+    pub text: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -158,6 +163,7 @@ pub struct TrainBatch {
     pub targets: Vec<i64>,
     pub max_target_len: usize,
     pub target_lengths: Vec<usize>,
+    pub reference_texts: Vec<Option<String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -166,6 +172,71 @@ pub struct TrainSummary {
     pub steps: usize,
     pub last_train_loss: Option<f32>,
     pub last_val_loss: Option<f32>,
+    pub last_val_cer: Option<f32>,
+    pub last_val_wer: Option<f32>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ValidationSummary {
+    loss: f32,
+    token_error_rate: Option<f32>,
+    cer: Option<f32>,
+    wer: Option<f32>,
+    decoded_samples: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct EditStats {
+    edits: usize,
+    reference_len: usize,
+}
+
+impl EditStats {
+    fn add(&mut self, edits: usize, reference_len: usize) {
+        self.edits += edits;
+        self.reference_len += reference_len;
+    }
+
+    fn rate(&self) -> Option<f32> {
+        (self.reference_len > 0).then_some(self.edits as f32 / self.reference_len as f32)
+    }
+}
+
+struct ValidationDecoder {
+    tokenizer: Option<SentencePieceTokenizer>,
+}
+
+impl ValidationDecoder {
+    fn from_config(config: &BurnTrainConfig) -> Result<Self> {
+        let tokenizer = config
+            .tokenizer_path
+            .as_deref()
+            .map(load_sentencepiece_tokenizer)
+            .transpose()?;
+        Ok(Self { tokenizer })
+    }
+
+    fn decode_tokens(&self, tokens: &[u32]) -> String {
+        if let Some(tokenizer) = &self.tokenizer {
+            tokenizer.decode_lossy(tokens)
+        } else {
+            tokens
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+    }
+
+    fn reference_text(&self, text: Option<&String>, tokens: &[i64]) -> String {
+        text.cloned().unwrap_or_else(|| {
+            let token_ids = tokens
+                .iter()
+                .filter_map(|token| u32::try_from(*token).ok())
+                .collect::<Vec<_>>();
+            self.decode_tokens(&token_ids)
+        })
+    }
 }
 
 pub fn run_burn_training(config: BurnTrainConfig) -> Result<TrainSummary> {
@@ -379,6 +450,9 @@ where
     let mut global_step = 0usize;
     let mut last_train_loss = None;
     let mut last_val_loss = None;
+    let mut last_val_cer = None;
+    let mut last_val_wer = None;
+    let decoder = ValidationDecoder::from_config(config)?;
     let started = Instant::now();
 
     for epoch in 1..=config.epochs {
@@ -411,26 +485,46 @@ where
 
             if let (Some(_), Some(every)) = (&config.val_manifest, config.validate_every_steps) {
                 if every > 0 && global_step % every == 0 {
-                    let val_loss = evaluate_ctc_model::<B, M>(&model, config, device)?;
-                    println!("epoch={epoch} step={global_step} val_ctc_loss={val_loss:.6}");
-                    last_val_loss = Some(val_loss);
+                    let val = evaluate_ctc_model::<B, M>(&model, config, device, &decoder)?;
+                    println!(
+                        "{}",
+                        format_validation_summary(epoch, Some(global_step), "val_ctc_loss", &val)
+                    );
+                    last_val_loss = Some(val.loss);
+                    last_val_cer = val.cer;
+                    last_val_wer = val.wer;
                     write_checkpoint_metadata(
                         config,
                         epoch,
                         global_step,
                         last_train_loss,
                         last_val_loss,
+                        last_val_cer,
+                        last_val_wer,
                     )?;
                 }
             }
         }
 
         if config.val_manifest.is_some() {
-            let val_loss = evaluate_ctc_model::<B, M>(&model, config, device)?;
-            println!("epoch={epoch} val_ctc_loss={val_loss:.6}");
-            last_val_loss = Some(val_loss);
+            let val = evaluate_ctc_model::<B, M>(&model, config, device, &decoder)?;
+            println!(
+                "{}",
+                format_validation_summary(epoch, None, "val_ctc_loss", &val)
+            );
+            last_val_loss = Some(val.loss);
+            last_val_cer = val.cer;
+            last_val_wer = val.wer;
         }
-        write_checkpoint_metadata(config, epoch, global_step, last_train_loss, last_val_loss)?;
+        write_checkpoint_metadata(
+            config,
+            epoch,
+            global_step,
+            last_train_loss,
+            last_val_loss,
+            last_val_cer,
+            last_val_wer,
+        )?;
     }
 
     Ok(TrainSummary {
@@ -438,16 +532,24 @@ where
         steps: global_step,
         last_train_loss,
         last_val_loss,
+        last_val_cer,
+        last_val_wer,
     })
 }
 
-fn evaluate_ctc_model<B, M>(model: &M, config: &BurnTrainConfig, device: &B::Device) -> Result<f32>
+fn evaluate_ctc_model<B, M>(
+    model: &M,
+    config: &BurnTrainConfig,
+    device: &B::Device,
+    decoder: &ValidationDecoder,
+) -> Result<ValidationSummary>
 where
     B: AutodiffBackend,
     M: TrainableCtc<B>,
 {
     let mut total = 0.0f64;
     let mut count = 0usize;
+    let mut metrics = ValidationMetrics::default();
     let val_manifest = config
         .val_manifest
         .as_ref()
@@ -462,14 +564,25 @@ where
         config.max_val_samples,
     )?;
     while let Some(batch) = batches.next_batch()? {
-        let loss = ctc_loss_for_batch::<B, M>(model, &batch, config.blank_id, device);
+        let (logits_or_log_probs, output_lengths) =
+            ctc_logits_for_batch::<B, M>(model, &batch, device);
+        let loss = ctc_loss_from_logits(
+            logits_or_log_probs.clone(),
+            output_lengths.clone(),
+            &batch,
+            config.blank_id,
+            device,
+        );
         total += f64::from(scalar_value(loss)?);
+        let predictions =
+            greedy_decode_batch(logits_or_log_probs, &output_lengths, config.blank_id)?;
+        metrics.update(&batch, &predictions, decoder);
         count += 1;
     }
     if count == 0 {
         bail!("validation manifest is empty");
     }
-    Ok((total / count as f64) as f32)
+    Ok(metrics.summary((total / count as f64) as f32))
 }
 
 fn train_paraformer_model<B>(
@@ -486,6 +599,9 @@ where
     let mut global_step = 0usize;
     let mut last_train_loss = None;
     let mut last_val_loss = None;
+    let mut last_val_cer = None;
+    let mut last_val_wer = None;
+    let decoder = ValidationDecoder::from_config(config)?;
     let started = Instant::now();
 
     for epoch in 1..=config.epochs {
@@ -520,26 +636,46 @@ where
 
             if let (Some(_), Some(every)) = (&config.val_manifest, config.validate_every_steps) {
                 if every > 0 && global_step % every == 0 {
-                    let val_loss = evaluate_paraformer_model(&model, config, device)?;
-                    println!("epoch={epoch} step={global_step} val_loss={val_loss:.6}");
-                    last_val_loss = Some(val_loss);
+                    let val = evaluate_paraformer_model(&model, config, device, &decoder)?;
+                    println!(
+                        "{}",
+                        format_validation_summary(epoch, Some(global_step), "val_loss", &val)
+                    );
+                    last_val_loss = Some(val.loss);
+                    last_val_cer = val.cer;
+                    last_val_wer = val.wer;
                     write_checkpoint_metadata(
                         config,
                         epoch,
                         global_step,
                         last_train_loss,
                         last_val_loss,
+                        last_val_cer,
+                        last_val_wer,
                     )?;
                 }
             }
         }
 
         if config.val_manifest.is_some() {
-            let val_loss = evaluate_paraformer_model(&model, config, device)?;
-            println!("epoch={epoch} val_loss={val_loss:.6}");
-            last_val_loss = Some(val_loss);
+            let val = evaluate_paraformer_model(&model, config, device, &decoder)?;
+            println!(
+                "{}",
+                format_validation_summary(epoch, None, "val_loss", &val)
+            );
+            last_val_loss = Some(val.loss);
+            last_val_cer = val.cer;
+            last_val_wer = val.wer;
         }
-        write_checkpoint_metadata(config, epoch, global_step, last_train_loss, last_val_loss)?;
+        write_checkpoint_metadata(
+            config,
+            epoch,
+            global_step,
+            last_train_loss,
+            last_val_loss,
+            last_val_cer,
+            last_val_wer,
+        )?;
     }
 
     Ok(TrainSummary {
@@ -547,6 +683,8 @@ where
         steps: global_step,
         last_train_loss,
         last_val_loss,
+        last_val_cer,
+        last_val_wer,
     })
 }
 
@@ -554,12 +692,14 @@ fn evaluate_paraformer_model<B>(
     model: &ParaformerV2<B>,
     config: &BurnTrainConfig,
     device: &B::Device,
-) -> Result<f32>
+    decoder: &ValidationDecoder,
+) -> Result<ValidationSummary>
 where
     B: AutodiffBackend,
 {
     let mut total = 0.0f64;
     let mut count = 0usize;
+    let mut metrics = ValidationMetrics::default();
     let val_manifest = config
         .val_manifest
         .as_ref()
@@ -574,14 +714,20 @@ where
         config.max_val_samples,
     )?;
     while let Some(batch) = batches.next_batch()? {
-        let loss = paraformer_loss_for_batch(model, &batch, config, device).loss;
-        total += f64::from(scalar_value(loss)?);
+        let output = paraformer_loss_for_batch(model, &batch, config, device);
+        total += f64::from(scalar_value(output.loss)?);
+        let predictions = greedy_decode_batch(
+            output.output.ctc_log_probs,
+            &output.output.encoder_lengths,
+            config.blank_id,
+        )?;
+        metrics.update(&batch, &predictions, decoder);
         count += 1;
     }
     if count == 0 {
         bail!("validation manifest is empty");
     }
-    Ok((total / count as f64) as f32)
+    Ok(metrics.summary((total / count as f64) as f32))
 }
 
 fn train_enhanced_paraformer_model<B>(
@@ -598,6 +744,9 @@ where
     let mut global_step = 0usize;
     let mut last_train_loss = None;
     let mut last_val_loss = None;
+    let mut last_val_cer = None;
+    let mut last_val_wer = None;
+    let decoder = ValidationDecoder::from_config(config)?;
     let started = Instant::now();
 
     for epoch in 1..=config.epochs {
@@ -634,26 +783,46 @@ where
 
             if let (Some(_), Some(every)) = (&config.val_manifest, config.validate_every_steps) {
                 if every > 0 && global_step % every == 0 {
-                    let val_loss = evaluate_enhanced_paraformer_model(&model, config, device)?;
-                    println!("epoch={epoch} step={global_step} val_loss={val_loss:.6}");
-                    last_val_loss = Some(val_loss);
+                    let val = evaluate_enhanced_paraformer_model(&model, config, device, &decoder)?;
+                    println!(
+                        "{}",
+                        format_validation_summary(epoch, Some(global_step), "val_loss", &val)
+                    );
+                    last_val_loss = Some(val.loss);
+                    last_val_cer = val.cer;
+                    last_val_wer = val.wer;
                     write_checkpoint_metadata(
                         config,
                         epoch,
                         global_step,
                         last_train_loss,
                         last_val_loss,
+                        last_val_cer,
+                        last_val_wer,
                     )?;
                 }
             }
         }
 
         if config.val_manifest.is_some() {
-            let val_loss = evaluate_enhanced_paraformer_model(&model, config, device)?;
-            println!("epoch={epoch} val_loss={val_loss:.6}");
-            last_val_loss = Some(val_loss);
+            let val = evaluate_enhanced_paraformer_model(&model, config, device, &decoder)?;
+            println!(
+                "{}",
+                format_validation_summary(epoch, None, "val_loss", &val)
+            );
+            last_val_loss = Some(val.loss);
+            last_val_cer = val.cer;
+            last_val_wer = val.wer;
         }
-        write_checkpoint_metadata(config, epoch, global_step, last_train_loss, last_val_loss)?;
+        write_checkpoint_metadata(
+            config,
+            epoch,
+            global_step,
+            last_train_loss,
+            last_val_loss,
+            last_val_cer,
+            last_val_wer,
+        )?;
     }
 
     Ok(TrainSummary {
@@ -661,6 +830,8 @@ where
         steps: global_step,
         last_train_loss,
         last_val_loss,
+        last_val_cer,
+        last_val_wer,
     })
 }
 
@@ -668,12 +839,14 @@ fn evaluate_enhanced_paraformer_model<B>(
     model: &EnhancedParaformerV2<B>,
     config: &BurnTrainConfig,
     device: &B::Device,
-) -> Result<f32>
+    decoder: &ValidationDecoder,
+) -> Result<ValidationSummary>
 where
     B: AutodiffBackend,
 {
     let mut total = 0.0f64;
     let mut count = 0usize;
+    let mut metrics = ValidationMetrics::default();
     let val_manifest = config
         .val_manifest
         .as_ref()
@@ -688,14 +861,20 @@ where
         config.max_val_samples,
     )?;
     while let Some(batch) = batches.next_batch()? {
-        let loss = enhanced_paraformer_loss_for_batch(model, &batch, config, device).loss;
-        total += f64::from(scalar_value(loss)?);
+        let output = enhanced_paraformer_loss_for_batch(model, &batch, config, device);
+        total += f64::from(scalar_value(output.loss)?);
+        let predictions = greedy_decode_batch(
+            output.output.ctc_log_probs,
+            &output.output.encoder_lengths,
+            config.blank_id,
+        )?;
+        metrics.update(&batch, &predictions, decoder);
         count += 1;
     }
     if count == 0 {
         bail!("validation manifest is empty");
     }
-    Ok((total / count as f64) as f32)
+    Ok(metrics.summary((total / count as f64) as f32))
 }
 
 fn paraformer_loss_for_batch<B>(
@@ -776,15 +955,40 @@ where
     B: AutodiffBackend,
     M: TrainableCtc<B>,
 {
-    let features = Tensor::<B, 3>::from_data(
+    let (logits_or_log_probs, output_lengths) = ctc_logits_for_batch(model, batch, device);
+    ctc_loss_from_logits(logits_or_log_probs, output_lengths, batch, blank_id, device)
+}
+
+fn ctc_logits_for_batch<B, M>(
+    model: &M,
+    batch: &TrainBatch,
+    device: &B::Device,
+) -> (Tensor<B, 3>, Vec<usize>)
+where
+    B: AutodiffBackend,
+    M: TrainableCtc<B>,
+{
+    let features = batch_features_tensor(batch, device);
+    model.ctc_logits(features, batch.feature_lengths.clone())
+}
+
+fn batch_features_tensor<B: Backend>(batch: &TrainBatch, device: &B::Device) -> Tensor<B, 3> {
+    Tensor::<B, 3>::from_data(
         TensorData::new(
             batch.features.clone(),
             [batch.batch_size, batch.max_frames, batch.feature_dim],
         ),
         device,
-    );
-    let (logits_or_log_probs, output_lengths) =
-        model.ctc_logits(features, batch.feature_lengths.clone());
+    )
+}
+
+fn ctc_loss_from_logits<B: AutodiffBackend>(
+    logits_or_log_probs: Tensor<B, 3>,
+    output_lengths: Vec<usize>,
+    batch: &TrainBatch,
+    blank_id: usize,
+    device: &B::Device,
+) -> Tensor<B, 1> {
     let log_probs = log_softmax(logits_or_log_probs, 2).swap_dims(0, 1);
     let targets = Tensor::<B, 2, Int>::from_data(
         TensorData::new(
@@ -814,6 +1018,167 @@ where
         )
 }
 
+#[derive(Default)]
+struct ValidationMetrics {
+    token_stats: EditStats,
+    char_stats: EditStats,
+    word_stats: EditStats,
+    decoded_samples: usize,
+}
+
+impl ValidationMetrics {
+    fn update(
+        &mut self,
+        batch: &TrainBatch,
+        predictions: &[Vec<u32>],
+        decoder: &ValidationDecoder,
+    ) {
+        for sample_index in 0..batch.batch_size {
+            let reference_tokens = target_tokens_for_batch_item(batch, sample_index);
+            let predicted_tokens = predictions
+                .get(sample_index)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(i64::from)
+                .collect::<Vec<_>>();
+            self.token_stats.add(
+                edit_distance(&predicted_tokens, &reference_tokens),
+                reference_tokens.len(),
+            );
+
+            let predicted_u32 = predicted_tokens
+                .iter()
+                .filter_map(|token| u32::try_from(*token).ok())
+                .collect::<Vec<_>>();
+            let predicted_text = decoder.decode_tokens(&predicted_u32);
+            let reference_text = decoder.reference_text(
+                batch.reference_texts[sample_index].as_ref(),
+                &reference_tokens,
+            );
+            let predicted_chars = predicted_text.chars().collect::<Vec<_>>();
+            let reference_chars = reference_text.chars().collect::<Vec<_>>();
+            self.char_stats.add(
+                edit_distance(&predicted_chars, &reference_chars),
+                reference_chars.len(),
+            );
+            let predicted_words = predicted_text.split_whitespace().collect::<Vec<_>>();
+            let reference_words = reference_text.split_whitespace().collect::<Vec<_>>();
+            self.word_stats.add(
+                edit_distance(&predicted_words, &reference_words),
+                reference_words.len(),
+            );
+            self.decoded_samples += 1;
+        }
+    }
+
+    fn summary(self, loss: f32) -> ValidationSummary {
+        ValidationSummary {
+            loss,
+            token_error_rate: self.token_stats.rate(),
+            cer: self.char_stats.rate(),
+            wer: self.word_stats.rate(),
+            decoded_samples: self.decoded_samples,
+        }
+    }
+}
+
+fn greedy_decode_batch<B: Backend>(
+    logits_or_log_probs: Tensor<B, 3>,
+    output_lengths: &[usize],
+    blank_id: usize,
+) -> Result<Vec<Vec<u32>>> {
+    let [batch_size, frames, vocab_size] = logits_or_log_probs.dims();
+    if vocab_size == 0 {
+        bail!("cannot decode logits with empty vocab dimension");
+    }
+    if blank_id >= vocab_size {
+        bail!("blank_id {blank_id} is outside vocab size {vocab_size}");
+    }
+    let values = logits_or_log_probs
+        .into_data()
+        .to_vec::<f32>()
+        .context("failed to read validation logits")?;
+    let mut decoded = Vec::with_capacity(batch_size);
+    for batch_index in 0..batch_size {
+        let length = output_lengths
+            .get(batch_index)
+            .copied()
+            .unwrap_or(frames)
+            .min(frames);
+        let mut previous = None;
+        let mut tokens = Vec::new();
+        for frame in 0..length {
+            let offset = (batch_index * frames + frame) * vocab_size;
+            let frame_values = &values[offset..offset + vocab_size];
+            let token = frame_values
+                .iter()
+                .enumerate()
+                .max_by(|(_, left), (_, right)| left.total_cmp(right))
+                .map(|(index, _)| index)
+                .unwrap_or(blank_id);
+            if token != blank_id && previous != Some(token) {
+                tokens.push(u32::try_from(token).context("token id does not fit u32")?);
+            }
+            previous = Some(token);
+        }
+        decoded.push(tokens);
+    }
+    Ok(decoded)
+}
+
+fn target_tokens_for_batch_item(batch: &TrainBatch, sample_index: usize) -> Vec<i64> {
+    let length = batch.target_lengths[sample_index];
+    let start = sample_index * batch.max_target_len;
+    batch.targets[start..start + length].to_vec()
+}
+
+fn edit_distance<T: Eq>(hypothesis: &[T], reference: &[T]) -> usize {
+    if reference.is_empty() {
+        return hypothesis.len();
+    }
+    if hypothesis.is_empty() {
+        return reference.len();
+    }
+    let mut previous = (0..=reference.len()).collect::<Vec<_>>();
+    let mut current = vec![0; reference.len() + 1];
+    for (hyp_index, hyp_item) in hypothesis.iter().enumerate() {
+        current[0] = hyp_index + 1;
+        for (ref_index, ref_item) in reference.iter().enumerate() {
+            let substitution = previous[ref_index] + usize::from(hyp_item != ref_item);
+            let insertion = current[ref_index] + 1;
+            let deletion = previous[ref_index + 1] + 1;
+            current[ref_index + 1] = substitution.min(insertion).min(deletion);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[reference.len()]
+}
+
+fn format_validation_summary(
+    epoch: usize,
+    step: Option<usize>,
+    loss_name: &str,
+    summary: &ValidationSummary,
+) -> String {
+    let mut parts = vec![format!("epoch={epoch}")];
+    if let Some(step) = step {
+        parts.push(format!("step={step}"));
+    }
+    parts.push(format!("{loss_name}={:.6}", summary.loss));
+    if let Some(cer) = summary.cer {
+        parts.push(format!("val_cer={cer:.6}"));
+    }
+    if let Some(wer) = summary.wer {
+        parts.push(format!("val_wer={wer:.6}"));
+    }
+    if let Some(token_error_rate) = summary.token_error_rate {
+        parts.push(format!("val_token_error_rate={token_error_rate:.6}"));
+    }
+    parts.push(format!("decoded_samples={}", summary.decoded_samples));
+    parts.join(" ")
+}
+
 fn make_batch(records: &[FeatureRecord], expected_dim: usize) -> Result<TrainBatch> {
     if records.is_empty() {
         bail!("cannot build an empty batch");
@@ -833,6 +1198,7 @@ fn make_batch(records: &[FeatureRecord], expected_dim: usize) -> Result<TrainBat
     let mut targets = vec![0i64; batch_size * max_target_len];
     let mut feature_lengths = Vec::with_capacity(batch_size);
     let mut target_lengths = Vec::with_capacity(batch_size);
+    let mut reference_texts = Vec::with_capacity(batch_size);
 
     for (batch_index, record) in records.iter().enumerate() {
         if record.cols != expected_dim {
@@ -845,6 +1211,7 @@ fn make_batch(records: &[FeatureRecord], expected_dim: usize) -> Result<TrainBat
         }
         feature_lengths.push(record.rows);
         target_lengths.push(record.tokens.len());
+        reference_texts.push(record.text.clone());
         for row in 0..record.rows {
             let src = row * expected_dim;
             let dst = (batch_index * max_frames + row) * expected_dim;
@@ -864,6 +1231,7 @@ fn make_batch(records: &[FeatureRecord], expected_dim: usize) -> Result<TrainBat
         targets,
         max_target_len,
         target_lengths,
+        reference_texts,
     })
 }
 
@@ -1254,6 +1622,12 @@ fn parse_json_record(line: &str, base_dir: &Path, line_number: usize) -> Result<
             .or_else(|| value.get("targets"))
             .ok_or_else(|| anyhow!("record '{id}' is missing tokens"))?,
     )?;
+    let text = value
+        .get("text")
+        .or_else(|| value.get("transcript"))
+        .or_else(|| value.get("sentence"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
 
     if let Some(features) = value.get("features") {
         let rows = value
@@ -1271,6 +1645,7 @@ fn parse_json_record(line: &str, base_dir: &Path, line_number: usize) -> Result<
             cols,
             features,
             tokens,
+            text,
         });
     }
 
@@ -1297,6 +1672,7 @@ fn parse_json_record(line: &str, base_dir: &Path, line_number: usize) -> Result<
         cols,
         features,
         tokens,
+        text,
     })
 }
 
@@ -1321,6 +1697,7 @@ fn parse_tsv_record(line: &str, base_dir: &Path, line_number: usize) -> Result<F
         cols,
         features,
         tokens,
+        text: parts.get(4).map(|value| (*value).to_string()),
     })
 }
 
@@ -1612,6 +1989,7 @@ fn write_run_config(config: &BurnTrainConfig) -> Result<()> {
             "epochs": config.epochs,
             "learning_rate": config.learning_rate,
             "weight_decay": config.weight_decay,
+            "tokenizer_path": config.tokenizer_path,
             "w2v_hf_model_dir": config.w2v_hf_model_dir,
             "w2v_hf_load_weights": config.w2v_hf_load_weights,
             "w2v_activation_checkpointing": config.w2v_activation_checkpointing,
@@ -1626,6 +2004,8 @@ fn write_checkpoint_metadata(
     global_step: usize,
     train_loss: Option<f32>,
     val_loss: Option<f32>,
+    val_cer: Option<f32>,
+    val_wer: Option<f32>,
 ) -> Result<()> {
     let path = config.output_dir.join("checkpoint_latest.json");
     fs::write(
@@ -1635,6 +2015,8 @@ fn write_checkpoint_metadata(
             "global_step": global_step,
             "train_ctc_loss": train_loss,
             "val_ctc_loss": val_loss,
+            "val_cer": val_cer,
+            "val_wer": val_wer,
         }))?,
     )
     .with_context(|| format!("failed to write {}", path.display()))
@@ -1643,6 +2025,7 @@ fn write_checkpoint_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use burn_ndarray::NdArray;
 
     #[test]
     fn manifest_loads_inline_jsonl_records() {
@@ -1662,6 +2045,26 @@ mod tests {
         assert_eq!(records[0].rows, 2);
         assert_eq!(records[0].cols, 2);
         assert_eq!(records[0].tokens, vec![1, 2]);
+        assert_eq!(records[0].text, None);
+    }
+
+    #[test]
+    fn manifest_loads_optional_reference_text() {
+        let dir = std::env::temp_dir().join(format!(
+            "w2v_bert_uk_train_text_test_{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let manifest = dir.join("train_text.jsonl");
+        fs::write(
+            &manifest,
+            r#"{"id":"a","features":[[0.1,0.2]],"tokens":[1],"text":"hello world"}"#,
+        )
+        .unwrap();
+
+        let records = load_manifest(&manifest, None).unwrap();
+
+        assert_eq!(records[0].text, Some("hello world".to_string()));
     }
 
     #[test]
@@ -1673,6 +2076,7 @@ mod tests {
                 cols: 2,
                 features: vec![1.0, 2.0, 3.0, 4.0],
                 tokens: vec![1, 2],
+                text: Some("one two".to_string()),
             },
             FeatureRecord {
                 id: "b".to_string(),
@@ -1680,6 +2084,7 @@ mod tests {
                 cols: 2,
                 features: vec![5.0, 6.0],
                 tokens: vec![3],
+                text: None,
             },
         ];
 
@@ -1689,6 +2094,53 @@ mod tests {
         assert_eq!(batch.max_frames, 2);
         assert_eq!(batch.feature_lengths, vec![2, 1]);
         assert_eq!(batch.target_lengths, vec![2, 1]);
+        assert_eq!(batch.reference_texts[0], Some("one two".to_string()));
+    }
+
+    #[test]
+    fn greedy_decoder_collapses_repeats_and_blanks() {
+        let device = Default::default();
+        let logits = Tensor::<NdArray<f32>, 3>::from_data(
+            TensorData::new(
+                vec![
+                    5.0, 1.0, 0.0, // blank
+                    0.0, 6.0, 1.0, // 1
+                    0.0, 7.0, 1.0, // repeat 1
+                    8.0, 0.0, 0.0, // blank
+                    0.0, 1.0, 9.0, // 2
+                ],
+                [1, 5, 3],
+            ),
+            &device,
+        );
+
+        let decoded = greedy_decode_batch(logits, &[5], 0).unwrap();
+
+        assert_eq!(decoded, vec![vec![1, 2]]);
+    }
+
+    #[test]
+    fn validation_metrics_compute_token_cer_and_wer() {
+        let records = vec![FeatureRecord {
+            id: "a".to_string(),
+            rows: 1,
+            cols: 2,
+            features: vec![0.0, 0.0],
+            tokens: vec![1, 2, 3],
+            text: None,
+        }];
+        let batch = make_batch(&records, 2).unwrap();
+        let decoder = ValidationDecoder { tokenizer: None };
+        let mut metrics = ValidationMetrics::default();
+
+        metrics.update(&batch, &[vec![1, 3]], &decoder);
+        let summary = metrics.summary(0.5);
+
+        assert_eq!(summary.loss, 0.5);
+        assert_eq!(summary.decoded_samples, 1);
+        assert_eq!(summary.token_error_rate, Some(1.0 / 3.0));
+        assert_eq!(summary.cer, Some(2.0 / 5.0));
+        assert_eq!(summary.wer, Some(1.0 / 3.0));
     }
 
     #[test]

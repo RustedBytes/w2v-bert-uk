@@ -60,8 +60,8 @@
 ## Validation And Inference
 
 - [x] Add Squeezeformer greedy CTC transcription helper.
-- [ ] Add validation decoding for all architectures.
-- [ ] Add CER/WER metrics.
+- [x] Add validation decoding for all architectures.
+- [x] Add CER/WER metrics.
 - [ ] Add beam search decoding.
 - [ ] Add optional language-model decoding.
 - [ ] Add sample prediction logging.

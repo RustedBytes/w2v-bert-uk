@@ -128,6 +128,10 @@ struct Args {
     #[arg(long)]
     max_val_samples: Option<usize>,
 
+    /// Optional SentencePiece tokenizer for validation CER/WER text decoding.
+    #[arg(long)]
+    tokenizer: Option<PathBuf>,
+
     /// Run forward/loss only and skip optimizer updates.
     #[arg(long)]
     dry_run: bool,
@@ -205,6 +209,7 @@ fn main() -> Result<()> {
         validate_every_steps: args.validate_every_steps,
         max_train_samples: args.max_train_samples,
         max_val_samples: args.max_val_samples,
+        tokenizer_path: args.tokenizer,
         dry_run: args.dry_run,
         paraformer_alignment_mode: match args.paraformer_alignment_mode {
             ParaformerAlignmentArg::Viterbi => ParaformerAlignmentMode::Viterbi,
@@ -219,8 +224,13 @@ fn main() -> Result<()> {
 
     let summary = run_burn_training(config)?;
     println!(
-        "training complete epochs={} steps={} last_train_loss={:?} last_val_loss={:?}",
-        summary.epochs, summary.steps, summary.last_train_loss, summary.last_val_loss
+        "training complete epochs={} steps={} last_train_loss={:?} last_val_loss={:?} last_val_cer={:?} last_val_wer={:?}",
+        summary.epochs,
+        summary.steps,
+        summary.last_train_loss,
+        summary.last_val_loss,
+        summary.last_val_cer,
+        summary.last_val_wer
     );
     Ok(())
 }
