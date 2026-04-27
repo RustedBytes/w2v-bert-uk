@@ -140,6 +140,7 @@ pub struct BurnTrainConfig {
     pub resume_from: Option<PathBuf>,
     pub backend: TrainBackendKind,
     pub device_index: usize,
+    pub device_indices: Vec<usize>,
     pub precision: TrainPrecision,
 }
 
@@ -192,6 +193,7 @@ impl Default for BurnTrainConfig {
             resume_from: None,
             backend: TrainBackendKind::Cpu,
             device_index: 0,
+            device_indices: vec![0],
             precision: TrainPrecision::F32,
         }
     }
@@ -457,26 +459,29 @@ pub fn run_burn_training(config: BurnTrainConfig) -> Result<TrainSummary> {
 }
 
 fn run_burn_training_cpu(config: BurnTrainConfig) -> Result<TrainSummary> {
-    if config.device_index != 0 {
-        bail!("cpu backend only supports --device-index 0");
+    if config.device_indices != [0] {
+        bail!("cpu backend only supports device index 0");
     }
     type InnerBackend = burn_ndarray::NdArray<f32>;
     let device = Default::default();
-    run_burn_training_inner::<InnerBackend>(&config, &device)
+    let devices = vec![device];
+    run_burn_training_inner::<InnerBackend>(&config, &devices)
 }
 
 #[cfg(feature = "burn-cuda-backend")]
 fn run_burn_training_cuda(config: BurnTrainConfig) -> Result<TrainSummary> {
-    let device = burn_cuda::CudaDevice {
-        index: config.device_index,
-    };
+    let devices = config
+        .device_indices
+        .iter()
+        .map(|index| burn_cuda::CudaDevice { index: *index })
+        .collect::<Vec<_>>();
     match config.precision {
-        TrainPrecision::F32 => run_burn_training_inner::<burn_cuda::Cuda<f32>>(&config, &device),
+        TrainPrecision::F32 => run_burn_training_inner::<burn_cuda::Cuda<f32>>(&config, &devices),
         TrainPrecision::F16 => {
-            run_burn_training_inner::<burn_cuda::Cuda<burn::tensor::f16>>(&config, &device)
+            run_burn_training_inner::<burn_cuda::Cuda<burn::tensor::f16>>(&config, &devices)
         }
         TrainPrecision::Bf16 => {
-            run_burn_training_inner::<burn_cuda::Cuda<burn::tensor::bf16>>(&config, &device)
+            run_burn_training_inner::<burn_cuda::Cuda<burn::tensor::bf16>>(&config, &devices)
         }
     }
 }
@@ -488,11 +493,15 @@ fn run_burn_training_cuda(_config: BurnTrainConfig) -> Result<TrainSummary> {
 
 #[cfg(feature = "burn-wgpu-backend")]
 fn run_burn_training_wgpu(config: BurnTrainConfig) -> Result<TrainSummary> {
-    let device = burn_wgpu::WgpuDevice::DiscreteGpu(config.device_index);
+    let devices = config
+        .device_indices
+        .iter()
+        .map(|index| burn_wgpu::WgpuDevice::DiscreteGpu(*index))
+        .collect::<Vec<_>>();
     match config.precision {
-        TrainPrecision::F32 => run_burn_training_inner::<burn_wgpu::Wgpu<f32>>(&config, &device),
+        TrainPrecision::F32 => run_burn_training_inner::<burn_wgpu::Wgpu<f32>>(&config, &devices),
         TrainPrecision::F16 => {
-            run_burn_training_inner::<burn_wgpu::Wgpu<burn::tensor::f16>>(&config, &device)
+            run_burn_training_inner::<burn_wgpu::Wgpu<burn::tensor::f16>>(&config, &devices)
         }
         TrainPrecision::Bf16 => bail!("BF16 training is not supported by Burn WGPU backend"),
     }
@@ -505,12 +514,15 @@ fn run_burn_training_wgpu(_config: BurnTrainConfig) -> Result<TrainSummary> {
 
 fn run_burn_training_inner<InnerBackend>(
     config: &BurnTrainConfig,
-    device: &InnerBackend::Device,
+    devices: &[InnerBackend::Device],
 ) -> Result<TrainSummary>
 where
     InnerBackend: Backend,
 {
     type TrainBackend<InnerBackend> = burn_autodiff::Autodiff<InnerBackend>;
+    let device = devices
+        .first()
+        .ok_or_else(|| anyhow!("at least one training device is required"))?;
     configure_training_precision::<TrainBackend<InnerBackend>>(config, device)?;
 
     match config.architecture {
@@ -532,7 +544,7 @@ where
                 vocab_size: config.vocab_size,
             }
             .init::<TrainBackend<InnerBackend>>(device);
-            train_ctc_model(model, config, device)
+            train_ctc_model(model, config, devices)
         }
         TrainArchitecture::Zipformer => {
             let mut encoder = config
@@ -546,7 +558,7 @@ where
                 vocab_size: config.vocab_size,
             }
             .init::<TrainBackend<InnerBackend>>(device);
-            train_ctc_model(model, config, device)
+            train_ctc_model(model, config, devices)
         }
         TrainArchitecture::Paraformer => {
             if config.paraformer_enhanced {
@@ -572,7 +584,7 @@ where
                         value
                     });
                 let model = model_config.init::<TrainBackend<InnerBackend>>(device);
-                train_enhanced_paraformer_model(model, config, device)
+                train_enhanced_paraformer_model(model, config, devices)
             } else {
                 let model_config = config
                     .variant
@@ -596,7 +608,7 @@ where
                         value
                     });
                 let model = model_config.init::<TrainBackend<InnerBackend>>(device);
-                train_paraformer_model(model, config, device)
+                train_paraformer_model(model, config, devices)
             }
         }
         TrainArchitecture::Wav2VecBert => {
@@ -604,9 +616,9 @@ where
                 type CheckpointBackend<InnerBackend> =
                     burn_autodiff::Autodiff<InnerBackend, BalancedCheckpointing>;
                 configure_training_precision::<CheckpointBackend<InnerBackend>>(config, device)?;
-                train_wav2vec_model::<CheckpointBackend<InnerBackend>>(config, device)
+                train_wav2vec_model::<CheckpointBackend<InnerBackend>>(config, devices)
             } else {
-                train_wav2vec_model::<TrainBackend<InnerBackend>>(config, device)
+                train_wav2vec_model::<TrainBackend<InnerBackend>>(config, devices)
             }
         }
     }
@@ -629,10 +641,13 @@ where
     })
 }
 
-fn train_wav2vec_model<B>(config: &BurnTrainConfig, device: &B::Device) -> Result<TrainSummary>
+fn train_wav2vec_model<B>(config: &BurnTrainConfig, devices: &[B::Device]) -> Result<TrainSummary>
 where
     B: AutodiffBackend,
 {
+    let device = devices
+        .first()
+        .ok_or_else(|| anyhow!("at least one training device is required"))?;
     let mut model_config = if let Some(path) = &config.w2v_hf_model_dir {
         Wav2VecBertCtcConfig::from_huggingface_dir(path, Some(config.vocab_size))?
     } else {
@@ -664,7 +679,7 @@ where
             report.skipped_shape.len()
         );
     }
-    train_ctc_model(model, &train_config, device)
+    train_ctc_model(model, &train_config, devices)
 }
 
 trait TrainableCtc<B: AutodiffBackend>: AutodiffModule<B> {
@@ -824,15 +839,104 @@ where
     (optimizer.step(lr, model, grads), Some(lr))
 }
 
+fn collect_parallel_gradients<B, M, R, F>(
+    model: &M,
+    batches: Vec<TrainBatch>,
+    devices: &[B::Device],
+    main_device: &B::Device,
+    loss_fn: &F,
+) -> Result<Vec<(GradientsParams, R)>>
+where
+    B: AutodiffBackend,
+    B::Device: Clone,
+    M: AutodiffModule<B>,
+    R: Send,
+    F: Fn(&M, &TrainBatch, &B::Device) -> Result<(Tensor<B, 1>, R)> + Sync,
+{
+    std::thread::scope(|scope| {
+        let handles = batches
+            .into_iter()
+            .zip(devices.iter().cloned())
+            .map(|(batch, device)| {
+                let local_model = model.clone().fork(&device);
+                let main_device = main_device.clone();
+                scope.spawn(move || {
+                    let (loss, metrics) = loss_fn(&local_model, &batch, &device)?;
+                    let grads = GradientsParams::from_grads(loss.backward(), &local_model)
+                        .to_device::<B, M>(&main_device, &local_model);
+                    Ok::<_, anyhow::Error>((grads, metrics))
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut results = Vec::with_capacity(handles.len());
+        for handle in handles {
+            results.push(
+                handle
+                    .join()
+                    .map_err(|_| anyhow!("multi-GPU worker thread panicked"))??,
+            );
+        }
+        Ok(results)
+    })
+}
+
+fn collect_device_batches<B>(
+    first: TrainBatch,
+    train_batches: &mut StreamingBatchLoader,
+    devices: &[B::Device],
+) -> Result<Vec<TrainBatch>>
+where
+    B: Backend,
+{
+    let mut batches = vec![first];
+    while batches.len() < devices.len() {
+        let Some(batch) = train_batches.next_batch()? else {
+            break;
+        };
+        batches.push(batch);
+    }
+    Ok(batches)
+}
+
+fn average_metric_triplets(results: &[(GradientsParams, [f32; 3])]) -> [f32; 3] {
+    let mut values = [0.0; 3];
+    for (_, metrics) in results {
+        for index in 0..3 {
+            values[index] += metrics[index];
+        }
+    }
+    for value in &mut values {
+        *value /= results.len() as f32;
+    }
+    values
+}
+
+fn average_metric_quintets(results: &[(GradientsParams, [f32; 5])]) -> [f32; 5] {
+    let mut values = [0.0; 5];
+    for (_, metrics) in results {
+        for index in 0..5 {
+            values[index] += metrics[index];
+        }
+    }
+    for value in &mut values {
+        *value /= results.len() as f32;
+    }
+    values
+}
+
 fn train_ctc_model<B, M>(
     mut model: M,
     config: &BurnTrainConfig,
-    device: &B::Device,
+    devices: &[B::Device],
 ) -> Result<TrainSummary>
 where
     B: AutodiffBackend,
     M: TrainableCtc<B>,
 {
+    let device = devices
+        .first()
+        .ok_or_else(|| anyhow!("at least one training device is required"))?;
     let mut optimizer = adamw_optimizer::<B, M>(config);
     let resume = load_resume_checkpoint(config)?;
     model = load_model_checkpoint(model, &resume, device)?;
@@ -869,14 +973,47 @@ where
             config.max_train_samples,
         )?;
         while let Some(batch) = train_batches.next_batch()? {
-            let loss = ctc_loss_for_batch::<B, M>(&model, &batch, config.blank_id, device);
-            let loss_value = scalar_value(loss.clone())?;
+            let batches = if !config.dry_run && devices.len() > 1 {
+                collect_device_batches::<B>(batch, &mut train_batches, devices)?
+            } else {
+                vec![batch]
+            };
+
+            let loss = ctc_loss_for_batch::<B, M>(&model, &batches[0], config.blank_id, device);
+            let mut loss_value = scalar_value(loss.clone())?;
             last_train_loss = Some(loss_value);
 
             if !config.dry_run {
-                let grads = GradientsParams::from_grads(loss.backward(), &model);
-                accumulator.accumulate::<B>(&model, grads);
-                accumulated_batches += 1;
+                if devices.len() > 1 {
+                    let active_devices = &devices[..batches.len()];
+                    let results = collect_parallel_gradients::<B, M, f32, _>(
+                        &model,
+                        batches,
+                        active_devices,
+                        device,
+                        &|local_model, batch, local_device| {
+                            let loss = ctc_loss_for_batch::<B, M>(
+                                local_model,
+                                batch,
+                                config.blank_id,
+                                local_device,
+                            );
+                            let loss_value = scalar_value(loss.clone())?;
+                            Ok((loss, loss_value))
+                        },
+                    )?;
+                    loss_value =
+                        results.iter().map(|(_, value)| *value).sum::<f32>() / results.len() as f32;
+                    last_train_loss = Some(loss_value);
+                    for (grads, _) in results {
+                        accumulator.accumulate::<B>(&model, grads);
+                        accumulated_batches += 1;
+                    }
+                } else {
+                    let grads = GradientsParams::from_grads(loss.backward(), &model);
+                    accumulator.accumulate::<B>(&model, grads);
+                    accumulated_batches += 1;
+                }
                 let (next_model, lr) = maybe_step_accumulated::<B, M, _>(
                     model,
                     &mut optimizer,
@@ -1042,11 +1179,14 @@ where
 fn train_paraformer_model<B>(
     mut model: ParaformerV2<B>,
     config: &BurnTrainConfig,
-    device: &B::Device,
+    devices: &[B::Device],
 ) -> Result<TrainSummary>
 where
     B: AutodiffBackend,
 {
+    let device = devices
+        .first()
+        .ok_or_else(|| anyhow!("at least one training device is required"))?;
     let mut optimizer = adamw_optimizer::<B, ParaformerV2<B>>(config);
     let resume = load_resume_checkpoint(config)?;
     model = load_model_checkpoint(model, &resume, device)?;
@@ -1083,16 +1223,51 @@ where
             config.max_train_samples,
         )?;
         while let Some(batch) = train_batches.next_batch()? {
-            let loss_output = paraformer_loss_for_batch(&model, &batch, config, device);
+            let batches = if !config.dry_run && devices.len() > 1 {
+                collect_device_batches::<B>(batch, &mut train_batches, devices)?
+            } else {
+                vec![batch]
+            };
+
+            let loss_output = paraformer_loss_for_batch(&model, &batches[0], config, device);
             let loss_value = scalar_value(loss_output.loss.clone())?;
-            let ctc_value = scalar_value(loss_output.ctc_loss.clone())?;
-            let ce_value = scalar_value(loss_output.ce_loss.clone())?;
-            last_train_loss = Some(loss_value);
+            let mut metric_values = [
+                loss_value,
+                scalar_value(loss_output.ctc_loss.clone())?,
+                scalar_value(loss_output.ce_loss.clone())?,
+            ];
+            last_train_loss = Some(metric_values[0]);
 
             if !config.dry_run {
-                let grads = GradientsParams::from_grads(loss_output.loss.backward(), &model);
-                accumulator.accumulate::<B>(&model, grads);
-                accumulated_batches += 1;
+                if devices.len() > 1 {
+                    let active_devices = &devices[..batches.len()];
+                    let results = collect_parallel_gradients::<B, ParaformerV2<B>, [f32; 3], _>(
+                        &model,
+                        batches,
+                        active_devices,
+                        device,
+                        &|local_model, batch, local_device| {
+                            let loss_output =
+                                paraformer_loss_for_batch(local_model, batch, config, local_device);
+                            let metrics = [
+                                scalar_value(loss_output.loss.clone())?,
+                                scalar_value(loss_output.ctc_loss.clone())?,
+                                scalar_value(loss_output.ce_loss.clone())?,
+                            ];
+                            Ok((loss_output.loss, metrics))
+                        },
+                    )?;
+                    metric_values = average_metric_triplets(&results);
+                    last_train_loss = Some(metric_values[0]);
+                    for (grads, _) in results {
+                        accumulator.accumulate::<B>(&model, grads);
+                        accumulated_batches += 1;
+                    }
+                } else {
+                    let grads = GradientsParams::from_grads(loss_output.loss.backward(), &model);
+                    accumulator.accumulate::<B>(&model, grads);
+                    accumulated_batches += 1;
+                }
                 let (next_model, lr) = maybe_step_accumulated::<B, ParaformerV2<B>, _>(
                     model,
                     &mut optimizer,
@@ -1106,7 +1281,10 @@ where
                 if let Some(lr) = lr {
                     if global_step == 1 || global_step % config.log_every == 0 {
                         println!(
-                            "epoch={epoch} step={global_step} lr={lr:.8} train_loss={loss_value:.6} train_ctc_loss={ctc_value:.6} train_ce_loss={ce_value:.6} elapsed_sec={:.1}",
+                            "epoch={epoch} step={global_step} lr={lr:.8} train_loss={:.6} train_ctc_loss={:.6} train_ce_loss={:.6} elapsed_sec={:.1}",
+                            metric_values[0],
+                            metric_values[1],
+                            metric_values[2],
                             started.elapsed().as_secs_f64()
                         );
                     }
@@ -1115,7 +1293,10 @@ where
                 global_step += 1;
                 if global_step == 1 || global_step % config.log_every == 0 {
                     println!(
-                        "epoch={epoch} step={global_step} train_loss={loss_value:.6} train_ctc_loss={ctc_value:.6} train_ce_loss={ce_value:.6} elapsed_sec={:.1}",
+                        "epoch={epoch} step={global_step} train_loss={:.6} train_ctc_loss={:.6} train_ce_loss={:.6} elapsed_sec={:.1}",
+                        metric_values[0],
+                        metric_values[1],
+                        metric_values[2],
                         started.elapsed().as_secs_f64()
                     );
                 }
@@ -1249,11 +1430,14 @@ where
 fn train_enhanced_paraformer_model<B>(
     mut model: EnhancedParaformerV2<B>,
     config: &BurnTrainConfig,
-    device: &B::Device,
+    devices: &[B::Device],
 ) -> Result<TrainSummary>
 where
     B: AutodiffBackend,
 {
+    let device = devices
+        .first()
+        .ok_or_else(|| anyhow!("at least one training device is required"))?;
     let mut optimizer = adamw_optimizer::<B, EnhancedParaformerV2<B>>(config);
     let resume = load_resume_checkpoint(config)?;
     model = load_model_checkpoint(model, &resume, device)?;
@@ -1291,18 +1475,60 @@ where
             config.max_train_samples,
         )?;
         while let Some(batch) = train_batches.next_batch()? {
-            let loss_output = enhanced_paraformer_loss_for_batch(&model, &batch, config, device);
-            let loss_value = scalar_value(loss_output.loss.clone())?;
-            let ctc_value = scalar_value(loss_output.ctc_loss.clone())?;
-            let shallow_value = scalar_value(loss_output.shallow_ctc_loss.clone())?;
-            let ce_value = scalar_value(loss_output.ce_loss.clone())?;
-            let boundary_value = scalar_value(loss_output.boundary_loss.clone())?;
-            last_train_loss = Some(loss_value);
+            let batches = if !config.dry_run && devices.len() > 1 {
+                collect_device_batches::<B>(batch, &mut train_batches, devices)?
+            } else {
+                vec![batch]
+            };
+
+            let loss_output =
+                enhanced_paraformer_loss_for_batch(&model, &batches[0], config, device);
+            let mut metric_values = [
+                scalar_value(loss_output.loss.clone())?,
+                scalar_value(loss_output.ctc_loss.clone())?,
+                scalar_value(loss_output.shallow_ctc_loss.clone())?,
+                scalar_value(loss_output.ce_loss.clone())?,
+                scalar_value(loss_output.boundary_loss.clone())?,
+            ];
+            last_train_loss = Some(metric_values[0]);
 
             if !config.dry_run {
-                let grads = GradientsParams::from_grads(loss_output.loss.backward(), &model);
-                accumulator.accumulate::<B>(&model, grads);
-                accumulated_batches += 1;
+                if devices.len() > 1 {
+                    let active_devices = &devices[..batches.len()];
+                    let results =
+                        collect_parallel_gradients::<B, EnhancedParaformerV2<B>, [f32; 5], _>(
+                            &model,
+                            batches,
+                            active_devices,
+                            device,
+                            &|local_model, batch, local_device| {
+                                let loss_output = enhanced_paraformer_loss_for_batch(
+                                    local_model,
+                                    batch,
+                                    config,
+                                    local_device,
+                                );
+                                let metrics = [
+                                    scalar_value(loss_output.loss.clone())?,
+                                    scalar_value(loss_output.ctc_loss.clone())?,
+                                    scalar_value(loss_output.shallow_ctc_loss.clone())?,
+                                    scalar_value(loss_output.ce_loss.clone())?,
+                                    scalar_value(loss_output.boundary_loss.clone())?,
+                                ];
+                                Ok((loss_output.loss, metrics))
+                            },
+                        )?;
+                    metric_values = average_metric_quintets(&results);
+                    last_train_loss = Some(metric_values[0]);
+                    for (grads, _) in results {
+                        accumulator.accumulate::<B>(&model, grads);
+                        accumulated_batches += 1;
+                    }
+                } else {
+                    let grads = GradientsParams::from_grads(loss_output.loss.backward(), &model);
+                    accumulator.accumulate::<B>(&model, grads);
+                    accumulated_batches += 1;
+                }
                 let (next_model, lr) = maybe_step_accumulated::<B, EnhancedParaformerV2<B>, _>(
                     model,
                     &mut optimizer,
@@ -1316,7 +1542,12 @@ where
                 if let Some(lr) = lr {
                     if global_step == 1 || global_step % config.log_every == 0 {
                         println!(
-                            "epoch={epoch} step={global_step} lr={lr:.8} train_loss={loss_value:.6} train_ctc_loss={ctc_value:.6} train_shallow_ctc_loss={shallow_value:.6} train_ce_loss={ce_value:.6} train_boundary_loss={boundary_value:.6} elapsed_sec={:.1}",
+                            "epoch={epoch} step={global_step} lr={lr:.8} train_loss={:.6} train_ctc_loss={:.6} train_shallow_ctc_loss={:.6} train_ce_loss={:.6} train_boundary_loss={:.6} elapsed_sec={:.1}",
+                            metric_values[0],
+                            metric_values[1],
+                            metric_values[2],
+                            metric_values[3],
+                            metric_values[4],
                             started.elapsed().as_secs_f64()
                         );
                     }
@@ -1325,7 +1556,12 @@ where
                 global_step += 1;
                 if global_step == 1 || global_step % config.log_every == 0 {
                     println!(
-                        "epoch={epoch} step={global_step} train_loss={loss_value:.6} train_ctc_loss={ctc_value:.6} train_shallow_ctc_loss={shallow_value:.6} train_ce_loss={ce_value:.6} train_boundary_loss={boundary_value:.6} elapsed_sec={:.1}",
+                        "epoch={epoch} step={global_step} train_loss={:.6} train_ctc_loss={:.6} train_shallow_ctc_loss={:.6} train_ce_loss={:.6} train_boundary_loss={:.6} elapsed_sec={:.1}",
+                        metric_values[0],
+                        metric_values[1],
+                        metric_values[2],
+                        metric_values[3],
+                        metric_values[4],
                         started.elapsed().as_secs_f64()
                     );
                 }
@@ -2555,6 +2791,12 @@ fn validate_config(config: &BurnTrainConfig) -> Result<()> {
     if config.gradient_clip_norm.is_some() && config.gradient_clip_value.is_some() {
         bail!("set at most one of gradient_clip_norm or gradient_clip_value");
     }
+    if config.device_indices.is_empty() {
+        bail!("device_indices must contain at least one device");
+    }
+    if config.backend == TrainBackendKind::Cpu && config.device_indices != [0] {
+        bail!("cpu backend only supports device index 0");
+    }
     if matches!(config.gradient_clip_norm, Some(value) if value <= 0.0) {
         bail!("gradient_clip_norm must be > 0 when set");
     }
@@ -2661,6 +2903,7 @@ fn run_config_json(config: &BurnTrainConfig) -> Value {
             TrainBackendKind::Wgpu => "wgpu",
         },
         "device_index": config.device_index,
+        "device_indices": config.device_indices,
         "precision": match config.precision {
             TrainPrecision::F32 => "f32",
             TrainPrecision::F16 => "f16",

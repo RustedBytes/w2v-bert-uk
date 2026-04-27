@@ -38,7 +38,7 @@
 - [x] Add learning-rate scheduler with warmup/hold/decay.
 - [ ] Add EMA model tracking.
 - [ ] Add distributed training support.
-- [ ] Add multi-GPU training support.
+- [x] Add multi-GPU training support.
 
 ## Data Loading
 

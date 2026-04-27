@@ -225,6 +225,10 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     device_index: usize,
 
+    /// Comma-separated CUDA/WGPU device indices for replicated data-parallel training.
+    #[arg(long, value_delimiter = ',')]
+    device_indices: Vec<usize>,
+
     /// Training float precision: f32, f16, or bf16.
     #[arg(long, value_enum, default_value_t = PrecisionArg::F32)]
     precision: PrecisionArg,
@@ -278,6 +282,7 @@ fn main() -> Result<()> {
     let (train_manifest, val_manifest) = resolve_manifest_paths(&args)?;
     let adaptive_batch = resolve_adaptive_batch(&args)?;
     let precision = resolve_precision(&args);
+    let device_indices = resolve_device_indices(&args);
     let config = BurnTrainConfig {
         architecture: resolve_architecture(&args),
         train_manifest,
@@ -333,6 +338,7 @@ fn main() -> Result<()> {
             BackendArg::Wgpu => TrainBackendKind::Wgpu,
         },
         device_index: args.device_index,
+        device_indices,
         precision,
     };
 
@@ -347,6 +353,14 @@ fn main() -> Result<()> {
         summary.last_val_wer
     );
     Ok(())
+}
+
+fn resolve_device_indices(args: &Args) -> Vec<usize> {
+    if args.device_indices.is_empty() {
+        vec![args.device_index]
+    } else {
+        args.device_indices.clone()
+    }
 }
 
 fn resolve_precision(args: &Args) -> TrainPrecision {
