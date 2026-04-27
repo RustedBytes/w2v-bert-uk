@@ -87,9 +87,9 @@ Tokenizer inputs:
 
 | Input type | Text source |
 | --- | --- |
-| JSONL/JSON | `text`, `transcript`, `sentence`, or `normalized_text` |
+| JSONL/JSON | `text`, `transcript`, `transcription`, `sentence`, or `normalized_text` |
 | TSV | fifth column, after `features_path`, `rows`, `cols`, `tokens` |
-| Parquet | `text`, `transcript`, `sentence`, or `normalized_text` columns |
+| Parquet | `text`, `transcript`, `transcription`, `sentence`, or `normalized_text` columns |
 | Plain text | one training sentence per non-empty line |
 | Audio files | `.txt`, `.lab`, or `.transcript` sidecar beside each audio file |
 
@@ -198,7 +198,7 @@ Audio file:
 {"id":"utt-1","audio_path":"audio/utt-1.wav","tokens":[1,2,3],"text":"hello"}
 ```
 
-Accepted transcript fields are `text`, `transcript`, and `sentence`.
+Accepted transcript fields are `text`, `transcript`, `transcription`, `sentence`, and `normalized_text`.
 Accepted token fields are `tokens`, `target`, and `targets`.
 
 ### TSV Manifest
@@ -259,7 +259,7 @@ training example. The loader recognizes common column names:
 | Meaning | Column names |
 | --- | --- |
 | id | `id`, `utt_id`, `utterance_id`, `key`, `sample_id` |
-| transcript | `text`, `transcript`, `sentence`, `normalized_text` |
+| transcript | `text`, `transcript`, `transcription`, `sentence`, `normalized_text` |
 | tokens | `tokens`, `target`, `targets`, `labels`, `label_ids` |
 | precomputed features | `features`, `input_features`, `feature`, `fbank`, `filterbank` |
 | feature rows | `rows`, `num_frames`, `frames`, `feature_rows` |

@@ -919,7 +919,13 @@ fn write_parquet_text(path: &Path, writer: &mut fs::File) -> Result<usize> {
         if let Some(text) = parquet_optional_string(
             &df,
             row,
-            &["text", "transcript", "sentence", "normalized_text"],
+            &[
+                "text",
+                "transcript",
+                "transcription",
+                "sentence",
+                "normalized_text",
+            ],
         )? {
             count += write_corpus_line(writer, &text)?;
         }
@@ -953,6 +959,7 @@ fn json_text_field(value: &Value) -> Option<&str> {
     value
         .get("text")
         .or_else(|| value.get("transcript"))
+        .or_else(|| value.get("transcription"))
         .or_else(|| value.get("sentence"))
         .or_else(|| value.get("normalized_text"))
         .and_then(Value::as_str)

@@ -4041,7 +4041,13 @@ fn parse_parquet_record(
     let text = parquet_optional_string(
         &df,
         row,
-        &["text", "transcript", "sentence", "normalized_text"],
+        &[
+            "text",
+            "transcript",
+            "transcription",
+            "sentence",
+            "normalized_text",
+        ],
     )?;
     let tokens = match parquet_optional_tokens(&df, row)? {
         Some(tokens) => tokens,
@@ -4624,7 +4630,9 @@ fn parse_json_record(
     let text = value
         .get("text")
         .or_else(|| value.get("transcript"))
+        .or_else(|| value.get("transcription"))
         .or_else(|| value.get("sentence"))
+        .or_else(|| value.get("normalized_text"))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
     let tokens = parse_record_tokens(&value, text.as_deref(), tokenizer, &id)?;
