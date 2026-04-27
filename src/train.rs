@@ -12,7 +12,10 @@ use burn_nn::loss::{CTCLossConfig, Reduction};
 use burn_optim::{AdamWConfig, GradientsParams, Optimizer};
 use serde_json::{Value, json};
 
-use crate::paraformer::{ParaformerAlignmentMode, ParaformerV2, ParaformerV2Config};
+use crate::paraformer::{
+    EnhancedParaformerV2, EnhancedParaformerV2Config, ParaformerAlignmentMode, ParaformerV2,
+    ParaformerV2Config,
+};
 use crate::squeezeformer::{SqueezeformerCtc, SqueezeformerCtcConfig, SqueezeformerEncoderConfig};
 use crate::wav2vec::{Wav2VecBertConfig, Wav2VecBertCtc, Wav2VecBertCtcConfig};
 use crate::zipformer::{ZipformerConfig, ZipformerCtc, ZipformerCtcConfig};
@@ -65,6 +68,7 @@ pub struct BurnTrainConfig {
     pub max_val_samples: Option<usize>,
     pub dry_run: bool,
     pub paraformer_alignment_mode: ParaformerAlignmentMode,
+    pub paraformer_enhanced: bool,
 }
 
 impl Default for BurnTrainConfig {
@@ -94,6 +98,7 @@ impl Default for BurnTrainConfig {
             max_val_samples: None,
             dry_run: false,
             paraformer_alignment_mode: ParaformerAlignmentMode::Viterbi,
+            paraformer_enhanced: false,
         }
     }
 }
@@ -206,28 +211,55 @@ pub fn run_burn_training(config: BurnTrainConfig) -> Result<TrainSummary> {
             train_ctc_model(model, &config, &device)
         }
         TrainArchitecture::Paraformer => {
-            let model_config = config
-                .variant
-                .as_deref()
-                .and_then(|variant| {
-                    ParaformerV2Config::variant(
-                        variant,
-                        config.input_dim,
-                        config.vocab_size,
-                        config.blank_id,
-                    )
-                })
-                .unwrap_or_else(|| {
-                    let mut value = ParaformerV2Config::new(config.input_dim, config.vocab_size)
-                        .with_blank_id(config.blank_id);
-                    value.encoder_dim = config.d_model;
-                    value.decoder_dim = config.d_model;
-                    value.encoder_layers = config.num_layers;
-                    value.attention_heads = config.num_heads;
-                    value
-                });
-            let model = model_config.init::<TrainBackend>(&device);
-            train_paraformer_model(model, &config, &device)
+            if config.paraformer_enhanced {
+                let model_config = config
+                    .variant
+                    .as_deref()
+                    .and_then(|variant| {
+                        EnhancedParaformerV2Config::variant(
+                            variant,
+                            config.input_dim,
+                            config.vocab_size,
+                            config.blank_id,
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        let mut value =
+                            EnhancedParaformerV2Config::new(config.input_dim, config.vocab_size)
+                                .with_blank_id(config.blank_id);
+                        value.base.encoder_dim = config.d_model;
+                        value.base.decoder_dim = config.d_model;
+                        value.base.encoder_layers = config.num_layers;
+                        value.base.attention_heads = config.num_heads;
+                        value
+                    });
+                let model = model_config.init::<TrainBackend>(&device);
+                train_enhanced_paraformer_model(model, &config, &device)
+            } else {
+                let model_config = config
+                    .variant
+                    .as_deref()
+                    .and_then(|variant| {
+                        ParaformerV2Config::variant(
+                            variant,
+                            config.input_dim,
+                            config.vocab_size,
+                            config.blank_id,
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        let mut value =
+                            ParaformerV2Config::new(config.input_dim, config.vocab_size)
+                                .with_blank_id(config.blank_id);
+                        value.encoder_dim = config.d_model;
+                        value.decoder_dim = config.d_model;
+                        value.encoder_layers = config.num_layers;
+                        value.attention_heads = config.num_heads;
+                        value
+                    });
+                let model = model_config.init::<TrainBackend>(&device);
+                train_paraformer_model(model, &config, &device)
+            }
         }
         TrainArchitecture::Wav2VecBert => {
             let encoder = Wav2VecBertConfig::new(config.input_dim, config.d_model)
@@ -508,12 +540,160 @@ where
     Ok((total / count as f64) as f32)
 }
 
+fn train_enhanced_paraformer_model<B>(
+    mut model: EnhancedParaformerV2<B>,
+    config: &BurnTrainConfig,
+    device: &B::Device,
+) -> Result<TrainSummary>
+where
+    B: AutodiffBackend,
+{
+    let mut optimizer = AdamWConfig::new()
+        .with_weight_decay(config.weight_decay as f32)
+        .init();
+    let mut global_step = 0usize;
+    let mut last_train_loss = None;
+    let mut last_val_loss = None;
+    let started = Instant::now();
+
+    for epoch in 1..=config.epochs {
+        let mut train_batches = StreamingBatchLoader::new(
+            config.train_manifest.clone(),
+            config.batch_size,
+            config.adaptive_batch,
+            config.sort_by_length_desc,
+            config.sort_buffer_size,
+            config.input_dim,
+            config.max_train_samples,
+        )?;
+        while let Some(batch) = train_batches.next_batch()? {
+            let loss_output = enhanced_paraformer_loss_for_batch(&model, &batch, config, device);
+            let loss_value = scalar_value(loss_output.loss.clone())?;
+            let ctc_value = scalar_value(loss_output.ctc_loss.clone())?;
+            let shallow_value = scalar_value(loss_output.shallow_ctc_loss.clone())?;
+            let ce_value = scalar_value(loss_output.ce_loss.clone())?;
+            let boundary_value = scalar_value(loss_output.boundary_loss.clone())?;
+            last_train_loss = Some(loss_value);
+
+            if !config.dry_run {
+                let grads = GradientsParams::from_grads(loss_output.loss.backward(), &model);
+                model = optimizer.step(config.learning_rate, model, grads);
+            }
+
+            global_step += 1;
+            if global_step == 1 || global_step % config.log_every == 0 {
+                println!(
+                    "epoch={epoch} step={global_step} train_loss={loss_value:.6} train_ctc_loss={ctc_value:.6} train_shallow_ctc_loss={shallow_value:.6} train_ce_loss={ce_value:.6} train_boundary_loss={boundary_value:.6} elapsed_sec={:.1}",
+                    started.elapsed().as_secs_f64()
+                );
+            }
+
+            if let (Some(_), Some(every)) = (&config.val_manifest, config.validate_every_steps) {
+                if every > 0 && global_step % every == 0 {
+                    let val_loss = evaluate_enhanced_paraformer_model(&model, config, device)?;
+                    println!("epoch={epoch} step={global_step} val_loss={val_loss:.6}");
+                    last_val_loss = Some(val_loss);
+                    write_checkpoint_metadata(
+                        config,
+                        epoch,
+                        global_step,
+                        last_train_loss,
+                        last_val_loss,
+                    )?;
+                }
+            }
+        }
+
+        if config.val_manifest.is_some() {
+            let val_loss = evaluate_enhanced_paraformer_model(&model, config, device)?;
+            println!("epoch={epoch} val_loss={val_loss:.6}");
+            last_val_loss = Some(val_loss);
+        }
+        write_checkpoint_metadata(config, epoch, global_step, last_train_loss, last_val_loss)?;
+    }
+
+    Ok(TrainSummary {
+        epochs: config.epochs,
+        steps: global_step,
+        last_train_loss,
+        last_val_loss,
+    })
+}
+
+fn evaluate_enhanced_paraformer_model<B>(
+    model: &EnhancedParaformerV2<B>,
+    config: &BurnTrainConfig,
+    device: &B::Device,
+) -> Result<f32>
+where
+    B: AutodiffBackend,
+{
+    let mut total = 0.0f64;
+    let mut count = 0usize;
+    let val_manifest = config
+        .val_manifest
+        .as_ref()
+        .ok_or_else(|| anyhow!("validation requested without val_manifest"))?;
+    let mut batches = StreamingBatchLoader::new(
+        val_manifest.clone(),
+        config.batch_size,
+        config.adaptive_batch,
+        config.sort_by_length_desc,
+        config.sort_buffer_size,
+        config.input_dim,
+        config.max_val_samples,
+    )?;
+    while let Some(batch) = batches.next_batch()? {
+        let loss = enhanced_paraformer_loss_for_batch(model, &batch, config, device).loss;
+        total += f64::from(scalar_value(loss)?);
+        count += 1;
+    }
+    if count == 0 {
+        bail!("validation manifest is empty");
+    }
+    Ok((total / count as f64) as f32)
+}
+
 fn paraformer_loss_for_batch<B>(
     model: &ParaformerV2<B>,
     batch: &TrainBatch,
     config: &BurnTrainConfig,
     device: &B::Device,
 ) -> crate::paraformer::ParaformerLossOutput<B>
+where
+    B: AutodiffBackend,
+{
+    let features = Tensor::<B, 3>::from_data(
+        TensorData::new(
+            batch.features.clone(),
+            [batch.batch_size, batch.max_frames, batch.feature_dim],
+        ),
+        device,
+    );
+    let targets = Tensor::<B, 2, Int>::from_data(
+        TensorData::new(
+            batch.targets.clone(),
+            [batch.batch_size, batch.max_target_len],
+        ),
+        device,
+    );
+    model.loss(
+        features,
+        batch.feature_lengths.clone(),
+        targets,
+        &batch.targets,
+        batch.target_lengths.clone(),
+        config.blank_id,
+        config.paraformer_alignment_mode,
+    )
+}
+
+fn enhanced_paraformer_loss_for_batch<B>(
+    model: &EnhancedParaformerV2<B>,
+    batch: &TrainBatch,
+    config: &BurnTrainConfig,
+    device: &B::Device,
+) -> crate::paraformer::EnhancedParaformerLossOutput<B>
 where
     B: AutodiffBackend,
 {

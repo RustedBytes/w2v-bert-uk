@@ -5,8 +5,8 @@ use burn_nn::attention::{MhaInput, MultiHeadAttention, MultiHeadAttentionConfig}
 use burn_nn::conv::{Conv1d, Conv1dConfig, Conv2d, Conv2dConfig};
 use burn_nn::transformer::{TransformerDecoder, TransformerDecoderConfig, TransformerDecoderInput};
 use burn_nn::{
-    BatchNorm, BatchNormConfig, Dropout, DropoutConfig, LayerNorm, LayerNormConfig, Linear,
-    LinearConfig, PaddingConfig1d, PaddingConfig2d,
+    BatchNorm, BatchNormConfig, Dropout, DropoutConfig, Embedding, EmbeddingConfig, LayerNorm,
+    LayerNormConfig, Linear, LinearConfig, PaddingConfig1d, PaddingConfig2d,
 };
 
 #[derive(Clone, Debug)]
@@ -124,6 +124,104 @@ impl ParaformerV2Config {
             .init(device),
             decoder_projection: LinearConfig::new(self.decoder_dim, self.vocab_size).init(device),
             blank_id: self.resolved_blank_id(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct EnhancedParaformerV2Config {
+    pub base: ParaformerV2Config,
+    pub shallow_ctc_loss_weight: f64,
+    pub boundary_loss_weight: f64,
+    pub refinement_loss_weight: f64,
+    pub confidence_threshold: f64,
+    pub low_confidence_threshold: f64,
+}
+
+impl EnhancedParaformerV2Config {
+    pub fn new(input_dim: usize, vocab_size: usize) -> Self {
+        Self {
+            base: ParaformerV2Config::new(input_dim, vocab_size),
+            shallow_ctc_loss_weight: 0.3,
+            boundary_loss_weight: 0.1,
+            refinement_loss_weight: 0.3,
+            confidence_threshold: 0.55,
+            low_confidence_threshold: 0.7,
+        }
+    }
+
+    pub fn variant(
+        name: &str,
+        input_dim: usize,
+        vocab_size: usize,
+        blank_id: usize,
+    ) -> Option<Self> {
+        Some(Self {
+            base: ParaformerV2Config::variant(name, input_dim, vocab_size, blank_id)?,
+            ..Self::new(input_dim, vocab_size)
+        })
+    }
+
+    pub fn with_blank_id(mut self, blank_id: usize) -> Self {
+        self.base = self.base.with_blank_id(blank_id);
+        self
+    }
+
+    pub fn init<B: Backend>(&self, device: &B::Device) -> EnhancedParaformerV2<B> {
+        let base = &self.base;
+        EnhancedParaformerV2 {
+            encoder: MultiResolutionConformerEncoderConfig {
+                input_dim: base.input_dim,
+                encoder_dim: base.encoder_dim,
+                encoder_layers: base.encoder_layers,
+                encoder_ff_dim: base.encoder_ff_dim,
+                attention_heads: base.attention_heads,
+                conv_kernel_size: base.conv_kernel_size,
+                dropout: base.dropout,
+            }
+            .init(device),
+            shallow_ctc_projection: LinearConfig::new(base.encoder_dim, base.ctc_vocab_size())
+                .init(device),
+            final_ctc_projection: LinearConfig::new(base.encoder_dim, base.ctc_vocab_size())
+                .init(device),
+            boundary_in: LinearConfig::new(base.encoder_dim * 2, base.encoder_dim).init(device),
+            boundary_out: LinearConfig::new(base.encoder_dim, 1).init(device),
+            query_projection: LinearConfig::new(base.ctc_vocab_size() * 2 + 4, base.decoder_dim)
+                .init(device),
+            query_norm: LayerNormConfig::new(base.decoder_dim).init(device),
+            memory_projection: if base.encoder_dim == base.decoder_dim {
+                None
+            } else {
+                Some(LinearConfig::new(base.encoder_dim, base.decoder_dim).init(device))
+            },
+            decoder: TransformerDecoderConfig::new(
+                base.decoder_dim,
+                base.decoder_ff_dim,
+                base.attention_heads,
+                base.decoder_layers,
+            )
+            .with_dropout(base.dropout)
+            .with_norm_first(true)
+            .init(device),
+            decoder_projection: LinearConfig::new(base.decoder_dim, base.vocab_size).init(device),
+            token_embedding: EmbeddingConfig::new(base.vocab_size, base.decoder_dim).init(device),
+            refinement_decoder: TransformerDecoderConfig::new(
+                base.decoder_dim,
+                base.decoder_ff_dim,
+                base.attention_heads,
+                1,
+            )
+            .with_dropout(base.dropout)
+            .with_norm_first(true)
+            .init(device),
+            refinement_projection: LinearConfig::new(base.decoder_dim, base.vocab_size)
+                .init(device),
+            blank_id: base.resolved_blank_id(),
+            shallow_ctc_loss_weight: self.shallow_ctc_loss_weight,
+            boundary_loss_weight: self.boundary_loss_weight,
+            refinement_loss_weight: self.refinement_loss_weight,
+            confidence_threshold: self.confidence_threshold,
+            low_confidence_threshold: self.low_confidence_threshold,
         }
     }
 }
@@ -357,6 +455,65 @@ impl<B: Backend> ConformerEncoder<B> {
     }
 }
 
+#[derive(Clone, Debug)]
+struct MultiResolutionConformerEncoderConfig {
+    input_dim: usize,
+    encoder_dim: usize,
+    encoder_layers: usize,
+    encoder_ff_dim: usize,
+    attention_heads: usize,
+    conv_kernel_size: usize,
+    dropout: f64,
+}
+
+impl MultiResolutionConformerEncoderConfig {
+    fn init<B: Backend>(&self, device: &B::Device) -> MultiResolutionConformerEncoder<B> {
+        MultiResolutionConformerEncoder {
+            subsampling: ConvSubsamplingConfig::new(self.input_dim, self.encoder_dim).init(device),
+            layers: (0..self.encoder_layers)
+                .map(|_| {
+                    ConformerBlockConfig {
+                        dim: self.encoder_dim,
+                        ff_dim: self.encoder_ff_dim,
+                        heads: self.attention_heads,
+                        kernel_size: self.conv_kernel_size,
+                        dropout: self.dropout,
+                    }
+                    .init(device)
+                })
+                .collect(),
+            shallow_index: self.encoder_layers.saturating_div(2).saturating_sub(1),
+        }
+    }
+}
+
+#[derive(Module, Debug)]
+struct MultiResolutionConformerEncoder<B: Backend> {
+    subsampling: ConvSubsampling<B>,
+    layers: Vec<ConformerBlock<B>>,
+    shallow_index: usize,
+}
+
+impl<B: Backend> MultiResolutionConformerEncoder<B> {
+    fn forward(
+        &self,
+        features: Tensor<B, 3>,
+        lengths: Vec<usize>,
+    ) -> (Tensor<B, 3>, Tensor<B, 3>, Vec<usize>) {
+        let device = features.device();
+        let (mut output, lengths) = self.subsampling.forward(features, lengths);
+        let mask = padding_mask::<B>(&lengths, output.dims()[1], &device);
+        let mut shallow = None;
+        for (index, layer) in self.layers.iter().enumerate() {
+            output = layer.forward(output, mask.clone());
+            if index == self.shallow_index {
+                shallow = Some(output.clone());
+            }
+        }
+        (shallow.unwrap_or_else(|| output.clone()), output, lengths)
+    }
+}
+
 #[derive(Module, Debug)]
 pub struct ParaformerV2<B: Backend> {
     encoder: ConformerEncoder<B>,
@@ -390,6 +547,52 @@ pub struct ParaformerLossOutput<B: Backend> {
     pub ctc_loss: Tensor<B, 1>,
     pub ce_loss: Tensor<B, 1>,
     pub output: ParaformerOutput<B>,
+}
+
+#[derive(Module, Debug)]
+pub struct EnhancedParaformerV2<B: Backend> {
+    encoder: MultiResolutionConformerEncoder<B>,
+    shallow_ctc_projection: Linear<B>,
+    final_ctc_projection: Linear<B>,
+    boundary_in: Linear<B>,
+    boundary_out: Linear<B>,
+    query_projection: Linear<B>,
+    query_norm: LayerNorm<B>,
+    memory_projection: Option<Linear<B>>,
+    decoder: TransformerDecoder<B>,
+    decoder_projection: Linear<B>,
+    token_embedding: Embedding<B>,
+    refinement_decoder: TransformerDecoder<B>,
+    refinement_projection: Linear<B>,
+    blank_id: usize,
+    shallow_ctc_loss_weight: f64,
+    boundary_loss_weight: f64,
+    refinement_loss_weight: f64,
+    confidence_threshold: f64,
+    low_confidence_threshold: f64,
+}
+
+#[derive(Debug)]
+pub struct EnhancedParaformerOutput<B: Backend> {
+    pub decoder_logits: Tensor<B, 3>,
+    pub initial_decoder_logits: Tensor<B, 3>,
+    pub ctc_log_probs: Tensor<B, 3>,
+    pub shallow_ctc_log_probs: Tensor<B, 3>,
+    pub encoder_lengths: Vec<usize>,
+    pub query_lengths: Vec<usize>,
+    pub query_confidences: Tensor<B, 2>,
+    pub alignments: Vec<i64>,
+    pub boundary_logits: Tensor<B, 2>,
+}
+
+#[derive(Debug)]
+pub struct EnhancedParaformerLossOutput<B: Backend> {
+    pub loss: Tensor<B, 1>,
+    pub ctc_loss: Tensor<B, 1>,
+    pub shallow_ctc_loss: Tensor<B, 1>,
+    pub ce_loss: Tensor<B, 1>,
+    pub boundary_loss: Tensor<B, 1>,
+    pub output: EnhancedParaformerOutput<B>,
 }
 
 impl<B: Backend> ParaformerV2<B> {
@@ -545,6 +748,167 @@ impl<B: Backend> ParaformerOutput<B> {
     }
 }
 
+impl<B: Backend> EnhancedParaformerV2<B> {
+    pub fn forward_train(
+        &self,
+        features: Tensor<B, 3>,
+        lengths: Vec<usize>,
+        targets: &[i64],
+        target_lengths: &[usize],
+        alignment_mode: ParaformerAlignmentMode,
+    ) -> EnhancedParaformerOutput<B> {
+        let (shallow_out, final_out, encoder_lengths) = self.encoder.forward(features, lengths);
+        let shallow_logits = self.shallow_ctc_projection.forward(shallow_out.clone());
+        let final_logits = self.final_ctc_projection.forward(final_out.clone());
+        let shallow_ctc_log_probs = log_softmax(shallow_logits.clone(), 2);
+        let ctc_log_probs = log_softmax(final_logits.clone(), 2);
+        let final_posteriors = softmax(final_logits.clone(), 2);
+        let alignments = match alignment_mode {
+            ParaformerAlignmentMode::Viterbi => batch_ctc_viterbi_alignments(
+                ctc_log_probs.clone(),
+                &encoder_lengths,
+                targets,
+                target_lengths,
+                self.blank_id,
+            ),
+            ParaformerAlignmentMode::Uniform => batch_uniform_alignments(
+                &encoder_lengths,
+                targets,
+                target_lengths,
+                final_posteriors.dims()[1],
+                self.blank_id,
+            ),
+            ParaformerAlignmentMode::Greedy => {
+                greedy_alignments(ctc_log_probs.clone(), &encoder_lengths)
+            }
+        };
+
+        let boundary_logits = self
+            .boundary_out
+            .forward(silu(self.boundary_in.forward(Tensor::cat(
+                vec![shallow_out.clone(), final_out.clone()],
+                2,
+            ))))
+            .reshape([final_out.dims()[0], final_out.dims()[1]]);
+        let (query_features, query_lengths, query_confidences) = compress_confidence_gated_queries(
+            softmax(shallow_logits, 2),
+            final_posteriors,
+            &alignments,
+            &encoder_lengths,
+            self.blank_id,
+            sigmoid(boundary_logits.clone()),
+            self.confidence_threshold,
+        );
+        let decoder_in = silu(
+            self.query_norm
+                .forward(self.query_projection.forward(query_features)),
+        ) * query_confidences.clone().unsqueeze_dim::<3>(2);
+        let memory = match &self.memory_projection {
+            Some(projection) => projection.forward(final_out),
+            None => final_out,
+        };
+        let target_mask = padding_mask::<B>(&query_lengths, decoder_in.dims()[1], &memory.device());
+        let memory_mask = padding_mask::<B>(&encoder_lengths, memory.dims()[1], &memory.device());
+        let decoder_out = self.decoder.forward(
+            TransformerDecoderInput::new(decoder_in, memory.clone())
+                .target_mask_pad(target_mask.clone())
+                .memory_mask_pad(memory_mask.clone()),
+        );
+        let initial_decoder_logits = self.decoder_projection.forward(decoder_out.clone());
+        let decoder_probs = softmax(initial_decoder_logits.clone(), 2);
+        let token_confidences = decoder_probs
+            .clone()
+            .max_dim(2)
+            .reshape([decoder_probs.dims()[0], decoder_probs.dims()[1]]);
+        let token_ids = decoder_probs
+            .clone()
+            .argmax(2)
+            .reshape([decoder_probs.dims()[0], decoder_probs.dims()[1]]);
+        let correction_seed = decoder_out.clone() + self.token_embedding.forward(token_ids);
+        let refinement_out = self.refinement_decoder.forward(
+            TransformerDecoderInput::new(correction_seed, memory)
+                .target_mask_pad(target_mask)
+                .memory_mask_pad(memory_mask),
+        );
+        let low_confidence = token_confidences
+            .lower_elem(self.low_confidence_threshold)
+            .unsqueeze_dim::<3>(2)
+            .repeat_dim(2, decoder_out.dims()[2]);
+        let refined_states = decoder_out.mask_where(low_confidence, refinement_out);
+        let decoder_logits = self.refinement_projection.forward(refined_states);
+
+        EnhancedParaformerOutput {
+            decoder_logits,
+            initial_decoder_logits,
+            ctc_log_probs,
+            shallow_ctc_log_probs,
+            encoder_lengths,
+            query_lengths,
+            query_confidences,
+            alignments,
+            boundary_logits,
+        }
+    }
+
+    pub fn loss(
+        &self,
+        features: Tensor<B, 3>,
+        lengths: Vec<usize>,
+        targets: Tensor<B, 2, Int>,
+        targets_flat: &[i64],
+        target_lengths: Vec<usize>,
+        blank_id: usize,
+        alignment_mode: ParaformerAlignmentMode,
+    ) -> EnhancedParaformerLossOutput<B> {
+        let output = self.forward_train(
+            features,
+            lengths,
+            targets_flat,
+            &target_lengths,
+            alignment_mode,
+        );
+        let ctc_loss = ctc_loss_from_log_probs(
+            output.ctc_log_probs.clone(),
+            targets.clone(),
+            output.encoder_lengths.clone(),
+            target_lengths.clone(),
+            blank_id,
+        );
+        let shallow_ctc_loss = ctc_loss_from_log_probs(
+            output.shallow_ctc_log_probs.clone(),
+            targets.clone(),
+            output.encoder_lengths.clone(),
+            target_lengths.clone(),
+            blank_id,
+        );
+        let base_ce_loss = masked_cross_entropy(
+            output.initial_decoder_logits.clone(),
+            targets.clone(),
+            target_lengths.clone(),
+        );
+        let ce_loss = masked_cross_entropy(output.decoder_logits.clone(), targets, target_lengths);
+        let boundary_loss = boundary_bce_loss(
+            output.boundary_logits.clone(),
+            &output.alignments,
+            &output.encoder_lengths,
+        );
+        let loss = ctc_loss.clone()
+            + shallow_ctc_loss.clone() * self.shallow_ctc_loss_weight
+            + base_ce_loss
+            + ce_loss.clone() * self.refinement_loss_weight
+            + boundary_loss.clone() * self.boundary_loss_weight;
+
+        EnhancedParaformerLossOutput {
+            loss,
+            ctc_loss,
+            shallow_ctc_loss,
+            ce_loss,
+            boundary_loss,
+            output,
+        }
+    }
+}
+
 fn compress_posteriors<B: Backend>(
     posteriors: Tensor<B, 3>,
     alignments: &[i64],
@@ -603,6 +967,155 @@ fn compress_posteriors<B: Backend>(
     (Tensor::cat(padded, 0), piece_lengths)
 }
 
+fn compress_confidence_gated_queries<B: Backend>(
+    shallow_posteriors: Tensor<B, 3>,
+    final_posteriors: Tensor<B, 3>,
+    alignments: &[i64],
+    lengths: &[usize],
+    blank_id: usize,
+    boundary_probs: Tensor<B, 2>,
+    confidence_threshold: f64,
+) -> (Tensor<B, 3>, Vec<usize>, Tensor<B, 2>) {
+    let [batch_size, max_time, vocab_size] = shallow_posteriors.dims();
+    let feature_dim = vocab_size * 2 + 4;
+    let device = shallow_posteriors.device();
+    let mut pieces = Vec::with_capacity(batch_size);
+    let mut confidence_pieces = Vec::with_capacity(batch_size);
+    let mut piece_lengths = Vec::with_capacity(batch_size);
+
+    for (batch, &length) in lengths.iter().enumerate().take(batch_size) {
+        let segments = nonblank_segments(
+            &alignments[batch * max_time..batch * max_time + length],
+            blank_id,
+        );
+        if segments.is_empty() {
+            pieces.push(Tensor::zeros([1, 1, feature_dim], &device));
+            confidence_pieces.push(Tensor::ones([1, 1], &device));
+            piece_lengths.push(1);
+            continue;
+        }
+
+        let mut segment_features = Vec::with_capacity(segments.len());
+        let mut segment_confidences = Vec::with_capacity(segments.len());
+        for (segment_index, (start, end, label)) in segments.iter().copied().enumerate() {
+            let shallow_frames =
+                shallow_posteriors
+                    .clone()
+                    .slice([batch..batch + 1, start..end, 0..vocab_size]);
+            let final_frames =
+                final_posteriors
+                    .clone()
+                    .slice([batch..batch + 1, start..end, 0..vocab_size]);
+            let label_indices =
+                Tensor::<B, 3, Int>::full([1, end - start, 1], label as i64, &device);
+            let shallow_label_confidence = shallow_frames.clone().gather(2, label_indices.clone());
+            let final_label_confidence = final_frames.clone().gather(2, label_indices);
+            let frame_confidence =
+                (shallow_label_confidence.clone() + final_label_confidence.clone()) * 0.5;
+            let gate = sigmoid((frame_confidence.clone() - confidence_threshold) * 12.0) + 0.05;
+            let gate_sum = gate.clone().sum().clamp_min(1.0e-6).reshape([1, 1, 1]);
+            let shallow_pool = (shallow_frames * gate.clone())
+                .sum_dim(1)
+                .reshape([1, 1, vocab_size])
+                / gate_sum.clone();
+            let final_pool =
+                (final_frames * gate).sum_dim(1).reshape([1, 1, vocab_size]) / gate_sum;
+            let segment_confidence = frame_confidence.clone().mean().reshape([1, 1, 1]);
+            let shallow_mean = shallow_label_confidence.mean().reshape([1, 1, 1]);
+            let left_boundary = if segment_index > 0 {
+                boundary_probs
+                    .clone()
+                    .slice([batch..batch + 1, start - 1..start])
+                    .reshape([1, 1, 1])
+            } else {
+                Tensor::ones([1, 1, 1], &device)
+            };
+            let right_boundary = boundary_probs
+                .clone()
+                .slice([batch..batch + 1, end - 1..end])
+                .reshape([1, 1, 1]);
+            let smooth_left = (Tensor::ones([1, 1, 1], &device) - left_boundary.clone()) * 0.25;
+            let smooth_right = (Tensor::ones([1, 1, 1], &device) - right_boundary.clone()) * 0.25;
+            let meta = Tensor::cat(
+                vec![
+                    segment_confidence.clone(),
+                    shallow_mean,
+                    left_boundary,
+                    right_boundary,
+                ],
+                2,
+            );
+            let feature = Tensor::cat(vec![shallow_pool, final_pool, meta], 2)
+                * (Tensor::ones([1, 1, 1], &device) + smooth_left + smooth_right);
+            segment_features.push(feature);
+            segment_confidences.push(segment_confidence.reshape([1, 1]).clamp(0.05, 1.0));
+        }
+        let piece = Tensor::cat(segment_features, 1);
+        let confidences = Tensor::cat(segment_confidences, 1);
+        piece_lengths.push(piece.dims()[1]);
+        pieces.push(piece);
+        confidence_pieces.push(confidences);
+    }
+
+    let max_piece_len = piece_lengths.iter().copied().max().unwrap_or(1);
+    let padded = pieces
+        .into_iter()
+        .map(|piece| {
+            let piece_len = piece.dims()[1];
+            if piece_len < max_piece_len {
+                Tensor::cat(
+                    vec![
+                        piece,
+                        Tensor::zeros([1, max_piece_len - piece_len, feature_dim], &device),
+                    ],
+                    1,
+                )
+            } else {
+                piece
+            }
+        })
+        .collect();
+    let padded_confidences = confidence_pieces
+        .into_iter()
+        .map(|piece| {
+            let piece_len = piece.dims()[1];
+            if piece_len < max_piece_len {
+                Tensor::cat(
+                    vec![
+                        piece,
+                        Tensor::zeros([1, max_piece_len - piece_len], &device),
+                    ],
+                    1,
+                )
+            } else {
+                piece
+            }
+        })
+        .collect();
+    (
+        Tensor::cat(padded, 0),
+        piece_lengths,
+        Tensor::cat(padded_confidences, 0),
+    )
+}
+
+fn nonblank_segments(labels: &[i64], blank_id: usize) -> Vec<(usize, usize, usize)> {
+    let mut segments = Vec::new();
+    let mut start = 0usize;
+    while start < labels.len() {
+        let label = labels[start];
+        let mut end = start + 1;
+        while end < labels.len() && labels[end] == label {
+            end += 1;
+        }
+        if label != blank_id as i64 {
+            segments.push((start, end, label as usize));
+        }
+        start = end;
+    }
+    segments
+}
+
 fn masked_cross_entropy<B: Backend>(
     logits: Tensor<B, 3>,
     targets: Tensor<B, 2, Int>,
@@ -625,6 +1138,72 @@ fn masked_cross_entropy<B: Backend>(
     let mask = sequence_mask::<B>(&target_lengths, usable_len, &device).float();
     let denom = mask.clone().sum().clamp_min(1.0);
     -(gathered * mask).sum() / denom
+}
+
+fn ctc_loss_from_log_probs<B: Backend>(
+    log_probs: Tensor<B, 3>,
+    targets: Tensor<B, 2, Int>,
+    input_lengths: Vec<usize>,
+    target_lengths: Vec<usize>,
+    blank_id: usize,
+) -> Tensor<B, 1> {
+    let batch_size = target_lengths.len();
+    let device = log_probs.device();
+    let input_lengths = Tensor::<B, 1, Int>::from_data(
+        TensorData::new(to_i64(input_lengths), [batch_size]),
+        &device,
+    );
+    let target_lengths = Tensor::<B, 1, Int>::from_data(
+        TensorData::new(to_i64(target_lengths), [batch_size]),
+        &device,
+    );
+    burn_nn::loss::CTCLossConfig::new()
+        .with_blank(blank_id)
+        .with_zero_infinity(true)
+        .init()
+        .forward_with_reduction(
+            log_probs.swap_dims(0, 1),
+            targets,
+            input_lengths,
+            target_lengths,
+            burn_nn::loss::Reduction::Mean,
+        )
+}
+
+fn boundary_bce_loss<B: Backend>(
+    logits: Tensor<B, 2>,
+    alignments: &[i64],
+    lengths: &[usize],
+) -> Tensor<B, 1> {
+    let [batch_size, max_time] = logits.dims();
+    let targets = build_boundary_targets::<B>(alignments, lengths, max_time, &logits.device());
+    let mask = sequence_mask::<B>(lengths, max_time, &logits.device()).float();
+    let probs = sigmoid(logits).clamp(1.0e-6, 1.0 - 1.0e-6);
+    let one = Tensor::ones([batch_size, max_time], &probs.device());
+    let loss =
+        -(targets.clone() * probs.clone().log() + (one.clone() - targets) * (one - probs).log());
+    (loss * mask.clone()).sum() / mask.sum().clamp_min(1.0)
+}
+
+fn build_boundary_targets<B: Backend>(
+    alignments: &[i64],
+    lengths: &[usize],
+    max_time: usize,
+    device: &B::Device,
+) -> Tensor<B, 2> {
+    let batch_size = lengths.len();
+    let mut values = vec![0.0f32; batch_size * max_time];
+    for batch in 0..batch_size {
+        let length = lengths[batch].min(max_time);
+        if length > 1 {
+            for time in 0..length - 1 {
+                if alignments[batch * max_time + time] != alignments[batch * max_time + time + 1] {
+                    values[batch * max_time + time] = 1.0;
+                }
+            }
+        }
+    }
+    Tensor::from_data(TensorData::new(values, [batch_size, max_time]), device)
 }
 
 fn batch_uniform_alignments(
@@ -870,5 +1449,36 @@ mod tests {
         assert_eq!(output.query_lengths, vec![3, 2]);
         assert_eq!(output.decoder_logits.dims(), [2, 3, 6]);
         assert_eq!(output.alignments.len(), 12);
+    }
+
+    #[test]
+    fn enhanced_paraformer_forward_exposes_auxiliary_heads() {
+        let device = Default::default();
+        let mut config = EnhancedParaformerV2Config::new(8, 6).with_blank_id(0);
+        config.base.encoder_dim = 16;
+        config.base.decoder_dim = 16;
+        config.base.encoder_layers = 2;
+        config.base.decoder_layers = 1;
+        config.base.encoder_ff_dim = 32;
+        config.base.decoder_ff_dim = 32;
+        config.base.attention_heads = 2;
+        let model = config.init::<TestBackend>(&device);
+        let input = Tensor::<TestBackend, 3>::zeros([2, 24, 8], &device);
+        let targets = vec![1, 2, 3, 2, 4, 0];
+
+        let output = model.forward_train(
+            input,
+            vec![24, 20],
+            &targets,
+            &[3, 2],
+            ParaformerAlignmentMode::Uniform,
+        );
+
+        assert_eq!(output.encoder_lengths, vec![6, 5]);
+        assert_eq!(output.ctc_log_probs.dims(), [2, 6, 6]);
+        assert_eq!(output.shallow_ctc_log_probs.dims(), [2, 6, 6]);
+        assert_eq!(output.boundary_logits.dims(), [2, 6]);
+        assert_eq!(output.initial_decoder_logits.dims()[2], 6);
+        assert_eq!(output.decoder_logits.dims()[2], 6);
     }
 }

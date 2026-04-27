@@ -135,6 +135,10 @@ struct Args {
     /// Paraformer alignment strategy for decoder-query construction.
     #[arg(long, value_enum, default_value_t = ParaformerAlignmentArg::Viterbi)]
     paraformer_alignment_mode: ParaformerAlignmentArg,
+
+    /// Use enhanced Paraformer-v2 with shallow CTC, boundary, and refinement heads.
+    #[arg(long)]
+    paraformer_enhanced: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -195,6 +199,7 @@ fn main() -> Result<()> {
             ParaformerAlignmentArg::Uniform => ParaformerAlignmentMode::Uniform,
             ParaformerAlignmentArg::Greedy => ParaformerAlignmentMode::Greedy,
         },
+        paraformer_enhanced: args.paraformer_enhanced,
     };
 
     let summary = run_burn_training(config)?;
