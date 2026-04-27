@@ -36,8 +36,7 @@
 - [x] Add gradient accumulation.
 - [x] Add gradient clipping.
 - [x] Add learning-rate scheduler with warmup/hold/decay.
-- [ ] Add EMA model tracking.
-- [ ] Add distributed training support.
+- [x] Add EMA model tracking.
 - [x] Add multi-GPU training support.
 
 ## Data Loading

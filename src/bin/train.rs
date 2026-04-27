@@ -141,6 +141,14 @@ struct Args {
     #[arg(long)]
     gradient_clip_value: Option<f32>,
 
+    /// EMA decay for shadow model tracking, e.g. 0.9999. Disabled when unset.
+    #[arg(long)]
+    ema_decay: Option<f64>,
+
+    /// First optimizer step that updates the EMA shadow model.
+    #[arg(long, default_value_t = 0)]
+    ema_start_step: usize,
+
     /// Log every N optimizer steps.
     #[arg(long, default_value_t = 10)]
     log_every: usize,
@@ -309,6 +317,8 @@ fn main() -> Result<()> {
         gradient_accumulation_steps: args.gradient_accumulation_steps,
         gradient_clip_norm: args.gradient_clip_norm,
         gradient_clip_value: args.gradient_clip_value,
+        ema_decay: args.ema_decay,
+        ema_start_step: args.ema_start_step,
         log_every: args.log_every,
         validate_every_steps: args.validate_every_steps,
         max_train_samples: args.max_train_samples,

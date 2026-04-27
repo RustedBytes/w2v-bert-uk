@@ -4,10 +4,11 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
-use burn::module::{AutodiffModule, ModuleVisitor, Param};
+use burn::module::{AutodiffModule, ModuleMapper, ModuleVisitor, Param, ParamId};
 use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
 use burn::tensor::activation::log_softmax;
 use burn::tensor::backend::{AutodiffBackend, Backend};
+use burn::tensor::container::TensorContainer;
 use burn::tensor::{FloatDType, Int, IntDType, Tensor, TensorData, set_default_dtypes};
 use burn_autodiff::checkpoint::strategy::BalancedCheckpointing;
 use burn_nn::loss::{CTCLossConfig, Reduction};
@@ -119,6 +120,8 @@ pub struct BurnTrainConfig {
     pub gradient_accumulation_steps: usize,
     pub gradient_clip_norm: Option<f32>,
     pub gradient_clip_value: Option<f32>,
+    pub ema_decay: Option<f64>,
+    pub ema_start_step: usize,
     pub log_every: usize,
     pub validate_every_steps: Option<usize>,
     pub max_train_samples: Option<usize>,
@@ -172,6 +175,8 @@ impl Default for BurnTrainConfig {
             gradient_accumulation_steps: 1,
             gradient_clip_norm: None,
             gradient_clip_value: None,
+            ema_decay: None,
+            ema_start_step: 0,
             log_every: 10,
             validate_every_steps: None,
             max_train_samples: None,
@@ -811,6 +816,83 @@ impl<B: AutodiffBackend> ModuleVisitor<B> for GradientsScaler<B> {
     }
 }
 
+fn initialize_ema_model<B, M>(model: &M, config: &BurnTrainConfig) -> Option<M>
+where
+    B: AutodiffBackend,
+    M: AutodiffModule<B>,
+{
+    config.ema_decay.map(|_| model.clone().no_grad())
+}
+
+fn update_ema_after_step<B, M>(
+    ema_model: &mut Option<M>,
+    model: &M,
+    config: &BurnTrainConfig,
+    global_step: usize,
+) where
+    B: AutodiffBackend,
+    M: AutodiffModule<B>,
+{
+    let Some(decay) = config.ema_decay else {
+        return;
+    };
+    if global_step < config.ema_start_step {
+        return;
+    }
+    if let Some(ema) = ema_model.take() {
+        *ema_model = Some(update_ema_model::<B, M>(ema, model, decay));
+    }
+}
+
+fn update_ema_model<B, M>(ema: M, model: &M, decay: f64) -> M
+where
+    B: AutodiffBackend,
+    M: AutodiffModule<B>,
+{
+    let mut collector = EmaSourceCollector::<B> {
+        tensors: TensorContainer::new(),
+        phantom: std::marker::PhantomData,
+    };
+    model.visit(&mut collector);
+    let mut mapper = EmaMapper::<B> {
+        tensors: collector.tensors,
+        decay,
+        phantom: std::marker::PhantomData,
+    };
+    ema.map(&mut mapper).no_grad()
+}
+
+struct EmaSourceCollector<B: AutodiffBackend> {
+    tensors: TensorContainer<ParamId>,
+    phantom: std::marker::PhantomData<B>,
+}
+
+impl<B: AutodiffBackend> ModuleVisitor<B> for EmaSourceCollector<B> {
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+        self.tensors
+            .register::<B>(param.id, param.val().detach().into_primitive());
+    }
+}
+
+struct EmaMapper<B: AutodiffBackend> {
+    tensors: TensorContainer<ParamId>,
+    decay: f64,
+    phantom: std::marker::PhantomData<B>,
+}
+
+impl<B: AutodiffBackend> ModuleMapper<B> for EmaMapper<B> {
+    fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
+        let (id, ema_tensor, mapper) = param.consume();
+        let Some(source) = self.tensors.remove::<B>(&id) else {
+            return Param::from_mapped_value(id, ema_tensor, mapper);
+        };
+        let source = Tensor::<B, D>::from_primitive(source).detach();
+        let updated =
+            ema_tensor.detach().mul_scalar(self.decay) + source.mul_scalar(1.0 - self.decay);
+        Param::from_mapped_value(id, updated.set_require_grad(false), mapper)
+    }
+}
+
 fn maybe_step_accumulated<B, M, O>(
     model: M,
     optimizer: &mut O,
@@ -941,6 +1023,8 @@ where
     let resume = load_resume_checkpoint(config)?;
     model = load_model_checkpoint(model, &resume, device)?;
     optimizer = load_optimizer_checkpoint::<B, M, _>(optimizer, &resume, device)?;
+    let mut ema_model = initialize_ema_model::<B, M>(&model, config);
+    ema_model = load_ema_checkpoint::<B, M>(ema_model, &resume, device)?;
     let mut global_step = resume
         .as_ref()
         .map_or(0, |checkpoint| checkpoint.global_step);
@@ -1025,6 +1109,7 @@ where
                 );
                 model = next_model;
                 if let Some(lr) = lr {
+                    update_ema_after_step::<B, M>(&mut ema_model, &model, config, global_step);
                     if global_step == 1 || global_step % config.log_every == 0 {
                         println!(
                             "epoch={epoch} step={global_step} lr={lr:.8} train_ctc_loss={loss_value:.6} elapsed_sec={:.1}",
@@ -1066,6 +1151,7 @@ where
                         last_val_loss,
                         last_val_cer,
                         last_val_wer,
+                        ema_model.as_ref(),
                     )?;
                 }
             }
@@ -1083,6 +1169,7 @@ where
             );
             model = next_model;
             if let Some(lr) = lr {
+                update_ema_after_step::<B, M>(&mut ema_model, &model, config, global_step);
                 println!(
                     "epoch={epoch} step={global_step} lr={lr:.8} flushed_accumulated_gradients=true elapsed_sec={:.1}",
                     started.elapsed().as_secs_f64()
@@ -1111,6 +1198,7 @@ where
             last_val_loss,
             last_val_cer,
             last_val_wer,
+            ema_model.as_ref(),
         )?;
     }
 
@@ -1191,6 +1279,8 @@ where
     let resume = load_resume_checkpoint(config)?;
     model = load_model_checkpoint(model, &resume, device)?;
     optimizer = load_optimizer_checkpoint::<B, ParaformerV2<B>, _>(optimizer, &resume, device)?;
+    let mut ema_model = initialize_ema_model::<B, ParaformerV2<B>>(&model, config);
+    ema_model = load_ema_checkpoint::<B, ParaformerV2<B>>(ema_model, &resume, device)?;
     let mut global_step = resume
         .as_ref()
         .map_or(0, |checkpoint| checkpoint.global_step);
@@ -1279,6 +1369,12 @@ where
                 );
                 model = next_model;
                 if let Some(lr) = lr {
+                    update_ema_after_step::<B, ParaformerV2<B>>(
+                        &mut ema_model,
+                        &model,
+                        config,
+                        global_step,
+                    );
                     if global_step == 1 || global_step % config.log_every == 0 {
                         println!(
                             "epoch={epoch} step={global_step} lr={lr:.8} train_loss={:.6} train_ctc_loss={:.6} train_ce_loss={:.6} elapsed_sec={:.1}",
@@ -1326,6 +1422,7 @@ where
                         last_val_loss,
                         last_val_cer,
                         last_val_wer,
+                        ema_model.as_ref(),
                     )?;
                 }
             }
@@ -1343,6 +1440,12 @@ where
             );
             model = next_model;
             if let Some(lr) = lr {
+                update_ema_after_step::<B, ParaformerV2<B>>(
+                    &mut ema_model,
+                    &model,
+                    config,
+                    global_step,
+                );
                 println!(
                     "epoch={epoch} step={global_step} lr={lr:.8} flushed_accumulated_gradients=true elapsed_sec={:.1}",
                     started.elapsed().as_secs_f64()
@@ -1371,6 +1474,7 @@ where
             last_val_loss,
             last_val_cer,
             last_val_wer,
+            ema_model.as_ref(),
         )?;
     }
 
@@ -1443,6 +1547,8 @@ where
     model = load_model_checkpoint(model, &resume, device)?;
     optimizer =
         load_optimizer_checkpoint::<B, EnhancedParaformerV2<B>, _>(optimizer, &resume, device)?;
+    let mut ema_model = initialize_ema_model::<B, EnhancedParaformerV2<B>>(&model, config);
+    ema_model = load_ema_checkpoint::<B, EnhancedParaformerV2<B>>(ema_model, &resume, device)?;
     let mut global_step = resume
         .as_ref()
         .map_or(0, |checkpoint| checkpoint.global_step);
@@ -1540,6 +1646,12 @@ where
                 );
                 model = next_model;
                 if let Some(lr) = lr {
+                    update_ema_after_step::<B, EnhancedParaformerV2<B>>(
+                        &mut ema_model,
+                        &model,
+                        config,
+                        global_step,
+                    );
                     if global_step == 1 || global_step % config.log_every == 0 {
                         println!(
                             "epoch={epoch} step={global_step} lr={lr:.8} train_loss={:.6} train_ctc_loss={:.6} train_shallow_ctc_loss={:.6} train_ce_loss={:.6} train_boundary_loss={:.6} elapsed_sec={:.1}",
@@ -1591,6 +1703,7 @@ where
                         last_val_loss,
                         last_val_cer,
                         last_val_wer,
+                        ema_model.as_ref(),
                     )?;
                 }
             }
@@ -1608,6 +1721,12 @@ where
             );
             model = next_model;
             if let Some(lr) = lr {
+                update_ema_after_step::<B, EnhancedParaformerV2<B>>(
+                    &mut ema_model,
+                    &model,
+                    config,
+                    global_step,
+                );
                 println!(
                     "epoch={epoch} step={global_step} lr={lr:.8} flushed_accumulated_gradients=true elapsed_sec={:.1}",
                     started.elapsed().as_secs_f64()
@@ -1636,6 +1755,7 @@ where
             last_val_loss,
             last_val_cer,
             last_val_wer,
+            ema_model.as_ref(),
         )?;
     }
 
@@ -2803,6 +2923,9 @@ fn validate_config(config: &BurnTrainConfig) -> Result<()> {
     if matches!(config.gradient_clip_value, Some(value) if value <= 0.0) {
         bail!("gradient_clip_value must be > 0 when set");
     }
+    if matches!(config.ema_decay, Some(value) if value <= 0.0 || value >= 1.0) {
+        bail!("ema_decay must be > 0 and < 1 when set");
+    }
     if config.input_dim == 0 || config.vocab_size == 0 {
         bail!("input_dim and vocab_size must be > 0");
     }
@@ -2880,6 +3003,8 @@ fn run_config_json(config: &BurnTrainConfig) -> Value {
         "gradient_accumulation_steps": config.gradient_accumulation_steps,
         "gradient_clip_norm": config.gradient_clip_norm,
         "gradient_clip_value": config.gradient_clip_value,
+        "ema_decay": config.ema_decay,
+        "ema_start_step": config.ema_start_step,
         "tokenizer_path": config.tokenizer_path,
         "val_beam_width": config.val_beam_width,
         "val_n_best": config.val_n_best,
@@ -2943,6 +3068,7 @@ fn save_training_checkpoint<B, M, O>(
     val_loss: Option<f32>,
     val_cer: Option<f32>,
     val_wer: Option<f32>,
+    ema_model: Option<&M>,
 ) -> Result<()>
 where
     B: AutodiffBackend,
@@ -2973,6 +3099,17 @@ where
                 checkpoint_file_path(&dir, "optimizer").display()
             )
         })?;
+    if let Some(ema_model) = ema_model {
+        ema_model
+            .clone()
+            .save_file(checkpoint_base_path(&dir, "ema_model"), &recorder)
+            .with_context(|| {
+                format!(
+                    "failed to write {}",
+                    checkpoint_file_path(&dir, "ema_model").display()
+                )
+            })?;
+    }
 
     let metadata = json!({
         "epoch": epoch,
@@ -2985,6 +3122,9 @@ where
         "checkpoint_dir": dir,
         "model_path": checkpoint_file_path(&dir, "model"),
         "optimizer_path": checkpoint_file_path(&dir, "optimizer"),
+        "ema_model_path": ema_model.map(|_| checkpoint_file_path(&dir, "ema_model")),
+        "ema_decay": config.ema_decay,
+        "ema_start_step": config.ema_start_step,
         "training_config": run_config_json(config),
     });
     let path = checkpoint_metadata_path(&dir);
@@ -3086,16 +3226,31 @@ fn validate_resume_config(config: &BurnTrainConfig, saved_config: &Value) -> Res
         "lr_hold_steps",
         "lr_decay_steps",
         "lr_min",
+        "ema_decay",
+        "ema_start_step",
     ] {
-        if current.get(key) != saved_config.get(key) {
+        let current_value = current.get(key).cloned();
+        let checkpoint_value = saved_config
+            .get(key)
+            .cloned()
+            .or_else(|| resume_config_default_value(key));
+        if current_value != checkpoint_value {
             bail!(
                 "resume checkpoint config mismatch for '{key}': current={:?} checkpoint={:?}",
-                current.get(key),
-                saved_config.get(key)
+                current_value,
+                checkpoint_value
             );
         }
     }
     Ok(())
+}
+
+fn resume_config_default_value(key: &str) -> Option<Value> {
+    match key {
+        "ema_decay" => Some(Value::Null),
+        "ema_start_step" => Some(json!(0)),
+        _ => None,
+    }
 }
 
 fn load_model_checkpoint<B, M>(
@@ -3123,6 +3278,36 @@ where
                 checkpoint_file_path(&checkpoint.dir, "model").display()
             )
         })
+}
+
+fn load_ema_checkpoint<B, M>(
+    ema_model: Option<M>,
+    resume: &Option<ResumeCheckpoint>,
+    device: &B::Device,
+) -> Result<Option<M>>
+where
+    B: AutodiffBackend,
+    M: AutodiffModule<B>,
+{
+    let Some(model) = ema_model else {
+        return Ok(None);
+    };
+    let Some(checkpoint) = resume else {
+        return Ok(Some(model));
+    };
+    let path = checkpoint_file_path(&checkpoint.dir, "ema_model");
+    if !path.exists() {
+        return Ok(Some(model));
+    }
+    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+    model
+        .load_file(
+            checkpoint_base_path(&checkpoint.dir, "ema_model"),
+            &recorder,
+            device,
+        )
+        .map(Some)
+        .with_context(|| format!("failed to load {}", path.display()))
 }
 
 fn load_optimizer_checkpoint<B, M, O>(
@@ -3322,6 +3507,16 @@ mod tests {
     }
 
     #[test]
+    fn resume_config_accepts_pre_ema_checkpoints_when_ema_disabled() {
+        let config = BurnTrainConfig::default();
+        let mut saved = run_config_json(&config);
+        saved.as_object_mut().unwrap().remove("ema_decay");
+        saved.as_object_mut().unwrap().remove("ema_start_step");
+
+        assert!(validate_resume_config(&config, &saved).is_ok());
+    }
+
+    #[test]
     fn scheduler_warmup_hold_decay_sequence() {
         let config = BurnTrainConfig {
             learning_rate: 1.0,
@@ -3337,6 +3532,18 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(values, vec![0.5, 1.0, 1.0, 0.55, 0.1, 0.1]);
+    }
+
+    #[test]
+    fn ema_decay_validation_rejects_invalid_values() {
+        for ema_decay in [Some(0.0), Some(1.0), Some(1.5)] {
+            let config = BurnTrainConfig {
+                ema_decay,
+                ..BurnTrainConfig::default()
+            };
+            let err = validate_config(&config).unwrap_err();
+            assert!(err.to_string().contains("ema_decay"));
+        }
     }
 
     #[test]
