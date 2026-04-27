@@ -6,7 +6,7 @@
 //! This module keeps the custom architecture-specific pieces isolated behind
 //! `asr-cubecl-kernels` while Burn's default path remains the portable fallback.
 
-use burn::tensor::{Shape, Tensor as BurnTensor, TensorMetadata, TensorPrimitive};
+use burn::tensor::{Int as BurnInt, Shape, Tensor as BurnTensor, TensorMetadata, TensorPrimitive};
 use burn_cubecl::cubecl::prelude::InputScalar;
 use burn_cubecl::{
     CubeBackend, CubeRuntime, FloatElement, IntElement,
@@ -28,6 +28,10 @@ pub enum AsrKernelTarget {
     ZipformerSwooshR,
     /// Squeezeformer/Zipformer relative-position attention shift.
     RelativeShift,
+    /// Apply a `[batch, time]` length mask to `[batch, time, channels]`.
+    MaskTime,
+    /// Apply a `[batch, time]` length mask to `[batch, channels, time]`.
+    MaskChannelTime,
 }
 
 /// Static analysis of the current ASR architectures and where custom CubeCL
@@ -36,6 +40,8 @@ pub const ASR_KERNEL_TARGETS: &[AsrKernelTarget] = &[
     AsrKernelTarget::ZipformerSwooshL,
     AsrKernelTarget::ZipformerSwooshR,
     AsrKernelTarget::RelativeShift,
+    AsrKernelTarget::MaskTime,
+    AsrKernelTarget::MaskChannelTime,
 ];
 
 /// Fused Zipformer Swoosh-L activation for non-fusion CubeCL backends.
@@ -48,7 +54,7 @@ where
     I: IntElement,
     BT: BoolElement,
 {
-    swoosh(input, 4.0)
+    swoosh_l(input)
 }
 
 /// Fused Zipformer Swoosh-R activation for non-fusion CubeCL backends.
@@ -61,7 +67,33 @@ where
     I: IntElement,
     BT: BoolElement,
 {
-    swoosh(input, 1.0)
+    swoosh_r(input)
+}
+
+/// Fused `x * sigmoid(x - 4)` activation.
+pub fn swoosh_l<R, F, I, BT, const D: usize>(
+    input: BurnTensor<AsrCubeBackend<R, F, I, BT>, D>,
+) -> BurnTensor<AsrCubeBackend<R, F, I, BT>, D>
+where
+    R: CubeRuntime,
+    F: FloatElement,
+    I: IntElement,
+    BT: BoolElement,
+{
+    swoosh_with_offset(input, 4.0)
+}
+
+/// Fused `x * sigmoid(x - 1)` activation.
+pub fn swoosh_r<R, F, I, BT, const D: usize>(
+    input: BurnTensor<AsrCubeBackend<R, F, I, BT>, D>,
+) -> BurnTensor<AsrCubeBackend<R, F, I, BT>, D>
+where
+    R: CubeRuntime,
+    F: FloatElement,
+    I: IntElement,
+    BT: BoolElement,
+{
+    swoosh_with_offset(input, 1.0)
 }
 
 /// Relative-position shift used by Squeezeformer and Zipformer attention.
@@ -83,7 +115,81 @@ where
     BurnTensor::from_primitive(TensorPrimitive::Float(output))
 }
 
-fn swoosh<R, F, I, BT, const D: usize>(
+/// Fused length masking for `[batch, time, channels]` tensors.
+///
+/// This is the CubeCL fast path for the generic fallback pattern:
+/// `input * sequence_mask(lengths).float().unsqueeze_dim(2)`.
+pub fn mask_time<R, F, I, BT>(
+    input: BurnTensor<AsrCubeBackend<R, F, I, BT>, 3>,
+    lengths: &[usize],
+) -> BurnTensor<AsrCubeBackend<R, F, I, BT>, 3>
+where
+    R: CubeRuntime,
+    F: FloatElement,
+    I: IntElement,
+    BT: BoolElement,
+{
+    let device = input.device();
+    let lengths = lengths_tensor::<R, F, I, BT>(lengths, &device);
+    mask_time_with_lengths(input, lengths)
+}
+
+/// Fused length masking for `[batch, time, channels]` tensors using an existing
+/// device-side lengths tensor.
+pub fn mask_time_with_lengths<R, F, I, BT>(
+    input: BurnTensor<AsrCubeBackend<R, F, I, BT>, 3>,
+    lengths: BurnTensor<AsrCubeBackend<R, F, I, BT>, 1, BurnInt>,
+) -> BurnTensor<AsrCubeBackend<R, F, I, BT>, 3>
+where
+    R: CubeRuntime,
+    F: FloatElement,
+    I: IntElement,
+    BT: BoolElement,
+{
+    let primitive = into_float_cube(input);
+    let lengths = lengths.into_primitive();
+    let output = mask_time_cube(primitive, lengths, MaskLayout::BatchTimeChannels);
+    BurnTensor::from_primitive(TensorPrimitive::Float(output))
+}
+
+/// Fused length masking for `[batch, channels, time]` tensors.
+///
+/// This is the CubeCL fast path for the generic fallback pattern:
+/// `input * sequence_mask(lengths).float().unsqueeze_dim(1)`.
+pub fn mask_channel_time<R, F, I, BT>(
+    input: BurnTensor<AsrCubeBackend<R, F, I, BT>, 3>,
+    lengths: &[usize],
+) -> BurnTensor<AsrCubeBackend<R, F, I, BT>, 3>
+where
+    R: CubeRuntime,
+    F: FloatElement,
+    I: IntElement,
+    BT: BoolElement,
+{
+    let device = input.device();
+    let lengths = lengths_tensor::<R, F, I, BT>(lengths, &device);
+    mask_channel_time_with_lengths(input, lengths)
+}
+
+/// Fused length masking for `[batch, channels, time]` tensors using an existing
+/// device-side lengths tensor.
+pub fn mask_channel_time_with_lengths<R, F, I, BT>(
+    input: BurnTensor<AsrCubeBackend<R, F, I, BT>, 3>,
+    lengths: BurnTensor<AsrCubeBackend<R, F, I, BT>, 1, BurnInt>,
+) -> BurnTensor<AsrCubeBackend<R, F, I, BT>, 3>
+where
+    R: CubeRuntime,
+    F: FloatElement,
+    I: IntElement,
+    BT: BoolElement,
+{
+    let primitive = into_float_cube(input);
+    let lengths = lengths.into_primitive();
+    let output = mask_time_cube(primitive, lengths, MaskLayout::BatchChannelsTime);
+    BurnTensor::from_primitive(TensorPrimitive::Float(output))
+}
+
+fn swoosh_with_offset<R, F, I, BT, const D: usize>(
     input: BurnTensor<AsrCubeBackend<R, F, I, BT>, D>,
     offset: f32,
 ) -> BurnTensor<AsrCubeBackend<R, F, I, BT>, D>
@@ -108,6 +214,23 @@ where
     BT: BoolElement,
 {
     input.into_primitive().tensor()
+}
+
+fn lengths_tensor<R, F, I, BT>(
+    lengths: &[usize],
+    device: &<AsrCubeBackend<R, F, I, BT> as burn::tensor::backend::Backend>::Device,
+) -> BurnTensor<AsrCubeBackend<R, F, I, BT>, 1, BurnInt>
+where
+    R: CubeRuntime,
+    F: FloatElement,
+    I: IntElement,
+    BT: BoolElement,
+{
+    let values = lengths
+        .iter()
+        .map(|length| i32::try_from(*length).expect("ASR CubeCL length values must fit in i32"))
+        .collect::<Vec<_>>();
+    BurnTensor::from_ints(values.as_slice(), device)
 }
 
 fn swoosh_cube<R: CubeRuntime>(input: CubeTensor<R>, offset: f32) -> CubeTensor<R> {
@@ -172,6 +295,65 @@ fn relative_shift_cube<R: CubeRuntime>(input: CubeTensor<R>, seq_len: usize) -> 
     output
 }
 
+#[derive(Clone, Copy)]
+enum MaskLayout {
+    BatchTimeChannels,
+    BatchChannelsTime,
+}
+
+fn mask_time_cube<R: CubeRuntime>(
+    input: CubeTensor<R>,
+    lengths: CubeTensor<R>,
+    layout: MaskLayout,
+) -> CubeTensor<R> {
+    let shape = input.shape();
+    let [batch, dim1, dim2] = shape.dims();
+    assert_eq!(
+        lengths.shape().dims::<1>()[0],
+        batch,
+        "mask lengths must match input batch size"
+    );
+
+    let output = empty_device_dtype(
+        input.client.clone(),
+        input.device.clone(),
+        shape,
+        input.dtype,
+    );
+    let num_elems = output.meta.num_elements();
+    let cube_dim = CubeDim::new(&output.client, num_elems);
+    let cube_count = calculate_cube_count_elemwise(&output.client, num_elems, cube_dim);
+    let dtype = output.dtype;
+    let int_dtype = lengths.dtype;
+
+    match layout {
+        MaskLayout::BatchTimeChannels => mask_time_kernel::launch(
+            &output.client,
+            cube_count,
+            cube_dim,
+            input.into_tensor_arg(),
+            lengths.into_tensor_arg(),
+            output.clone().into_tensor_arg(),
+            MaskTimeArgsLaunch::new(batch, dim1, dim2),
+            dtype.into(),
+            int_dtype.into(),
+        ),
+        MaskLayout::BatchChannelsTime => mask_channel_time_kernel::launch(
+            &output.client,
+            cube_count,
+            cube_dim,
+            input.into_tensor_arg(),
+            lengths.into_tensor_arg(),
+            output.clone().into_tensor_arg(),
+            MaskTimeArgsLaunch::new(batch, dim1, dim2),
+            dtype.into(),
+            int_dtype.into(),
+        ),
+    }
+
+    output
+}
+
 #[cube(launch)]
 fn swoosh_kernel<E: Float>(
     input: &Tensor<E>,
@@ -200,6 +382,16 @@ struct RelativeShiftArgs {
     seq_len: usize,
     #[cube(comptime)]
     pos_len: usize,
+}
+
+#[derive(CubeLaunch, CubeType)]
+struct MaskTimeArgs {
+    #[cube(comptime)]
+    batch: usize,
+    #[cube(comptime)]
+    dim1: usize,
+    #[cube(comptime)]
+    dim2: usize,
 }
 
 #[cube(launch)]
@@ -237,5 +429,73 @@ fn relative_shift_kernel<E: Float>(
     } else {
         let source = ((batch_index * heads + head) * seq_len + source_seq) * pos_len + source_pos;
         output[pos] = input[source];
+    }
+}
+
+#[cube(launch)]
+fn mask_time_kernel<E: Float, I: Int>(
+    input: &Tensor<E>,
+    lengths: &Tensor<I>,
+    output: &mut Tensor<E>,
+    args: &MaskTimeArgs,
+    #[define(E)] _dtype: StorageType,
+    #[define(I)] _int_dtype: StorageType,
+) {
+    let pos = ABSOLUTE_POS;
+    if pos >= output.len() {
+        terminate!();
+    }
+
+    let batch = comptime![args.batch];
+    let time = comptime![args.dim1];
+    let channels = comptime![args.dim2];
+
+    let channel_index = pos % channels;
+    let time_index = (pos / channels) % time;
+    let batch_index = pos / (time * channels);
+
+    if batch_index >= batch {
+        terminate!();
+    }
+
+    let length = usize::cast_from(lengths[batch_index]);
+    if channel_index < channels && time_index < length {
+        output[pos] = input[pos];
+    } else {
+        output[pos] = E::new(0.0);
+    }
+}
+
+#[cube(launch)]
+fn mask_channel_time_kernel<E: Float, I: Int>(
+    input: &Tensor<E>,
+    lengths: &Tensor<I>,
+    output: &mut Tensor<E>,
+    args: &MaskTimeArgs,
+    #[define(E)] _dtype: StorageType,
+    #[define(I)] _int_dtype: StorageType,
+) {
+    let pos = ABSOLUTE_POS;
+    if pos >= output.len() {
+        terminate!();
+    }
+
+    let batch = comptime![args.batch];
+    let channels = comptime![args.dim1];
+    let time = comptime![args.dim2];
+
+    let time_index = pos % time;
+    let channel_index = (pos / time) % channels;
+    let batch_index = pos / (channels * time);
+
+    if batch_index >= batch {
+        terminate!();
+    }
+
+    let length = usize::cast_from(lengths[batch_index]);
+    if channel_index < channels && time_index < length {
+        output[pos] = input[pos];
+    } else {
+        output[pos] = E::new(0.0);
     }
 }
