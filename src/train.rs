@@ -12,7 +12,7 @@ use burn_nn::loss::{CTCLossConfig, Reduction};
 use burn_optim::{AdamWConfig, GradientsParams, Optimizer};
 use serde_json::{Value, json};
 
-use crate::paraformer::{ParaformerV2, ParaformerV2Config};
+use crate::paraformer::{ParaformerAlignmentMode, ParaformerV2, ParaformerV2Config};
 use crate::squeezeformer::{SqueezeformerCtc, SqueezeformerCtcConfig, SqueezeformerEncoderConfig};
 use crate::wav2vec::{Wav2VecBertConfig, Wav2VecBertCtc, Wav2VecBertCtcConfig};
 use crate::zipformer::{ZipformerConfig, ZipformerCtc, ZipformerCtcConfig};
@@ -64,6 +64,7 @@ pub struct BurnTrainConfig {
     pub max_train_samples: Option<usize>,
     pub max_val_samples: Option<usize>,
     pub dry_run: bool,
+    pub paraformer_alignment_mode: ParaformerAlignmentMode,
 }
 
 impl Default for BurnTrainConfig {
@@ -92,6 +93,7 @@ impl Default for BurnTrainConfig {
             max_train_samples: None,
             max_val_samples: None,
             dry_run: false,
+            paraformer_alignment_mode: ParaformerAlignmentMode::Viterbi,
         }
     }
 }
@@ -225,7 +227,7 @@ pub fn run_burn_training(config: BurnTrainConfig) -> Result<TrainSummary> {
                     value
                 });
             let model = model_config.init::<TrainBackend>(&device);
-            train_ctc_model(model, &config, &device)
+            train_paraformer_model(model, &config, &device)
         }
         TrainArchitecture::Wav2VecBert => {
             let encoder = Wav2VecBertConfig::new(config.input_dim, config.d_model)
@@ -392,6 +394,152 @@ where
         bail!("validation manifest is empty");
     }
     Ok((total / count as f64) as f32)
+}
+
+fn train_paraformer_model<B>(
+    mut model: ParaformerV2<B>,
+    config: &BurnTrainConfig,
+    device: &B::Device,
+) -> Result<TrainSummary>
+where
+    B: AutodiffBackend,
+{
+    let mut optimizer = AdamWConfig::new()
+        .with_weight_decay(config.weight_decay as f32)
+        .init();
+    let mut global_step = 0usize;
+    let mut last_train_loss = None;
+    let mut last_val_loss = None;
+    let started = Instant::now();
+
+    for epoch in 1..=config.epochs {
+        let mut train_batches = StreamingBatchLoader::new(
+            config.train_manifest.clone(),
+            config.batch_size,
+            config.adaptive_batch,
+            config.sort_by_length_desc,
+            config.sort_buffer_size,
+            config.input_dim,
+            config.max_train_samples,
+        )?;
+        while let Some(batch) = train_batches.next_batch()? {
+            let loss_output = paraformer_loss_for_batch(&model, &batch, config, device);
+            let loss_value = scalar_value(loss_output.loss.clone())?;
+            let ctc_value = scalar_value(loss_output.ctc_loss.clone())?;
+            let ce_value = scalar_value(loss_output.ce_loss.clone())?;
+            last_train_loss = Some(loss_value);
+
+            if !config.dry_run {
+                let grads = GradientsParams::from_grads(loss_output.loss.backward(), &model);
+                model = optimizer.step(config.learning_rate, model, grads);
+            }
+
+            global_step += 1;
+            if global_step == 1 || global_step % config.log_every == 0 {
+                println!(
+                    "epoch={epoch} step={global_step} train_loss={loss_value:.6} train_ctc_loss={ctc_value:.6} train_ce_loss={ce_value:.6} elapsed_sec={:.1}",
+                    started.elapsed().as_secs_f64()
+                );
+            }
+
+            if let (Some(_), Some(every)) = (&config.val_manifest, config.validate_every_steps) {
+                if every > 0 && global_step % every == 0 {
+                    let val_loss = evaluate_paraformer_model(&model, config, device)?;
+                    println!("epoch={epoch} step={global_step} val_loss={val_loss:.6}");
+                    last_val_loss = Some(val_loss);
+                    write_checkpoint_metadata(
+                        config,
+                        epoch,
+                        global_step,
+                        last_train_loss,
+                        last_val_loss,
+                    )?;
+                }
+            }
+        }
+
+        if config.val_manifest.is_some() {
+            let val_loss = evaluate_paraformer_model(&model, config, device)?;
+            println!("epoch={epoch} val_loss={val_loss:.6}");
+            last_val_loss = Some(val_loss);
+        }
+        write_checkpoint_metadata(config, epoch, global_step, last_train_loss, last_val_loss)?;
+    }
+
+    Ok(TrainSummary {
+        epochs: config.epochs,
+        steps: global_step,
+        last_train_loss,
+        last_val_loss,
+    })
+}
+
+fn evaluate_paraformer_model<B>(
+    model: &ParaformerV2<B>,
+    config: &BurnTrainConfig,
+    device: &B::Device,
+) -> Result<f32>
+where
+    B: AutodiffBackend,
+{
+    let mut total = 0.0f64;
+    let mut count = 0usize;
+    let val_manifest = config
+        .val_manifest
+        .as_ref()
+        .ok_or_else(|| anyhow!("validation requested without val_manifest"))?;
+    let mut batches = StreamingBatchLoader::new(
+        val_manifest.clone(),
+        config.batch_size,
+        config.adaptive_batch,
+        config.sort_by_length_desc,
+        config.sort_buffer_size,
+        config.input_dim,
+        config.max_val_samples,
+    )?;
+    while let Some(batch) = batches.next_batch()? {
+        let loss = paraformer_loss_for_batch(model, &batch, config, device).loss;
+        total += f64::from(scalar_value(loss)?);
+        count += 1;
+    }
+    if count == 0 {
+        bail!("validation manifest is empty");
+    }
+    Ok((total / count as f64) as f32)
+}
+
+fn paraformer_loss_for_batch<B>(
+    model: &ParaformerV2<B>,
+    batch: &TrainBatch,
+    config: &BurnTrainConfig,
+    device: &B::Device,
+) -> crate::paraformer::ParaformerLossOutput<B>
+where
+    B: AutodiffBackend,
+{
+    let features = Tensor::<B, 3>::from_data(
+        TensorData::new(
+            batch.features.clone(),
+            [batch.batch_size, batch.max_frames, batch.feature_dim],
+        ),
+        device,
+    );
+    let targets = Tensor::<B, 2, Int>::from_data(
+        TensorData::new(
+            batch.targets.clone(),
+            [batch.batch_size, batch.max_target_len],
+        ),
+        device,
+    );
+    model.loss(
+        features,
+        batch.feature_lengths.clone(),
+        targets,
+        &batch.targets,
+        batch.target_lengths.clone(),
+        config.blank_id,
+        config.paraformer_alignment_mode,
+    )
 }
 
 fn ctc_loss_for_batch<B, M>(

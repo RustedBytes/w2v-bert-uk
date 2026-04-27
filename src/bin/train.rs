@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use env_logger::Env;
+use w2v_bert_uk::paraformer::ParaformerAlignmentMode;
 use w2v_bert_uk::train::{
     AdaptiveBatchConfig, AdaptiveBatchUnit, BurnTrainConfig, TrainArchitecture, run_burn_training,
 };
@@ -130,6 +131,10 @@ struct Args {
     /// Run forward/loss only and skip optimizer updates.
     #[arg(long)]
     dry_run: bool,
+
+    /// Paraformer alignment strategy for decoder-query construction.
+    #[arg(long, value_enum, default_value_t = ParaformerAlignmentArg::Viterbi)]
+    paraformer_alignment_mode: ParaformerAlignmentArg,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -147,6 +152,13 @@ enum AdaptiveBatchUnitArg {
     Frames,
     PaddedFrames,
     FeatureValues,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ParaformerAlignmentArg {
+    Viterbi,
+    Uniform,
+    Greedy,
 }
 
 fn main() -> Result<()> {
@@ -178,6 +190,11 @@ fn main() -> Result<()> {
         max_train_samples: args.max_train_samples,
         max_val_samples: args.max_val_samples,
         dry_run: args.dry_run,
+        paraformer_alignment_mode: match args.paraformer_alignment_mode {
+            ParaformerAlignmentArg::Viterbi => ParaformerAlignmentMode::Viterbi,
+            ParaformerAlignmentArg::Uniform => ParaformerAlignmentMode::Uniform,
+            ParaformerAlignmentArg::Greedy => ParaformerAlignmentMode::Greedy,
+        },
     };
 
     let summary = run_burn_training(config)?;
