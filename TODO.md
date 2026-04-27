@@ -50,7 +50,7 @@
 - [x] Add streaming data loader for large datasets.
 - [x] Add adaptive batching.
 - [x] Add largest-batches-first sorting.
-- [ ] Make sorting metadata-only so large inline features are not buffered in memory.
+- [x] Make sorting metadata-only so large inline features are not buffered in memory.
 - [ ] Add raw audio dataset loading.
 - [ ] Add feature extraction from audio.
 - [ ] Add tokenizer-driven transcript-to-token conversion.
@@ -75,3 +75,8 @@
 - [ ] Add detailed diagnostics for losses, batch sizes, and throughput.
 - [ ] Add model export packaging.
 - [ ] Add Hugging Face upload support.
+
+## Performance Optimization
+
+- [ ] Run pprof profiling on training and inference to identify bottlenecks.
+- [ ] Inline small helper functions in critical paths.

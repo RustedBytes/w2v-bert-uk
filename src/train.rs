@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -895,7 +895,7 @@ pub struct StreamingBatchLoader {
     yielded: usize,
     limit: Option<usize>,
     pending: Option<FeatureRecord>,
-    sort_buffer: Vec<FeatureRecord>,
+    sort_buffer: Vec<FeatureRecordMetadata>,
 }
 
 struct CurrentManifestFile {
@@ -903,6 +903,16 @@ struct CurrentManifestFile {
     base_dir: PathBuf,
     reader: BufReader<fs::File>,
     line_number: usize,
+}
+
+#[derive(Clone, Debug)]
+struct FeatureRecordMetadata {
+    manifest_path: PathBuf,
+    base_dir: PathBuf,
+    byte_offset: u64,
+    line_number: usize,
+    id: String,
+    rows: usize,
 }
 
 impl StreamingBatchLoader {
@@ -1003,10 +1013,10 @@ impl StreamingBatchLoader {
                 .unwrap_or(self.sort_buffer_size);
             let target = self.sort_buffer_size.min(remaining);
             for _ in 0..target {
-                let Some(record) = self.next_raw_record()? else {
+                let Some(metadata) = self.next_raw_metadata()? else {
                     break;
                 };
-                self.sort_buffer.push(record);
+                self.sort_buffer.push(metadata);
             }
             self.sort_buffer.sort_by(|left, right| {
                 right
@@ -1018,11 +1028,23 @@ impl StreamingBatchLoader {
         if self.sort_buffer.is_empty() {
             Ok(None)
         } else {
-            Ok(Some(self.sort_buffer.remove(0)))
+            self.sort_buffer.remove(0).load_record().map(Some)
         }
     }
 
     fn next_raw_record(&mut self) -> Result<Option<FeatureRecord>> {
+        self.next_raw_line()?
+            .map(|raw| raw.parse_record())
+            .transpose()
+    }
+
+    fn next_raw_metadata(&mut self) -> Result<Option<FeatureRecordMetadata>> {
+        self.next_raw_line()?
+            .map(|raw| raw.parse_metadata())
+            .transpose()
+    }
+
+    fn next_raw_line(&mut self) -> Result<Option<RawManifestLine>> {
         loop {
             if self.current.is_none() {
                 if self.file_index >= self.files.len() {
@@ -1035,6 +1057,10 @@ impl StreamingBatchLoader {
 
             let current = self.current.as_mut().expect("manifest file must be open");
             let mut line = String::new();
+            let byte_offset = current
+                .reader
+                .stream_position()
+                .with_context(|| format!("failed to seek {}", current.path.display()))?;
             let bytes = current
                 .reader
                 .read_line(&mut line)
@@ -1049,12 +1075,69 @@ impl StreamingBatchLoader {
                 continue;
             }
 
-            let record = if line.starts_with('{') {
-                parse_json_record(line, &current.base_dir, current.line_number)?
-            } else {
-                parse_tsv_record(line, &current.base_dir, current.line_number)?
-            };
-            return Ok(Some(record));
+            return Ok(Some(RawManifestLine {
+                manifest_path: current.path.clone(),
+                base_dir: current.base_dir.clone(),
+                byte_offset,
+                line_number: current.line_number,
+                line: line.to_string(),
+            }));
+        }
+    }
+}
+
+struct RawManifestLine {
+    manifest_path: PathBuf,
+    base_dir: PathBuf,
+    byte_offset: u64,
+    line_number: usize,
+    line: String,
+}
+
+impl RawManifestLine {
+    fn parse_record(&self) -> Result<FeatureRecord> {
+        if self.line.starts_with('{') {
+            parse_json_record(&self.line, &self.base_dir, self.line_number)
+        } else {
+            parse_tsv_record(&self.line, &self.base_dir, self.line_number)
+        }
+    }
+
+    fn parse_metadata(&self) -> Result<FeatureRecordMetadata> {
+        let (id, rows) = if self.line.starts_with('{') {
+            parse_json_record_metadata(&self.line, self.line_number)?
+        } else {
+            parse_tsv_record_metadata(&self.line, self.line_number)?
+        };
+        Ok(FeatureRecordMetadata {
+            manifest_path: self.manifest_path.clone(),
+            base_dir: self.base_dir.clone(),
+            byte_offset: self.byte_offset,
+            line_number: self.line_number,
+            id,
+            rows,
+        })
+    }
+}
+
+impl FeatureRecordMetadata {
+    fn load_record(&self) -> Result<FeatureRecord> {
+        let mut reader =
+            BufReader::new(fs::File::open(&self.manifest_path).with_context(|| {
+                format!("failed to open manifest {}", self.manifest_path.display())
+            })?);
+        reader
+            .seek(SeekFrom::Start(self.byte_offset))
+            .with_context(|| format!("failed to seek {}", self.manifest_path.display()))?;
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .with_context(|| format!("failed reading {}", self.manifest_path.display()))?;
+        let line = line.trim();
+        if line.starts_with('{') {
+            parse_json_record(line, &self.base_dir, self.line_number)
+        } else {
+            parse_tsv_record(line, &self.base_dir, self.line_number)
         }
     }
 }
@@ -1241,6 +1324,49 @@ fn parse_tsv_record(line: &str, base_dir: &Path, line_number: usize) -> Result<F
     })
 }
 
+fn parse_json_record_metadata(line: &str, line_number: usize) -> Result<(String, usize)> {
+    let value: Value = serde_json::from_str(line)
+        .with_context(|| format!("invalid JSON manifest line {line_number}"))?;
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("line-{line_number}"));
+
+    if let Some(features) = value.get("features") {
+        let rows = value
+            .get("rows")
+            .and_then(Value::as_u64)
+            .map(|v| v as usize);
+        let cols = value
+            .get("cols")
+            .and_then(Value::as_u64)
+            .map(|v| v as usize);
+        let (rows, _cols) = inline_feature_shape(features, rows, cols, &id)?;
+        return Ok((id, rows));
+    }
+
+    let rows = value
+        .get("rows")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("record '{id}' with feature file must include rows"))?
+        as usize;
+    Ok((id, rows))
+}
+
+fn parse_tsv_record_metadata(line: &str, line_number: usize) -> Result<(String, usize)> {
+    let parts = line.split('\t').collect::<Vec<_>>();
+    if parts.len() < 4 {
+        bail!(
+            "TSV manifest line {line_number} must have: features_path<TAB>rows<TAB>cols<TAB>tokens"
+        );
+    }
+    let rows = parts[1]
+        .parse::<usize>()
+        .with_context(|| format!("invalid rows on line {line_number}"))?;
+    Ok((format!("line-{line_number}"), rows))
+}
+
 fn parse_inline_features(
     value: &Value,
     rows: Option<usize>,
@@ -1299,6 +1425,50 @@ fn parse_inline_features(
         );
     }
     Ok((features, rows, cols))
+}
+
+fn inline_feature_shape(
+    value: &Value,
+    rows: Option<usize>,
+    cols: Option<usize>,
+    id: &str,
+) -> Result<(usize, usize)> {
+    if let Some(outer) = value.as_array().filter(|items| {
+        items
+            .first()
+            .is_some_and(|first| matches!(first, Value::Array(_)))
+    }) {
+        let rows = outer.len();
+        let cols = outer
+            .first()
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        for row in outer {
+            let row = row
+                .as_array()
+                .ok_or_else(|| anyhow!("record '{id}' has a non-array feature row"))?;
+            if row.len() != cols {
+                bail!("record '{id}' has ragged inline features");
+            }
+        }
+        return Ok((rows, cols));
+    }
+
+    let rows = rows.ok_or_else(|| anyhow!("record '{id}' inline flat features require rows"))?;
+    let cols = cols.ok_or_else(|| anyhow!("record '{id}' inline flat features require cols"))?;
+    let len = value
+        .as_array()
+        .ok_or_else(|| anyhow!("record '{id}' features must be an array"))?
+        .len();
+    if len != rows * cols {
+        bail!(
+            "record '{id}' feature shape {rows}x{cols} implies {} values, got {}",
+            rows * cols,
+            len
+        );
+    }
+    Ok((rows, cols))
 }
 
 fn parse_tokens_value(value: &Value) -> Result<Vec<i64>> {
