@@ -69,9 +69,9 @@
 
 - [x] Write training config metadata to output directory.
 - [x] Add structured run logging.
-- [ ] Add detailed diagnostics for losses, batch sizes, and throughput.
-- [ ] Add model export packaging.
-- [ ] Add Hugging Face upload support.
+- [x] Add detailed diagnostics for losses, batch sizes, and throughput.
+- [x] Add model export packaging.
+- [x] Add Hugging Face upload support.
 
 ## Performance Optimization
 

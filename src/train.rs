@@ -2,6 +2,7 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -324,6 +325,9 @@ pub struct BurnExportConfig {
     pub checkpoint: PathBuf,
     pub output_dir: PathBuf,
     pub use_ema: bool,
+    pub hf_repo_id: Option<String>,
+    pub hf_revision: Option<String>,
+    pub hf_private: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -331,6 +335,15 @@ pub struct BurnExportSummary {
     pub architecture: TrainArchitecture,
     pub model_path: PathBuf,
     pub metadata_path: PathBuf,
+    pub readme_path: PathBuf,
+    pub training_config_path: PathBuf,
+    pub hf_upload: Option<HfUploadSummary>,
+}
+
+#[derive(Clone, Debug)]
+pub struct HfUploadSummary {
+    pub repo_id: String,
+    pub revision: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -691,11 +704,7 @@ pub fn run_burn_export(config: BurnExportConfig) -> Result<BurnExportSummary> {
             source_model.display()
         );
     }
-    let model_path = config.output_dir.join(format!(
-        "{}_{}.bin",
-        architecture_name(&train_config.architecture),
-        if config.use_ema { "ema" } else { "model" }
-    ));
+    let model_path = config.output_dir.join(format!("{source_stem}.bin"));
     fs::copy(&source_model, &model_path).with_context(|| {
         format!(
             "failed to copy {} to {}",
@@ -703,25 +712,142 @@ pub fn run_burn_export(config: BurnExportConfig) -> Result<BurnExportSummary> {
             model_path.display()
         )
     })?;
+    let training_config_path = config.output_dir.join("training_config.json");
+    fs::write(
+        &training_config_path,
+        serde_json::to_string_pretty(&run_config_json(&train_config))?,
+    )
+    .with_context(|| format!("failed to write {}", training_config_path.display()))?;
+    let readme_path = config.output_dir.join("README.md");
+    fs::write(
+        &readme_path,
+        export_readme(&train_config, &model_path, config.use_ema),
+    )
+    .with_context(|| format!("failed to write {}", readme_path.display()))?;
     let metadata_path = config.output_dir.join("burn_export.json");
+    let checkpoint_metadata_path = config.output_dir.join("checkpoint.json");
+    let checkpoint_metadata = json!({
+        "epoch": Value::Null,
+        "epoch_complete": true,
+        "global_step": Value::Null,
+        "train_ctc_loss": Value::Null,
+        "val_ctc_loss": Value::Null,
+        "val_cer": Value::Null,
+        "val_wer": Value::Null,
+        "checkpoint_dir": config.output_dir,
+        "model_path": if config.use_ema { Value::Null } else { json!(&model_path) },
+        "optimizer_path": Value::Null,
+        "ema_model_path": if config.use_ema { json!(&model_path) } else { Value::Null },
+        "training_config": run_config_json(&train_config),
+    });
+    fs::write(
+        &checkpoint_metadata_path,
+        serde_json::to_string_pretty(&checkpoint_metadata)?,
+    )
+    .with_context(|| format!("failed to write {}", checkpoint_metadata_path.display()))?;
     fs::write(
         &metadata_path,
         serde_json::to_string_pretty(&json!({
             "format": "burn-bin-full-precision",
             "architecture": architecture_name(&train_config.architecture),
-            "model_path": model_path,
-            "source_checkpoint": checkpoint_dir,
+            "model_path": &model_path,
+            "readme_path": &readme_path,
+            "training_config_path": &training_config_path,
+            "checkpoint_metadata_path": &checkpoint_metadata_path,
+            "source_checkpoint": &checkpoint_dir,
             "source": if config.use_ema { "ema_model" } else { "model" },
+            "package_files": [
+                &model_path,
+                &readme_path,
+                &training_config_path,
+                &metadata_path,
+                &checkpoint_metadata_path,
+            ],
             "training_config": run_config_json(&train_config),
         }))?,
     )
     .with_context(|| format!("failed to write {}", metadata_path.display()))?;
+    let hf_upload = if let Some(repo_id) = config.hf_repo_id.clone() {
+        upload_export_to_huggingface(
+            &repo_id,
+            config.hf_revision.as_deref(),
+            config.hf_private,
+            &config.output_dir,
+        )?;
+        Some(HfUploadSummary {
+            repo_id,
+            revision: config.hf_revision.clone(),
+        })
+    } else {
+        None
+    };
 
     Ok(BurnExportSummary {
         architecture: train_config.architecture,
         model_path,
         metadata_path,
+        readme_path,
+        training_config_path,
+        hf_upload,
     })
+}
+
+fn export_readme(config: &BurnTrainConfig, model_path: &Path, use_ema: bool) -> String {
+    format!(
+        "---\nlibrary_name: burn\ntags:\n- automatic-speech-recognition\n- burn\n- ukrainian\n---\n\n# {} Burn ASR Export\n\nThis package contains a Burn full-precision checkpoint exported from `w2v-bert-uk`.\n\n- Architecture: `{}`\n- Model file: `{}`\n- Source weights: `{}`\n- Input feature dimension: `{}`\n- Vocabulary size: `{}`\n- Blank token id: `{}`\n\nUse `burn-infer --checkpoint <checkpoint-or-export-dir> --manifest <features.jsonl>` with a compatible feature manifest.\n",
+        architecture_name(&config.architecture),
+        architecture_name(&config.architecture),
+        model_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("model.bin"),
+        if use_ema { "ema_model" } else { "model" },
+        config.input_dim,
+        config.vocab_size,
+        config.blank_id,
+    )
+}
+
+fn upload_export_to_huggingface(
+    repo_id: &str,
+    revision: Option<&str>,
+    private: bool,
+    output_dir: &Path,
+) -> Result<()> {
+    if private {
+        let mut create = Command::new("huggingface-cli");
+        create.args([
+            "repo",
+            "create",
+            repo_id,
+            "--type",
+            "model",
+            "--exist-ok",
+            "--private",
+        ]);
+        let status = create.status().context(
+            "failed to run huggingface-cli; install huggingface_hub CLI and login first",
+        )?;
+        if !status.success() {
+            bail!("huggingface-cli repo create failed with status {status}");
+        }
+    }
+
+    let mut upload = Command::new("huggingface-cli");
+    upload.args(["upload", repo_id]);
+    upload.arg(output_dir);
+    upload.arg(".");
+    upload.args(["--repo-type", "model"]);
+    if let Some(revision) = revision {
+        upload.args(["--revision", revision]);
+    }
+    let status = upload
+        .status()
+        .context("failed to run huggingface-cli; install huggingface_hub CLI and login first")?;
+    if !status.success() {
+        bail!("huggingface-cli upload failed with status {status}");
+    }
+    Ok(())
 }
 
 fn run_burn_training_cpu(config: BurnTrainConfig) -> Result<TrainSummary> {
@@ -1380,6 +1506,65 @@ fn average_metric_quintets(results: &[(GradientsParams, [f32; 5])]) -> [f32; 5] 
     values
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct BatchDiagnostics {
+    batches: usize,
+    samples: usize,
+    total_frames: usize,
+    max_frames: usize,
+    padded_frames: usize,
+    feature_values: usize,
+    target_tokens: usize,
+    max_target_len: usize,
+}
+
+impl BatchDiagnostics {
+    fn from_batches(batches: &[TrainBatch]) -> Self {
+        let mut diagnostics = Self {
+            batches: batches.len(),
+            ..Self::default()
+        };
+        for batch in batches {
+            diagnostics.samples += batch.batch_size;
+            diagnostics.total_frames += batch.feature_lengths.iter().sum::<usize>();
+            diagnostics.max_frames = diagnostics.max_frames.max(batch.max_frames);
+            diagnostics.padded_frames += batch.batch_size * batch.max_frames;
+            diagnostics.feature_values += batch.batch_size * batch.max_frames * batch.feature_dim;
+            diagnostics.target_tokens += batch.target_lengths.iter().sum::<usize>();
+            diagnostics.max_target_len = diagnostics.max_target_len.max(batch.max_target_len);
+        }
+        diagnostics
+    }
+
+    fn as_json(self) -> Value {
+        json!({
+            "batches": self.batches,
+            "samples": self.samples,
+            "total_frames": self.total_frames,
+            "max_frames": self.max_frames,
+            "padded_frames": self.padded_frames,
+            "feature_values": self.feature_values,
+            "target_tokens": self.target_tokens,
+            "max_target_len": self.max_target_len,
+            "padding_ratio": if self.total_frames > 0 {
+                Some(self.padded_frames as f64 / self.total_frames as f64)
+            } else {
+                None
+            },
+        })
+    }
+
+    fn throughput_json(self, elapsed: std::time::Duration) -> Value {
+        let seconds = elapsed.as_secs_f64().max(1.0e-9);
+        json!({
+            "step_elapsed_sec": elapsed.as_secs_f64(),
+            "samples_per_sec": self.samples as f64 / seconds,
+            "frames_per_sec": self.total_frames as f64 / seconds,
+            "feature_values_per_sec": self.feature_values as f64 / seconds,
+        })
+    }
+}
+
 fn train_ctc_model<B, M>(
     mut model: M,
     config: &BurnTrainConfig,
@@ -1449,6 +1634,8 @@ where
             } else {
                 vec![batch]
             };
+            let step_started = Instant::now();
+            let batch_diagnostics = BatchDiagnostics::from_batches(&batches);
 
             let loss = ctc_loss_for_batch::<B, M>(&model, &batches[0], config.blank_id, device);
             let mut loss_value = scalar_value(loss.clone())?;
@@ -1511,6 +1698,8 @@ where
                             "global_step": global_step,
                             "learning_rate": lr,
                             "losses": {"ctc": loss_value},
+                            "batch": batch_diagnostics.as_json(),
+                            "throughput": batch_diagnostics.throughput_json(step_started.elapsed()),
                             "micro_batches": pending_micro_batches,
                             "dry_run": false,
                         }),
@@ -1531,6 +1720,8 @@ where
                         "global_step": global_step,
                         "learning_rate": Value::Null,
                         "losses": {"ctc": loss_value},
+                        "batch": batch_diagnostics.as_json(),
+                        "throughput": batch_diagnostics.throughput_json(step_started.elapsed()),
                         "dry_run": true,
                     }),
                 )?;
@@ -1779,6 +1970,8 @@ where
             } else {
                 vec![batch]
             };
+            let step_started = Instant::now();
+            let batch_diagnostics = BatchDiagnostics::from_batches(&batches);
 
             let loss_output = paraformer_loss_for_batch(&model, &batches[0], config, device);
             let loss_value = scalar_value(loss_output.loss.clone())?;
@@ -1857,6 +2050,8 @@ where
                                 "ctc": metric_values[1],
                                 "ce": metric_values[2],
                             },
+                            "batch": batch_diagnostics.as_json(),
+                            "throughput": batch_diagnostics.throughput_json(step_started.elapsed()),
                             "micro_batches": pending_micro_batches,
                             "dry_run": false,
                         }),
@@ -1884,6 +2079,8 @@ where
                             "ctc": metric_values[1],
                             "ce": metric_values[2],
                         },
+                        "batch": batch_diagnostics.as_json(),
+                        "throughput": batch_diagnostics.throughput_json(step_started.elapsed()),
                         "dry_run": true,
                     }),
                 )?;
@@ -2129,6 +2326,8 @@ where
             } else {
                 vec![batch]
             };
+            let step_started = Instant::now();
+            let batch_diagnostics = BatchDiagnostics::from_batches(&batches);
 
             let loss_output =
                 enhanced_paraformer_loss_for_batch(&model, &batches[0], config, device);
@@ -2220,6 +2419,8 @@ where
                                 "ce": metric_values[3],
                                 "boundary": metric_values[4],
                             },
+                            "batch": batch_diagnostics.as_json(),
+                            "throughput": batch_diagnostics.throughput_json(step_started.elapsed()),
                             "micro_batches": pending_micro_batches,
                             "dry_run": false,
                         }),
@@ -2251,6 +2452,8 @@ where
                             "ce": metric_values[3],
                             "boundary": metric_values[4],
                         },
+                        "batch": batch_diagnostics.as_json(),
+                        "throughput": batch_diagnostics.throughput_json(step_started.elapsed()),
                         "dry_run": true,
                     }),
                 )?;
