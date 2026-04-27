@@ -1279,7 +1279,22 @@ trait TrainableCtc<B: AutodiffBackend>: AutodiffModule<B> {
     -> (Tensor<B, 3>, Vec<usize>);
 }
 
+trait ValidCtc<B: Backend>: Module<B> {
+    fn ctc_logits(&self, features: Tensor<B, 3>, lengths: Vec<usize>)
+    -> (Tensor<B, 3>, Vec<usize>);
+}
+
 impl<B: AutodiffBackend> TrainableCtc<B> for SqueezeformerCtc<B> {
+    fn ctc_logits(
+        &self,
+        features: Tensor<B, 3>,
+        lengths: Vec<usize>,
+    ) -> (Tensor<B, 3>, Vec<usize>) {
+        self.forward_with_lengths(features, Some(lengths))
+    }
+}
+
+impl<B: Backend> ValidCtc<B> for SqueezeformerCtc<B> {
     fn ctc_logits(
         &self,
         features: Tensor<B, 3>,
@@ -1299,6 +1314,16 @@ impl<B: AutodiffBackend> TrainableCtc<B> for ZipformerCtc<B> {
     }
 }
 
+impl<B: Backend> ValidCtc<B> for ZipformerCtc<B> {
+    fn ctc_logits(
+        &self,
+        features: Tensor<B, 3>,
+        lengths: Vec<usize>,
+    ) -> (Tensor<B, 3>, Vec<usize>) {
+        self.forward_with_lengths(features, lengths)
+    }
+}
+
 impl<B: AutodiffBackend> TrainableCtc<B> for Wav2VecBertCtc<B> {
     fn ctc_logits(
         &self,
@@ -1309,7 +1334,28 @@ impl<B: AutodiffBackend> TrainableCtc<B> for Wav2VecBertCtc<B> {
     }
 }
 
+impl<B: Backend> ValidCtc<B> for Wav2VecBertCtc<B> {
+    fn ctc_logits(
+        &self,
+        features: Tensor<B, 3>,
+        lengths: Vec<usize>,
+    ) -> (Tensor<B, 3>, Vec<usize>) {
+        self.forward_with_lengths(features, lengths)
+    }
+}
+
 impl<B: AutodiffBackend> TrainableCtc<B> for ParaformerV2<B> {
+    fn ctc_logits(
+        &self,
+        features: Tensor<B, 3>,
+        lengths: Vec<usize>,
+    ) -> (Tensor<B, 3>, Vec<usize>) {
+        let output = self.forward(features, lengths);
+        (output.ctc_log_probs, output.encoder_lengths)
+    }
+}
+
+impl<B: Backend> ValidCtc<B> for ParaformerV2<B> {
     fn ctc_logits(
         &self,
         features: Tensor<B, 3>,
@@ -1743,6 +1789,7 @@ fn train_ctc_model<B, M>(
 where
     B: AutodiffBackend,
     M: TrainableCtc<B>,
+    M::InnerModule: ValidCtc<B::InnerBackend>,
 {
     let device = devices
         .first()
@@ -2033,12 +2080,13 @@ fn evaluate_ctc_model<B, M>(
 where
     B: AutodiffBackend,
     M: TrainableCtc<B>,
+    M::InnerModule: ValidCtc<B::InnerBackend>,
 {
     let mut total = 0.0f64;
     let mut count = 0usize;
     let mut metrics = ValidationMetrics::default();
     let mut sample_predictions = Vec::new();
-    let eval_model = model.clone().no_grad();
+    let eval_model = model.valid();
     let val_manifest = config
         .val_manifest
         .as_ref()
@@ -2058,8 +2106,10 @@ where
         feature_extractor_for_architecture(config),
     )?;
     while let Some(batch) = batches.next_batch()? {
-        let (logits_or_log_probs, output_lengths) =
-            ctc_logits_for_batch::<B, M>(&eval_model, &batch, device);
+        let (logits_or_log_probs, output_lengths) = valid_ctc_logits_for_batch::<
+            B::InnerBackend,
+            M::InnerModule,
+        >(&eval_model, &batch, device);
         let loss = ctc_loss_from_logits(
             logits_or_log_probs.clone(),
             output_lengths.clone(),
@@ -2430,7 +2480,7 @@ where
     let mut count = 0usize;
     let mut metrics = ValidationMetrics::default();
     let mut sample_predictions = Vec::new();
-    let eval_model = model.clone().no_grad();
+    let eval_model = model.valid();
     let val_manifest = config
         .val_manifest
         .as_ref()
@@ -2450,7 +2500,7 @@ where
         feature_extractor_for_architecture(config),
     )?;
     while let Some(batch) = batches.next_batch()? {
-        let features = batch_features_tensor::<B>(&batch, device);
+        let features = batch_features_tensor::<B::InnerBackend>(&batch, device);
         let output = eval_model.forward(features, batch.feature_lengths.clone());
         let loss = ctc_loss_from_log_probs(
             output.ctc_log_probs.clone(),
@@ -2843,7 +2893,7 @@ where
     let mut count = 0usize;
     let mut metrics = ValidationMetrics::default();
     let mut sample_predictions = Vec::new();
-    let eval_model = model.clone().no_grad();
+    let eval_model = model.valid();
     let val_manifest = config
         .val_manifest
         .as_ref()
@@ -2863,7 +2913,7 @@ where
         feature_extractor_for_architecture(config),
     )?;
     while let Some(batch) = batches.next_batch()? {
-        let features = batch_features_tensor::<B>(&batch, device);
+        let features = batch_features_tensor::<B::InnerBackend>(&batch, device);
         let (ctc_log_probs, encoder_lengths) =
             eval_model.ctc_log_probs(features, batch.feature_lengths.clone());
         let loss = ctc_loss_from_log_probs(
@@ -2984,14 +3034,14 @@ where
     )
 }
 
-fn ctc_logits_for_batch<B, M>(
+fn valid_ctc_logits_for_batch<B, M>(
     model: &M,
     batch: &TrainBatch,
     device: &B::Device,
 ) -> (Tensor<B, 3>, Vec<usize>)
 where
-    B: AutodiffBackend,
-    M: TrainableCtc<B>,
+    B: Backend,
+    M: ValidCtc<B>,
 {
     let features = batch_features_tensor(batch, device);
     model.ctc_logits(features, batch.feature_lengths.clone())
@@ -3052,7 +3102,7 @@ fn apply_spec_augment(features: &mut [f32], batch: &TrainBatch, config: SpecAugm
     }
 }
 
-fn ctc_loss_from_logits<B: AutodiffBackend>(
+fn ctc_loss_from_logits<B: Backend>(
     logits_or_log_probs: Tensor<B, 3>,
     output_lengths: Vec<usize>,
     batch: &TrainBatch,
@@ -3063,7 +3113,7 @@ fn ctc_loss_from_logits<B: AutodiffBackend>(
     ctc_loss_from_time_major_log_probs(log_probs, output_lengths, batch, blank_id, device)
 }
 
-fn ctc_loss_from_log_probs<B: AutodiffBackend>(
+fn ctc_loss_from_log_probs<B: Backend>(
     log_probs: Tensor<B, 3>,
     output_lengths: Vec<usize>,
     batch: &TrainBatch,
@@ -3079,7 +3129,7 @@ fn ctc_loss_from_log_probs<B: AutodiffBackend>(
     )
 }
 
-fn ctc_loss_from_time_major_log_probs<B: AutodiffBackend>(
+fn ctc_loss_from_time_major_log_probs<B: Backend>(
     log_probs: Tensor<B, 3>,
     output_lengths: Vec<usize>,
     batch: &TrainBatch,
