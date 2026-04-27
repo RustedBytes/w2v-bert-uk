@@ -63,7 +63,7 @@
 - [x] Add beam search decoding.
 - [x] Add optional language-model decoding.
 - [ ] Add sample prediction logging.
-- [ ] Add inference/export entrypoints for all architectures.
+- [x] Add inference/export entrypoints for all architectures.
 
 ## Experiment Ergonomics
 

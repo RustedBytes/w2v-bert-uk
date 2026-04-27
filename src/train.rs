@@ -1,10 +1,10 @@
 use std::fs;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
-use burn::module::{AutodiffModule, ModuleMapper, ModuleVisitor, Param, ParamId};
+use burn::module::{AutodiffModule, Module, ModuleMapper, ModuleVisitor, Param, ParamId};
 use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
 use burn::tensor::activation::log_softmax;
 use burn::tensor::backend::{AutodiffBackend, Backend};
@@ -31,7 +31,7 @@ use crate::tokenizer::load_sentencepiece_tokenizer;
 use crate::wav2vec::{Wav2VecBertConfig, Wav2VecBertCtc, Wav2VecBertCtcConfig};
 use crate::zipformer::{ZipformerConfig, ZipformerCtc, ZipformerCtcConfig};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum TrainArchitecture {
     Squeezeformer,
     Zipformer,
@@ -245,6 +245,7 @@ pub struct FeatureRecord {
 
 #[derive(Clone, Debug)]
 pub struct TrainBatch {
+    pub ids: Vec<String>,
     pub features: Vec<f32>,
     pub batch_size: usize,
     pub max_frames: usize,
@@ -264,6 +265,66 @@ pub struct TrainSummary {
     pub last_val_loss: Option<f32>,
     pub last_val_cer: Option<f32>,
     pub last_val_wer: Option<f32>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BurnInferenceConfig {
+    pub checkpoint: PathBuf,
+    pub manifest: PathBuf,
+    pub output: Option<PathBuf>,
+    pub use_ema: bool,
+    pub batch_size: Option<usize>,
+    pub max_samples: Option<usize>,
+    pub tokenizer_path: Option<PathBuf>,
+    pub beam_width: Option<usize>,
+    pub n_best: Option<usize>,
+    pub lm_path: Option<PathBuf>,
+    pub lm_weight: Option<f32>,
+    pub lm_word_bonus: Option<f32>,
+    pub lm_bos: bool,
+    pub lm_eos: bool,
+}
+
+impl Default for BurnInferenceConfig {
+    fn default() -> Self {
+        Self {
+            checkpoint: PathBuf::from("runs/burn/checkpoint_latest"),
+            manifest: PathBuf::from("val.jsonl"),
+            output: None,
+            use_ema: false,
+            batch_size: None,
+            max_samples: None,
+            tokenizer_path: None,
+            beam_width: None,
+            n_best: None,
+            lm_path: None,
+            lm_weight: None,
+            lm_word_bonus: None,
+            lm_bos: true,
+            lm_eos: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct BurnInferenceSummary {
+    pub architecture: TrainArchitecture,
+    pub decoded_samples: usize,
+    pub output: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BurnExportConfig {
+    pub checkpoint: PathBuf,
+    pub output_dir: PathBuf,
+    pub use_ema: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct BurnExportSummary {
+    pub architecture: TrainArchitecture,
+    pub model_path: PathBuf,
+    pub metadata_path: PathBuf,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -463,6 +524,190 @@ pub fn run_burn_training(config: BurnTrainConfig) -> Result<TrainSummary> {
     }
 }
 
+pub fn run_burn_inference(config: BurnInferenceConfig) -> Result<BurnInferenceSummary> {
+    type Backend = burn_ndarray::NdArray<f32>;
+    let device = Default::default();
+    let mut train_config = load_checkpoint_train_config(&config.checkpoint)?;
+    train_config.train_manifest = config.manifest.clone();
+    train_config.batch_size = config.batch_size.unwrap_or(train_config.batch_size);
+    train_config.max_train_samples = config.max_samples;
+    if let Some(tokenizer_path) = config.tokenizer_path.clone() {
+        train_config.tokenizer_path = Some(tokenizer_path);
+    }
+    if let Some(beam_width) = config.beam_width {
+        train_config.val_beam_width = beam_width;
+    }
+    train_config.val_n_best = config.n_best.unwrap_or(train_config.val_beam_width);
+    if let Some(lm_path) = config.lm_path.clone() {
+        train_config.val_lm_path = Some(lm_path);
+    }
+    if let Some(lm_weight) = config.lm_weight {
+        train_config.val_lm_weight = lm_weight;
+    }
+    if let Some(lm_word_bonus) = config.lm_word_bonus {
+        train_config.val_lm_word_bonus = lm_word_bonus;
+    }
+    train_config.val_lm_bos = config.lm_bos;
+    train_config.val_lm_eos = config.lm_eos;
+    train_config.backend = TrainBackendKind::Cpu;
+    train_config.device_index = 0;
+    train_config.device_indices = vec![0];
+    train_config.precision = TrainPrecision::F32;
+    validate_config(&train_config)?;
+
+    let decoder = ValidationDecoder::from_config(&train_config)?;
+    let checkpoint_dir = checkpoint_dir_from_path(&config.checkpoint)?;
+    let mut writer = match &config.output {
+        Some(path) => Some(
+            fs::File::create(path)
+                .with_context(|| format!("failed to create inference output {}", path.display()))?,
+        ),
+        None => None,
+    };
+
+    let decoded_samples = match train_config.architecture {
+        TrainArchitecture::Squeezeformer => {
+            let model = load_inference_model::<Backend, _>(
+                build_squeezeformer_model::<Backend>(&train_config, &device),
+                &checkpoint_dir,
+                config.use_ema,
+                &device,
+            )?;
+            infer_ctc_batches(
+                &model,
+                &train_config,
+                &device,
+                &decoder,
+                writer.as_mut(),
+                |model, features, lengths| model.forward_with_lengths(features, Some(lengths)),
+            )?
+        }
+        TrainArchitecture::Zipformer => {
+            let model = load_inference_model::<Backend, _>(
+                build_zipformer_model::<Backend>(&train_config, &device),
+                &checkpoint_dir,
+                config.use_ema,
+                &device,
+            )?;
+            infer_ctc_batches(
+                &model,
+                &train_config,
+                &device,
+                &decoder,
+                writer.as_mut(),
+                |model, features, lengths| model.forward_with_lengths(features, lengths),
+            )?
+        }
+        TrainArchitecture::Paraformer if train_config.paraformer_enhanced => {
+            let model = load_inference_model::<Backend, _>(
+                build_enhanced_paraformer_model::<Backend>(&train_config, &device),
+                &checkpoint_dir,
+                config.use_ema,
+                &device,
+            )?;
+            infer_ctc_batches(
+                &model,
+                &train_config,
+                &device,
+                &decoder,
+                writer.as_mut(),
+                |model, features, lengths| model.ctc_log_probs(features, lengths),
+            )?
+        }
+        TrainArchitecture::Paraformer => {
+            let model = load_inference_model::<Backend, _>(
+                build_paraformer_model::<Backend>(&train_config, &device),
+                &checkpoint_dir,
+                config.use_ema,
+                &device,
+            )?;
+            infer_ctc_batches(
+                &model,
+                &train_config,
+                &device,
+                &decoder,
+                writer.as_mut(),
+                |model, features, lengths| {
+                    let output = model.forward(features, lengths);
+                    (output.ctc_log_probs, output.encoder_lengths)
+                },
+            )?
+        }
+        TrainArchitecture::Wav2VecBert => {
+            let model = load_inference_model::<Backend, _>(
+                build_wav2vec_model::<Backend>(&train_config, &device)?,
+                &checkpoint_dir,
+                config.use_ema,
+                &device,
+            )?;
+            infer_ctc_batches(
+                &model,
+                &train_config,
+                &device,
+                &decoder,
+                writer.as_mut(),
+                |model, features, lengths| model.forward_with_lengths(features, lengths),
+            )?
+        }
+    };
+
+    Ok(BurnInferenceSummary {
+        architecture: train_config.architecture,
+        decoded_samples,
+        output: config.output,
+    })
+}
+
+pub fn run_burn_export(config: BurnExportConfig) -> Result<BurnExportSummary> {
+    let train_config = load_checkpoint_train_config(&config.checkpoint)?;
+    let checkpoint_dir = checkpoint_dir_from_path(&config.checkpoint)?;
+    fs::create_dir_all(&config.output_dir).with_context(|| {
+        format!(
+            "failed to create export directory {}",
+            config.output_dir.display()
+        )
+    })?;
+    let source_stem = if config.use_ema { "ema_model" } else { "model" };
+    let source_model = checkpoint_file_path(&checkpoint_dir, source_stem);
+    if !source_model.exists() {
+        bail!(
+            "checkpoint model file does not exist: {}",
+            source_model.display()
+        );
+    }
+    let model_path = config.output_dir.join(format!(
+        "{}_{}.bin",
+        architecture_name(&train_config.architecture),
+        if config.use_ema { "ema" } else { "model" }
+    ));
+    fs::copy(&source_model, &model_path).with_context(|| {
+        format!(
+            "failed to copy {} to {}",
+            source_model.display(),
+            model_path.display()
+        )
+    })?;
+    let metadata_path = config.output_dir.join("burn_export.json");
+    fs::write(
+        &metadata_path,
+        serde_json::to_string_pretty(&json!({
+            "format": "burn-bin-full-precision",
+            "architecture": architecture_name(&train_config.architecture),
+            "model_path": model_path,
+            "source_checkpoint": checkpoint_dir,
+            "source": if config.use_ema { "ema_model" } else { "model" },
+            "training_config": run_config_json(&train_config),
+        }))?,
+    )
+    .with_context(|| format!("failed to write {}", metadata_path.display()))?;
+
+    Ok(BurnExportSummary {
+        architecture: train_config.architecture,
+        model_path,
+        metadata_path,
+    })
+}
+
 fn run_burn_training_cpu(config: BurnTrainConfig) -> Result<TrainSummary> {
     if config.device_indices != [0] {
         bail!("cpu backend only supports device index 0");
@@ -644,6 +889,118 @@ where
             config.backend, config.precision, config.device_index
         )
     })
+}
+
+fn build_squeezeformer_model<B: Backend>(
+    config: &BurnTrainConfig,
+    device: &B::Device,
+) -> SqueezeformerCtc<B> {
+    let encoder = config
+        .variant
+        .as_deref()
+        .and_then(SqueezeformerEncoderConfig::variant)
+        .unwrap_or_else(|| {
+            SqueezeformerEncoderConfig::new(
+                config.input_dim,
+                config.d_model,
+                config.num_layers,
+                config.num_heads,
+            )
+        });
+    SqueezeformerCtcConfig {
+        encoder,
+        vocab_size: config.vocab_size,
+    }
+    .init::<B>(device)
+}
+
+fn build_zipformer_model<B: Backend>(
+    config: &BurnTrainConfig,
+    device: &B::Device,
+) -> ZipformerCtc<B> {
+    let mut encoder = config
+        .variant
+        .as_deref()
+        .and_then(ZipformerConfig::variant)
+        .unwrap_or_else(|| ZipformerConfig::new(config.input_dim));
+    encoder.input_dim = config.input_dim;
+    ZipformerCtcConfig {
+        encoder,
+        vocab_size: config.vocab_size,
+    }
+    .init::<B>(device)
+}
+
+fn build_paraformer_model<B: Backend>(
+    config: &BurnTrainConfig,
+    device: &B::Device,
+) -> ParaformerV2<B> {
+    let model_config = config
+        .variant
+        .as_deref()
+        .and_then(|variant| {
+            ParaformerV2Config::variant(
+                variant,
+                config.input_dim,
+                config.vocab_size,
+                config.blank_id,
+            )
+        })
+        .unwrap_or_else(|| {
+            let mut value = ParaformerV2Config::new(config.input_dim, config.vocab_size)
+                .with_blank_id(config.blank_id);
+            value.encoder_dim = config.d_model;
+            value.decoder_dim = config.d_model;
+            value.encoder_layers = config.num_layers;
+            value.attention_heads = config.num_heads;
+            value
+        });
+    model_config.init::<B>(device)
+}
+
+fn build_enhanced_paraformer_model<B: Backend>(
+    config: &BurnTrainConfig,
+    device: &B::Device,
+) -> EnhancedParaformerV2<B> {
+    let model_config = config
+        .variant
+        .as_deref()
+        .and_then(|variant| {
+            EnhancedParaformerV2Config::variant(
+                variant,
+                config.input_dim,
+                config.vocab_size,
+                config.blank_id,
+            )
+        })
+        .unwrap_or_else(|| {
+            let mut value = EnhancedParaformerV2Config::new(config.input_dim, config.vocab_size)
+                .with_blank_id(config.blank_id);
+            value.base.encoder_dim = config.d_model;
+            value.base.decoder_dim = config.d_model;
+            value.base.encoder_layers = config.num_layers;
+            value.base.attention_heads = config.num_heads;
+            value
+        });
+    model_config.init::<B>(device)
+}
+
+fn build_wav2vec_model<B: Backend>(
+    config: &BurnTrainConfig,
+    device: &B::Device,
+) -> Result<Wav2VecBertCtc<B>> {
+    let mut model_config = if let Some(path) = &config.w2v_hf_model_dir {
+        Wav2VecBertCtcConfig::from_huggingface_dir(path, Some(config.vocab_size))?
+    } else {
+        let encoder =
+            Wav2VecBertConfig::new(config.input_dim, config.d_model).with_layers(config.num_layers);
+        Wav2VecBertCtcConfig {
+            encoder,
+            vocab_size: config.vocab_size,
+        }
+    };
+    model_config.encoder.activation_checkpointing = config.w2v_activation_checkpointing;
+    Ok(model_config.init::<B>(device))
 }
 
 fn train_wav2vec_model<B>(config: &BurnTrainConfig, devices: &[B::Device]) -> Result<TrainSummary>
@@ -2132,6 +2489,83 @@ fn format_validation_summary(
     parts.join(" ")
 }
 
+fn load_inference_model<B, M>(
+    model: M,
+    checkpoint_dir: &Path,
+    use_ema: bool,
+    device: &B::Device,
+) -> Result<M>
+where
+    B: Backend,
+    M: Module<B>,
+{
+    let stem = if use_ema { "ema_model" } else { "model" };
+    let path = checkpoint_file_path(checkpoint_dir, stem);
+    if !path.exists() {
+        bail!("checkpoint model file does not exist: {}", path.display());
+    }
+    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+    model
+        .load_file(
+            checkpoint_base_path(checkpoint_dir, stem),
+            &recorder,
+            device,
+        )
+        .with_context(|| format!("failed to load {}", path.display()))
+}
+
+fn infer_ctc_batches<B, M, F>(
+    model: &M,
+    config: &BurnTrainConfig,
+    device: &B::Device,
+    decoder: &ValidationDecoder,
+    mut writer: Option<&mut fs::File>,
+    forward: F,
+) -> Result<usize>
+where
+    B: Backend,
+    F: Fn(&M, Tensor<B, 3>, Vec<usize>) -> (Tensor<B, 3>, Vec<usize>),
+{
+    let mut batches = StreamingBatchLoader::new(
+        config.train_manifest.clone(),
+        config.batch_size,
+        config.adaptive_batch,
+        config.sort_by_length_desc,
+        config.sort_buffer_size,
+        config.input_dim,
+        config.max_train_samples,
+    )?;
+    let mut decoded_samples = 0usize;
+    while let Some(batch) = batches.next_batch()? {
+        let features = batch_features_tensor::<B>(&batch, device);
+        let (logits_or_log_probs, output_lengths) =
+            forward(model, features, batch.feature_lengths.clone());
+        let predictions = decode_validation_batch(
+            logits_or_log_probs,
+            &output_lengths,
+            config.blank_id,
+            decoder,
+        )?;
+        for sample_index in 0..batch.batch_size {
+            let tokens = predictions.get(sample_index).cloned().unwrap_or_default();
+            let text = decoder.decode_tokens(&tokens);
+            let item = json!({
+                "id": batch.ids[sample_index],
+                "text": normalize_spaces(&text),
+                "tokens": tokens,
+                "reference_text": batch.reference_texts[sample_index],
+            });
+            if let Some(writer) = writer.as_deref_mut() {
+                writeln!(writer, "{}", serde_json::to_string(&item)?)?;
+            } else {
+                println!("{}", serde_json::to_string(&item)?);
+            }
+            decoded_samples += 1;
+        }
+    }
+    Ok(decoded_samples)
+}
+
 fn make_batch(records: &[FeatureRecord], expected_dim: usize) -> Result<TrainBatch> {
     if records.is_empty() {
         bail!("cannot build an empty batch");
@@ -2149,6 +2583,7 @@ fn make_batch(records: &[FeatureRecord], expected_dim: usize) -> Result<TrainBat
 
     let mut features = vec![0.0; batch_size * max_frames * expected_dim];
     let mut targets = vec![0i64; batch_size * max_target_len];
+    let mut ids = Vec::with_capacity(batch_size);
     let mut feature_lengths = Vec::with_capacity(batch_size);
     let mut target_lengths = Vec::with_capacity(batch_size);
     let mut reference_texts = Vec::with_capacity(batch_size);
@@ -2162,6 +2597,7 @@ fn make_batch(records: &[FeatureRecord], expected_dim: usize) -> Result<TrainBat
                 expected_dim
             );
         }
+        ids.push(record.id.clone());
         feature_lengths.push(record.rows);
         target_lengths.push(record.tokens.len());
         reference_texts.push(record.text.clone());
@@ -2176,6 +2612,7 @@ fn make_batch(records: &[FeatureRecord], expected_dim: usize) -> Result<TrainBat
     }
 
     Ok(TrainBatch {
+        ids,
         features,
         batch_size,
         max_frames,
@@ -3055,6 +3492,180 @@ fn checkpoint_base_path(dir: &Path, stem: &str) -> PathBuf {
 
 fn checkpoint_file_path(dir: &Path, stem: &str) -> PathBuf {
     dir.join(format!("{stem}.bin"))
+}
+
+fn checkpoint_dir_from_path(path: &Path) -> Result<PathBuf> {
+    if path.is_dir() {
+        Ok(path.to_path_buf())
+    } else {
+        checkpoint_metadata_path(path)
+            .parent()
+            .map(Path::to_path_buf)
+            .context("checkpoint metadata path has no parent directory")
+    }
+}
+
+fn load_checkpoint_metadata(path: &Path) -> Result<Value> {
+    let metadata_path = checkpoint_metadata_path(path);
+    let metadata_text = fs::read_to_string(&metadata_path).with_context(|| {
+        format!(
+            "failed to read checkpoint metadata {}",
+            metadata_path.display()
+        )
+    })?;
+    serde_json::from_str(&metadata_text).with_context(|| {
+        format!(
+            "failed to parse checkpoint metadata {}",
+            metadata_path.display()
+        )
+    })
+}
+
+fn load_checkpoint_train_config(path: &Path) -> Result<BurnTrainConfig> {
+    let metadata = load_checkpoint_metadata(path)?;
+    let value = metadata
+        .get("training_config")
+        .context("checkpoint metadata does not contain training_config")?;
+    train_config_from_json(value)
+}
+
+fn train_config_from_json(value: &Value) -> Result<BurnTrainConfig> {
+    let mut config = BurnTrainConfig::default();
+    if let Some(architecture) = value.get("architecture").and_then(Value::as_str) {
+        config.architecture = architecture.parse()?;
+    }
+    config.train_manifest = json_path(value, "train_manifest").unwrap_or(config.train_manifest);
+    config.val_manifest = json_path(value, "val_manifest");
+    config.variant = value
+        .get("variant")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    config.input_dim = json_usize(value, "input_dim").unwrap_or(config.input_dim);
+    config.vocab_size = json_usize(value, "vocab_size").unwrap_or(config.vocab_size);
+    config.blank_id = json_usize(value, "blank_id").unwrap_or(config.blank_id);
+    config.d_model = json_usize(value, "d_model").unwrap_or(config.d_model);
+    config.num_layers = json_usize(value, "num_layers").unwrap_or(config.num_layers);
+    config.num_heads = json_usize(value, "num_heads").unwrap_or(config.num_heads);
+    config.batch_size = json_usize(value, "batch_size").unwrap_or(config.batch_size);
+    config.adaptive_batch = json_adaptive_batch(value)?;
+    config.sort_by_length_desc =
+        json_bool(value, "sort_by_length_desc").unwrap_or(config.sort_by_length_desc);
+    config.sort_buffer_size =
+        json_usize(value, "sort_buffer_size").unwrap_or(config.sort_buffer_size);
+    config.epochs = json_usize(value, "epochs").unwrap_or(config.epochs);
+    config.learning_rate = json_f64(value, "learning_rate").unwrap_or(config.learning_rate);
+    config.lr_warmup_steps = json_usize(value, "lr_warmup_steps").unwrap_or(config.lr_warmup_steps);
+    config.lr_hold_steps = json_usize(value, "lr_hold_steps").unwrap_or(config.lr_hold_steps);
+    config.lr_decay_steps = json_usize(value, "lr_decay_steps").unwrap_or(config.lr_decay_steps);
+    config.lr_min = json_f64(value, "lr_min").unwrap_or(config.lr_min);
+    config.weight_decay = json_f64(value, "weight_decay").unwrap_or(config.weight_decay);
+    config.gradient_accumulation_steps = json_usize(value, "gradient_accumulation_steps")
+        .unwrap_or(config.gradient_accumulation_steps);
+    config.gradient_clip_norm = json_f32(value, "gradient_clip_norm");
+    config.gradient_clip_value = json_f32(value, "gradient_clip_value");
+    config.ema_decay = json_f64(value, "ema_decay");
+    config.ema_start_step = json_usize(value, "ema_start_step").unwrap_or(config.ema_start_step);
+    config.tokenizer_path = json_path(value, "tokenizer_path");
+    config.val_beam_width = json_usize(value, "val_beam_width").unwrap_or(config.val_beam_width);
+    config.val_n_best = json_usize(value, "val_n_best").unwrap_or(config.val_n_best);
+    config.val_lm_path = json_path(value, "val_lm_path");
+    config.val_lm_weight = json_f32(value, "val_lm_weight").unwrap_or(config.val_lm_weight);
+    config.val_lm_word_bonus =
+        json_f32(value, "val_lm_word_bonus").unwrap_or(config.val_lm_word_bonus);
+    config.val_lm_bos = json_bool(value, "val_lm_bos").unwrap_or(config.val_lm_bos);
+    config.val_lm_eos = json_bool(value, "val_lm_eos").unwrap_or(config.val_lm_eos);
+    config.paraformer_alignment_mode = match value
+        .get("paraformer_alignment_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("viterbi")
+    {
+        "uniform" => ParaformerAlignmentMode::Uniform,
+        "greedy" => ParaformerAlignmentMode::Greedy,
+        _ => ParaformerAlignmentMode::Viterbi,
+    };
+    config.paraformer_enhanced =
+        json_bool(value, "paraformer_enhanced").unwrap_or(config.paraformer_enhanced);
+    config.w2v_hf_model_dir = json_path(value, "w2v_hf_model_dir");
+    config.w2v_hf_load_weights =
+        json_bool(value, "w2v_hf_load_weights").unwrap_or(config.w2v_hf_load_weights);
+    config.w2v_activation_checkpointing = json_bool(value, "w2v_activation_checkpointing")
+        .unwrap_or(config.w2v_activation_checkpointing);
+    config.backend = value
+        .get("backend")
+        .and_then(Value::as_str)
+        .unwrap_or("cpu")
+        .parse()
+        .unwrap_or(TrainBackendKind::Cpu);
+    config.device_index = json_usize(value, "device_index").unwrap_or(config.device_index);
+    config.device_indices = value
+        .get("device_indices")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_u64().map(|value| value as usize))
+                .collect::<Vec<_>>()
+        })
+        .filter(|items| !items.is_empty())
+        .unwrap_or_else(|| vec![config.device_index]);
+    config.precision = value
+        .get("precision")
+        .and_then(Value::as_str)
+        .unwrap_or("f32")
+        .parse()
+        .unwrap_or(TrainPrecision::F32);
+    Ok(config)
+}
+
+fn json_path(value: &Value, key: &str) -> Option<PathBuf> {
+    value.get(key).and_then(Value::as_str).map(PathBuf::from)
+}
+
+fn json_usize(value: &Value, key: &str) -> Option<usize> {
+    value
+        .get(key)
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+}
+
+fn json_f64(value: &Value, key: &str) -> Option<f64> {
+    value.get(key).and_then(Value::as_f64)
+}
+
+fn json_f32(value: &Value, key: &str) -> Option<f32> {
+    json_f64(value, key).map(|value| value as f32)
+}
+
+fn json_bool(value: &Value, key: &str) -> Option<bool> {
+    value.get(key).and_then(Value::as_bool)
+}
+
+fn json_adaptive_batch(value: &Value) -> Result<Option<AdaptiveBatchConfig>> {
+    let Some(adaptive) = value.get("adaptive_batch") else {
+        return Ok(None);
+    };
+    if adaptive.is_null() {
+        return Ok(None);
+    }
+    let unit = adaptive
+        .get("unit")
+        .and_then(Value::as_str)
+        .unwrap_or("samples")
+        .parse()?;
+    let budget = adaptive
+        .get("budget")
+        .and_then(Value::as_u64)
+        .context("adaptive_batch.budget must be present in checkpoint config")?
+        as usize;
+    let max_samples = adaptive
+        .get("max_samples")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize);
+    Ok(Some(AdaptiveBatchConfig {
+        unit,
+        budget,
+        max_samples,
+    }))
 }
 
 fn save_training_checkpoint<B, M, O>(

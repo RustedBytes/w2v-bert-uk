@@ -749,6 +749,18 @@ impl<B: Backend> ParaformerOutput<B> {
 }
 
 impl<B: Backend> EnhancedParaformerV2<B> {
+    pub fn ctc_log_probs(
+        &self,
+        features: Tensor<B, 3>,
+        lengths: Vec<usize>,
+    ) -> (Tensor<B, 3>, Vec<usize>) {
+        let (_, final_out, encoder_lengths) = self.encoder.forward(features, lengths);
+        (
+            log_softmax(self.final_ctc_projection.forward(final_out), 2),
+            encoder_lengths,
+        )
+    }
+
     pub fn forward_train(
         &self,
         features: Tensor<B, 3>,
