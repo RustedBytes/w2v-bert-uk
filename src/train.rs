@@ -1963,6 +1963,10 @@ where
                 && let (Some(_), Some(every)) = (&config.val_manifest, config.validate_every_steps)
             {
                 if every > 0 && global_step % every == 0 {
+                    logger.log(
+                        "validation_start",
+                        validation_start_event(epoch, Some(global_step), "ctc"),
+                    )?;
                     let val = evaluate_ctc_model::<B, M>(&model, config, device, &decoder)?;
                     println!(
                         "{}",
@@ -2024,6 +2028,10 @@ where
         }
 
         if config.val_manifest.is_some() {
+            logger.log(
+                "validation_start",
+                validation_start_event(epoch, None, "ctc"),
+            )?;
             let val = evaluate_ctc_model::<B, M>(&model, config, device, &decoder)?;
             println!(
                 "{}",
@@ -2354,6 +2362,10 @@ where
                 && let (Some(_), Some(every)) = (&config.val_manifest, config.validate_every_steps)
             {
                 if every > 0 && global_step % every == 0 {
+                    logger.log(
+                        "validation_start",
+                        validation_start_event(epoch, Some(global_step), "loss"),
+                    )?;
                     let val = evaluate_paraformer_model(&model, config, device, &decoder)?;
                     println!(
                         "{}",
@@ -2420,6 +2432,10 @@ where
         }
 
         if config.val_manifest.is_some() {
+            logger.log(
+                "validation_start",
+                validation_start_event(epoch, None, "loss"),
+            )?;
             let val = evaluate_paraformer_model(&model, config, device, &decoder)?;
             println!(
                 "{}",
@@ -2767,6 +2783,10 @@ where
                 && let (Some(_), Some(every)) = (&config.val_manifest, config.validate_every_steps)
             {
                 if every > 0 && global_step % every == 0 {
+                    logger.log(
+                        "validation_start",
+                        validation_start_event(epoch, Some(global_step), "loss"),
+                    )?;
                     let val = evaluate_enhanced_paraformer_model(&model, config, device, &decoder)?;
                     println!(
                         "{}",
@@ -2833,6 +2853,10 @@ where
         }
 
         if config.val_manifest.is_some() {
+            logger.log(
+                "validation_start",
+                validation_start_event(epoch, None, "loss"),
+            )?;
             let val = evaluate_enhanced_paraformer_model(&model, config, device, &decoder)?;
             println!(
                 "{}",
@@ -3404,6 +3428,14 @@ fn validation_event(
                 "reference_tokens": sample.reference_tokens,
             })
         }).collect::<Vec<_>>(),
+    })
+}
+
+fn validation_start_event(epoch: usize, step: Option<usize>, loss_name: &str) -> Value {
+    json!({
+        "epoch": epoch,
+        "global_step": step,
+        "loss_name": loss_name,
     })
 }
 
@@ -5916,6 +5948,11 @@ impl TrainingTui {
                     self.metrics.samples_per_sec = json_f64(throughput, "samples_per_sec");
                     self.metrics.frames_per_sec = json_f64(throughput, "frames_per_sec");
                 }
+            }
+            "validation_start" => {
+                self.metrics.phase = "validation".to_string();
+                self.metrics.epoch = json_usize(payload, "epoch").or(self.metrics.epoch);
+                self.metrics.step = json_usize(payload, "global_step").or(self.metrics.step);
             }
             "validation" => {
                 self.metrics.phase = "validation".to_string();
