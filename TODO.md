@@ -52,7 +52,7 @@
 - [ ] Add raw audio dataset loading.
 - [x] Add feature extraction from audio.
 - [x] Add tokenizer-driven transcript-to-token conversion.
-- [ ] Add dataset cache/index support.
+- [x] Add dataset cache/index support.
 - [ ] Add SpecAugment and waveform augmentation.
 
 ## Validation And Inference

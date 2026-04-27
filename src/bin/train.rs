@@ -101,6 +101,10 @@ struct Args {
     #[arg(long, default_value_t = 4096)]
     sort_buffer_size: usize,
 
+    /// Directory for reusable manifest offset/length indexes.
+    #[arg(long)]
+    dataset_index_dir: Option<PathBuf>,
+
     /// Number of epochs.
     #[arg(long, default_value_t = 10)]
     epochs: usize,
@@ -311,6 +315,7 @@ fn main() -> Result<()> {
         adaptive_batch,
         sort_by_length_desc: args.sort_by_length_desc,
         sort_buffer_size: args.sort_buffer_size,
+        dataset_index_dir: args.dataset_index_dir,
         epochs: args.epochs,
         learning_rate: args.learning_rate,
         lr_warmup_steps: args.lr_warmup_steps,

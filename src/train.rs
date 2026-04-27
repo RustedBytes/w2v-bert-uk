@@ -112,6 +112,7 @@ pub struct BurnTrainConfig {
     pub adaptive_batch: Option<AdaptiveBatchConfig>,
     pub sort_by_length_desc: bool,
     pub sort_buffer_size: usize,
+    pub dataset_index_dir: Option<PathBuf>,
     pub epochs: usize,
     pub learning_rate: f64,
     pub lr_warmup_steps: usize,
@@ -168,6 +169,7 @@ impl Default for BurnTrainConfig {
             adaptive_batch: None,
             sort_by_length_desc: false,
             sort_buffer_size: 4096,
+            dataset_index_dir: None,
             epochs: 10,
             learning_rate: 1.0e-3,
             lr_warmup_steps: 0,
@@ -1439,6 +1441,7 @@ where
             config.input_dim,
             config.max_train_samples,
             config.tokenizer_path.clone(),
+            dataset_index_path(config, "train"),
         )?;
         while let Some(batch) = train_batches.next_batch()? {
             let batches = if !config.dry_run && devices.len() > 1 {
@@ -1672,6 +1675,7 @@ where
         config.input_dim,
         config.max_val_samples,
         config.tokenizer_path.clone(),
+        dataset_index_path(config, "val"),
     )?;
     while let Some(batch) = batches.next_batch()? {
         let (logits_or_log_probs, output_lengths) =
@@ -1767,6 +1771,7 @@ where
             config.input_dim,
             config.max_train_samples,
             config.tokenizer_path.clone(),
+            dataset_index_path(config, "train"),
         )?;
         while let Some(batch) = train_batches.next_batch()? {
             let batches = if !config.dry_run && devices.len() > 1 {
@@ -2027,6 +2032,7 @@ where
         config.input_dim,
         config.max_val_samples,
         config.tokenizer_path.clone(),
+        dataset_index_path(config, "val"),
     )?;
     while let Some(batch) = batches.next_batch()? {
         let output = paraformer_loss_for_batch(model, &batch, config, device);
@@ -2115,6 +2121,7 @@ where
             config.input_dim,
             config.max_train_samples,
             config.tokenizer_path.clone(),
+            dataset_index_path(config, "train"),
         )?;
         while let Some(batch) = train_batches.next_batch()? {
             let batches = if !config.dry_run && devices.len() > 1 {
@@ -2392,6 +2399,7 @@ where
         config.input_dim,
         config.max_val_samples,
         config.tokenizer_path.clone(),
+        dataset_index_path(config, "val"),
     )?;
     while let Some(batch) = batches.next_batch()? {
         let output = enhanced_paraformer_loss_for_batch(model, &batch, config, device);
@@ -2847,6 +2855,7 @@ where
         config.input_dim,
         config.max_train_samples,
         config.tokenizer_path.clone(),
+        None,
     )?;
     let mut decoded_samples = 0usize;
     while let Some(batch) = batches.next_batch()? {
@@ -2970,6 +2979,8 @@ pub struct StreamingBatchLoader {
     audio_frontend: asr_features::W2vBertFrontendConfig,
     pending: Option<FeatureRecord>,
     sort_buffer: Vec<FeatureRecordMetadata>,
+    index_records: Vec<FeatureRecordMetadata>,
+    index_cursor: usize,
 }
 
 struct CurrentManifestFile {
@@ -2999,6 +3010,7 @@ impl StreamingBatchLoader {
         expected_dim: usize,
         limit: Option<usize>,
         tokenizer_path: Option<PathBuf>,
+        index_path: Option<PathBuf>,
     ) -> Result<Self> {
         if batch_size == 0 {
             bail!("batch_size must be > 0");
@@ -3013,8 +3025,18 @@ impl StreamingBatchLoader {
             .as_deref()
             .map(load_sentencepiece_transcript_tokenizer)
             .transpose()?;
+        let files = manifest_files(&manifest)?;
+        let index_records = if sort_by_length_desc {
+            index_path
+                .as_deref()
+                .map(|path| load_or_build_dataset_index(&files, path))
+                .transpose()?
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         Ok(Self {
-            files: manifest_files(&manifest)?,
+            files,
             file_index: 0,
             current: None,
             batch_size,
@@ -3029,6 +3051,8 @@ impl StreamingBatchLoader {
             audio_frontend: W2vBertEncoderConfig::default().to_frontend_config(),
             pending: None,
             sort_buffer: Vec::new(),
+            index_records,
+            index_cursor: 0,
         })
     }
 
@@ -3088,6 +3112,9 @@ impl StreamingBatchLoader {
     }
 
     fn next_sorted_record(&mut self) -> Result<Option<FeatureRecord>> {
+        if !self.index_records.is_empty() {
+            return self.next_indexed_sorted_record();
+        }
         if self.sort_buffer.is_empty() {
             let remaining = self
                 .limit
@@ -3110,8 +3137,30 @@ impl StreamingBatchLoader {
         if self.sort_buffer.is_empty() {
             Ok(None)
         } else {
-            self.sort_buffer.remove(0).load_record().map(Some)
+            let metadata = self.sort_buffer.remove(0);
+            metadata
+                .load_record(
+                    self.tokenizer.as_ref(),
+                    &self.audio_decode,
+                    &self.audio_frontend,
+                )
+                .map(Some)
         }
+    }
+
+    fn next_indexed_sorted_record(&mut self) -> Result<Option<FeatureRecord>> {
+        if self.index_cursor >= self.index_records.len() {
+            return Ok(None);
+        }
+        let metadata = self.index_records[self.index_cursor].clone();
+        self.index_cursor += 1;
+        metadata
+            .load_record(
+                self.tokenizer.as_ref(),
+                &self.audio_decode,
+                &self.audio_frontend,
+            )
+            .map(Some)
     }
 
     fn next_raw_record(&mut self) -> Result<Option<FeatureRecord>> {
@@ -3221,7 +3270,12 @@ impl RawManifestLine {
 }
 
 impl FeatureRecordMetadata {
-    fn load_record(&self) -> Result<FeatureRecord> {
+    fn load_record(
+        &self,
+        tokenizer: Option<&SentencePieceTokenizer>,
+        audio_decode: &AudioDecodeConfig,
+        audio_frontend: &asr_features::W2vBertFrontendConfig,
+    ) -> Result<FeatureRecord> {
         let mut reader =
             BufReader::new(fs::File::open(&self.manifest_path).with_context(|| {
                 format!("failed to open manifest {}", self.manifest_path.display())
@@ -3239,9 +3293,9 @@ impl FeatureRecordMetadata {
                 line,
                 &self.base_dir,
                 self.line_number,
-                None,
-                &AudioDecodeConfig::default(),
-                &W2vBertEncoderConfig::default().to_frontend_config(),
+                tokenizer,
+                audio_decode,
+                audio_frontend,
             )
         } else {
             parse_tsv_record(line, &self.base_dir, self.line_number)
@@ -3295,6 +3349,186 @@ fn is_manifest_file(path: &Path) -> bool {
             .extension()
             .and_then(|extension| extension.to_str())
             .is_some_and(|extension| matches!(extension, "jsonl" | "json"))
+}
+
+fn dataset_index_path(config: &BurnTrainConfig, split: &str) -> Option<PathBuf> {
+    config
+        .dataset_index_dir
+        .as_ref()
+        .map(|dir| dir.join(format!("{split}.index.json")))
+}
+
+fn load_or_build_dataset_index(
+    files: &[PathBuf],
+    index_path: &Path,
+) -> Result<Vec<FeatureRecordMetadata>> {
+    if let Some(records) = load_dataset_index_if_fresh(files, index_path)? {
+        return Ok(records);
+    }
+    let records = build_dataset_index(files)?;
+    write_dataset_index(files, index_path, &records)?;
+    Ok(records)
+}
+
+fn load_dataset_index_if_fresh(
+    files: &[PathBuf],
+    index_path: &Path,
+) -> Result<Option<Vec<FeatureRecordMetadata>>> {
+    if !index_path.exists() {
+        return Ok(None);
+    }
+    let value: Value = serde_json::from_str(
+        &fs::read_to_string(index_path)
+            .with_context(|| format!("failed to read dataset index {}", index_path.display()))?,
+    )
+    .with_context(|| format!("failed to parse dataset index {}", index_path.display()))?;
+    let Some(files_value) = value.get("files").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    if files_value.len() != files.len() {
+        return Ok(None);
+    }
+    for (actual, cached) in files.iter().zip(files_value) {
+        if cached.get("path").and_then(Value::as_str) != Some(&actual.to_string_lossy()) {
+            return Ok(None);
+        }
+        let signature = file_signature(actual)?;
+        if cached.get("len").and_then(Value::as_u64) != Some(signature.0)
+            || cached.get("modified_ms").and_then(Value::as_u64) != Some(signature.1)
+        {
+            return Ok(None);
+        }
+    }
+    let mut records = match value.get("records").and_then(Value::as_array) {
+        Some(records) => records
+            .iter()
+            .map(dataset_index_record_from_json)
+            .collect::<Result<Vec<_>>>()?,
+        None => Vec::new(),
+    };
+    sort_index_records(&mut records);
+    Ok(Some(records))
+}
+
+fn build_dataset_index(files: &[PathBuf]) -> Result<Vec<FeatureRecordMetadata>> {
+    let mut records = Vec::new();
+    for path in files {
+        let mut current = CurrentManifestFile::open(path.clone())?;
+        loop {
+            let mut line = String::new();
+            let byte_offset = current
+                .reader
+                .stream_position()
+                .with_context(|| format!("failed to seek {}", current.path.display()))?;
+            let bytes = current
+                .reader
+                .read_line(&mut line)
+                .with_context(|| format!("failed reading {}", current.path.display()))?;
+            if bytes == 0 {
+                break;
+            }
+            current.line_number += 1;
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let raw = RawManifestLine {
+                manifest_path: current.path.clone(),
+                base_dir: current.base_dir.clone(),
+                byte_offset,
+                line_number: current.line_number,
+                line: line.to_string(),
+            };
+            records.push(raw.parse_metadata()?);
+        }
+    }
+    sort_index_records(&mut records);
+    Ok(records)
+}
+
+fn write_dataset_index(
+    files: &[PathBuf],
+    index_path: &Path,
+    records: &[FeatureRecordMetadata],
+) -> Result<()> {
+    if let Some(parent) = index_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create dataset index dir {}", parent.display()))?;
+    }
+    let files = files
+        .iter()
+        .map(|path| {
+            let (len, modified_ms) = file_signature(path)?;
+            Ok(json!({
+                "path": path,
+                "len": len,
+                "modified_ms": modified_ms,
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let records = records
+        .iter()
+        .map(|record| {
+            json!({
+                "manifest_path": record.manifest_path,
+                "base_dir": record.base_dir,
+                "byte_offset": record.byte_offset,
+                "line_number": record.line_number,
+                "id": record.id,
+                "rows": record.rows,
+            })
+        })
+        .collect::<Vec<_>>();
+    fs::write(
+        index_path,
+        serde_json::to_string_pretty(&json!({
+            "version": 1,
+            "files": files,
+            "records": records,
+        }))?,
+    )
+    .with_context(|| format!("failed to write dataset index {}", index_path.display()))
+}
+
+fn dataset_index_record_from_json(value: &Value) -> Result<FeatureRecordMetadata> {
+    Ok(FeatureRecordMetadata {
+        manifest_path: json_path(value, "manifest_path")
+            .context("dataset index record missing manifest_path")?,
+        base_dir: json_path(value, "base_dir").context("dataset index record missing base_dir")?,
+        byte_offset: value
+            .get("byte_offset")
+            .and_then(Value::as_u64)
+            .context("dataset index record missing byte_offset")?,
+        line_number: json_usize(value, "line_number")
+            .context("dataset index record missing line_number")?,
+        id: value
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        rows: json_usize(value, "rows").context("dataset index record missing rows")?,
+    })
+}
+
+fn sort_index_records(records: &mut [FeatureRecordMetadata]) {
+    records.sort_by(|left, right| {
+        right
+            .rows
+            .cmp(&left.rows)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+}
+
+fn file_signature(path: &Path) -> Result<(u64, u64)> {
+    let metadata =
+        fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    let modified_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    Ok((metadata.len(), modified_ms))
 }
 
 fn adaptive_cost<'a>(
@@ -3751,6 +3985,9 @@ fn validate_config(config: &BurnTrainConfig) -> Result<()> {
     if config.sort_by_length_desc && config.sort_buffer_size == 0 {
         bail!("sort_buffer_size must be > 0 when length sorting is enabled");
     }
+    if config.dataset_index_dir.is_some() && !config.sort_by_length_desc {
+        bail!("dataset_index_dir requires sort_by_length_desc so cached row metadata is used");
+    }
     if config.epochs == 0 {
         bail!("epochs must be > 0");
     }
@@ -3936,6 +4173,7 @@ fn run_config_json(config: &BurnTrainConfig) -> Value {
         "adaptive_batch": adaptive_batch_json(config),
         "sort_by_length_desc": config.sort_by_length_desc,
         "sort_buffer_size": config.sort_buffer_size,
+        "dataset_index_dir": config.dataset_index_dir,
         "epochs": config.epochs,
         "learning_rate": config.learning_rate,
         "lr_warmup_steps": config.lr_warmup_steps,
@@ -4059,6 +4297,7 @@ fn train_config_from_json(value: &Value) -> Result<BurnTrainConfig> {
         json_bool(value, "sort_by_length_desc").unwrap_or(config.sort_by_length_desc);
     config.sort_buffer_size =
         json_usize(value, "sort_buffer_size").unwrap_or(config.sort_buffer_size);
+    config.dataset_index_dir = json_path(value, "dataset_index_dir");
     config.epochs = json_usize(value, "epochs").unwrap_or(config.epochs);
     config.learning_rate = json_f64(value, "learning_rate").unwrap_or(config.learning_rate);
     config.lr_warmup_steps = json_usize(value, "lr_warmup_steps").unwrap_or(config.lr_warmup_steps);
@@ -4788,6 +5027,7 @@ mod tests {
             2,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -4819,13 +5059,73 @@ mod tests {
         )
         .unwrap();
 
-        let mut loader =
-            StreamingBatchLoader::new(dir.join("train.jsonl"), 3, None, true, 3, 2, None, None)
-                .unwrap();
+        let mut loader = StreamingBatchLoader::new(
+            dir.join("train.jsonl"),
+            3,
+            None,
+            true,
+            3,
+            2,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         let batch = loader.next_batch().unwrap().unwrap();
 
         assert_eq!(batch.feature_lengths, vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn streaming_loader_writes_and_reads_dataset_index_cache() {
+        let dir = std::env::temp_dir().join(format!(
+            "w2v_bert_uk_dataset_index_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("train.jsonl"),
+            [
+                r#"{"id":"short","features":[[0.1,0.2]],"tokens":[1]}"#,
+                r#"{"id":"long","features":[[0.1,0.2],[0.3,0.4],[0.5,0.6]],"tokens":[1]}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let index_path = dir.join("index").join("train.index.json");
+
+        let mut first_loader = StreamingBatchLoader::new(
+            dir.join("train.jsonl"),
+            2,
+            None,
+            true,
+            2,
+            2,
+            None,
+            None,
+            Some(index_path.clone()),
+        )
+        .unwrap();
+        let first = first_loader.next_batch().unwrap().unwrap();
+        assert_eq!(first.ids, vec!["long", "short"]);
+        assert!(index_path.exists());
+
+        let mut second_loader = StreamingBatchLoader::new(
+            dir.join("train.jsonl"),
+            2,
+            None,
+            true,
+            2,
+            2,
+            None,
+            None,
+            Some(index_path),
+        )
+        .unwrap();
+        let second = second_loader.next_batch().unwrap().unwrap();
+        assert_eq!(second.ids, vec!["long", "short"]);
     }
 
     fn mono_pcm_wav_bytes(sample_rate: u32, samples: &[i16]) -> Vec<u8> {
