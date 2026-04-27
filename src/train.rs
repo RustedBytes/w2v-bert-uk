@@ -2038,6 +2038,7 @@ where
     let mut count = 0usize;
     let mut metrics = ValidationMetrics::default();
     let mut sample_predictions = Vec::new();
+    let eval_model = model.clone().no_grad();
     let val_manifest = config
         .val_manifest
         .as_ref()
@@ -2058,7 +2059,7 @@ where
     )?;
     while let Some(batch) = batches.next_batch()? {
         let (logits_or_log_probs, output_lengths) =
-            ctc_logits_for_batch::<B, M>(model, &batch, device);
+            ctc_logits_for_batch::<B, M>(&eval_model, &batch, device);
         let loss = ctc_loss_from_logits(
             logits_or_log_probs.clone(),
             output_lengths.clone(),
@@ -2429,6 +2430,7 @@ where
     let mut count = 0usize;
     let mut metrics = ValidationMetrics::default();
     let mut sample_predictions = Vec::new();
+    let eval_model = model.clone().no_grad();
     let val_manifest = config
         .val_manifest
         .as_ref()
@@ -2448,11 +2450,19 @@ where
         feature_extractor_for_architecture(config),
     )?;
     while let Some(batch) = batches.next_batch()? {
-        let output = paraformer_loss_for_batch(model, &batch, config, device, false);
-        total += f64::from(scalar_value(output.loss)?);
+        let features = batch_features_tensor::<B>(&batch, device);
+        let output = eval_model.forward(features, batch.feature_lengths.clone());
+        let loss = ctc_loss_from_log_probs(
+            output.ctc_log_probs.clone(),
+            output.encoder_lengths.clone(),
+            &batch,
+            config.blank_id,
+            device,
+        );
+        total += f64::from(scalar_value(loss)?);
         let predictions = decode_validation_batch(
-            output.output.ctc_log_probs,
-            &output.output.encoder_lengths,
+            output.ctc_log_probs,
+            &output.encoder_lengths,
             config.blank_id,
             decoder,
         )?;
@@ -2833,6 +2843,7 @@ where
     let mut count = 0usize;
     let mut metrics = ValidationMetrics::default();
     let mut sample_predictions = Vec::new();
+    let eval_model = model.clone().no_grad();
     let val_manifest = config
         .val_manifest
         .as_ref()
@@ -2852,14 +2863,19 @@ where
         feature_extractor_for_architecture(config),
     )?;
     while let Some(batch) = batches.next_batch()? {
-        let output = enhanced_paraformer_loss_for_batch(model, &batch, config, device, false);
-        total += f64::from(scalar_value(output.loss)?);
-        let predictions = decode_validation_batch(
-            output.output.ctc_log_probs,
-            &output.output.encoder_lengths,
+        let features = batch_features_tensor::<B>(&batch, device);
+        let (ctc_log_probs, encoder_lengths) =
+            eval_model.ctc_log_probs(features, batch.feature_lengths.clone());
+        let loss = ctc_loss_from_log_probs(
+            ctc_log_probs.clone(),
+            encoder_lengths.clone(),
+            &batch,
             config.blank_id,
-            decoder,
-        )?;
+            device,
+        );
+        total += f64::from(scalar_value(loss)?);
+        let predictions =
+            decode_validation_batch(ctc_log_probs, &encoder_lengths, config.blank_id, decoder)?;
         metrics.update(&batch, &predictions, decoder);
         collect_validation_sample_predictions(
             &mut sample_predictions,
@@ -3044,6 +3060,32 @@ fn ctc_loss_from_logits<B: AutodiffBackend>(
     device: &B::Device,
 ) -> Tensor<B, 1> {
     let log_probs = log_softmax(logits_or_log_probs, 2).swap_dims(0, 1);
+    ctc_loss_from_time_major_log_probs(log_probs, output_lengths, batch, blank_id, device)
+}
+
+fn ctc_loss_from_log_probs<B: AutodiffBackend>(
+    log_probs: Tensor<B, 3>,
+    output_lengths: Vec<usize>,
+    batch: &TrainBatch,
+    blank_id: usize,
+    device: &B::Device,
+) -> Tensor<B, 1> {
+    ctc_loss_from_time_major_log_probs(
+        log_probs.swap_dims(0, 1),
+        output_lengths,
+        batch,
+        blank_id,
+        device,
+    )
+}
+
+fn ctc_loss_from_time_major_log_probs<B: AutodiffBackend>(
+    log_probs: Tensor<B, 3>,
+    output_lengths: Vec<usize>,
+    batch: &TrainBatch,
+    blank_id: usize,
+    device: &B::Device,
+) -> Tensor<B, 1> {
     let targets = Tensor::<B, 2, Int>::from_data(
         TensorData::new(
             batch.targets.clone(),
