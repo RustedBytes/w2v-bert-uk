@@ -64,8 +64,11 @@ struct RunArgs {
     #[arg(long)]
     manifest_dir: Option<PathBuf>,
 
-    /// Optional validation manifest, JSONL or TSV.
-    #[arg(long)]
+    /// Optional validation manifest/set: file or folder with JSONL, TSV, Parquet, or audio records.
+    #[arg(
+        long,
+        visible_aliases = ["validation-manifest", "valid-manifest", "validation-set", "val-set"]
+    )]
     val_manifest: Option<PathBuf>,
 
     /// Output directory for run metadata and checkpoints.

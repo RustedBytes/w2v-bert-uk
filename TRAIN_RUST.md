@@ -278,6 +278,7 @@ frontend. For Parquet feature rows, the features are used directly.
 | --- | --- | --- |
 | `--vocab-size <N>` | Yes | Vocabulary size including the blank token. |
 | `--train-manifest <PATH>` | Yes, unless `--manifest-dir` | File, folder, Parquet folder, or raw-audio folder. |
+| `--val-manifest <PATH>` | No | Validation file or folder. Aliases: `--validation-manifest`, `--valid-manifest`, `--validation-set`, `--val-set`. |
 | `--manifest-dir <DIR>` | Alternative | Directory containing `train.jsonl` and optional validation manifest. |
 | `--input-dim <N>` | Usually | Feature dimension. Use `80` for Squeezeformer/Zipformer/Paraformer audio extraction, `160` for W2V-BERT. |
 
@@ -451,6 +452,7 @@ Resume validates model-shape and training-critical config before loading.
 ```bash
 RUST_LOG=info CUDA_VISIBLE_DEVICES=0,1 cargo run --release --features burn-cuda-backend --bin train -- \
   --train-manifest testdata \
+  --validation-manifest testdata/validation \
   --architecture squeezeformer \
   --variant xs \
   --backend cuda \
@@ -469,6 +471,8 @@ RUST_LOG=info CUDA_VISIBLE_DEVICES=0,1 cargo run --release --features burn-cuda-
   --spec-freq-masks 2 \
   --spec-freq-mask-max-bins 12 \
   --epochs 20 \
+  --validate-every-steps 500 \
+  --max-val-samples 2048 \
   --learning-rate 0.001 \
   --lr-warmup-steps 1000 \
   --lr-decay-steps 20000 \
