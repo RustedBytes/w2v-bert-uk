@@ -132,6 +132,34 @@ struct Args {
     #[arg(long)]
     tokenizer: Option<PathBuf>,
 
+    /// Validation CTC beam width. Use 1 for greedy decoding.
+    #[arg(long, default_value_t = 1)]
+    val_beam_width: usize,
+
+    /// Number of validation CTC hypotheses to keep before optional LM reranking.
+    #[arg(long)]
+    val_n_best: Option<usize>,
+
+    /// Optional KenLM model path for validation CTC N-best reranking.
+    #[arg(long)]
+    val_lm_path: Option<PathBuf>,
+
+    /// KenLM shallow-fusion weight for validation decoding.
+    #[arg(long, default_value_t = 0.45)]
+    val_lm_weight: f32,
+
+    /// Word insertion bonus for validation LM reranking.
+    #[arg(long, default_value_t = 0.0)]
+    val_lm_word_bonus: f32,
+
+    /// Score validation LM candidates without beginning-of-sentence context.
+    #[arg(long)]
+    val_lm_no_bos: bool,
+
+    /// Score validation LM candidates without end-of-sentence context.
+    #[arg(long)]
+    val_lm_no_eos: bool,
+
     /// Run forward/loss only and skip optimizer updates.
     #[arg(long)]
     dry_run: bool,
@@ -210,6 +238,13 @@ fn main() -> Result<()> {
         max_train_samples: args.max_train_samples,
         max_val_samples: args.max_val_samples,
         tokenizer_path: args.tokenizer,
+        val_beam_width: args.val_beam_width,
+        val_n_best: args.val_n_best.unwrap_or(args.val_beam_width),
+        val_lm_path: args.val_lm_path,
+        val_lm_weight: args.val_lm_weight,
+        val_lm_word_bonus: args.val_lm_word_bonus,
+        val_lm_bos: !args.val_lm_no_bos,
+        val_lm_eos: !args.val_lm_no_eos,
         dry_run: args.dry_run,
         paraformer_alignment_mode: match args.paraformer_alignment_mode {
             ParaformerAlignmentArg::Viterbi => ParaformerAlignmentMode::Viterbi,

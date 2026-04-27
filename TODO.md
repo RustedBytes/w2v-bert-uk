@@ -62,8 +62,8 @@
 - [x] Add Squeezeformer greedy CTC transcription helper.
 - [x] Add validation decoding for all architectures.
 - [x] Add CER/WER metrics.
-- [ ] Add beam search decoding.
-- [ ] Add optional language-model decoding.
+- [x] Add beam search decoding.
+- [x] Add optional language-model decoding.
 - [ ] Add sample prediction logging.
 - [ ] Add inference/export entrypoints for all architectures.
 

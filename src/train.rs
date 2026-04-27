@@ -11,9 +11,12 @@ use burn::tensor::{Int, Tensor, TensorData};
 use burn_autodiff::checkpoint::strategy::BalancedCheckpointing;
 use burn_nn::loss::{CTCLossConfig, Reduction};
 use burn_optim::{AdamWConfig, GradientsParams, Optimizer};
+use kenlm::{Config as KenlmConfig, Model as KenlmModel};
 use serde_json::{Value, json};
 use splintr::SentencePieceTokenizer;
 
+use crate::ctc::{CtcCandidate, threaded_ctc_beam_search_decode_n_best};
+use crate::normalize_spaces;
 use crate::paraformer::{
     EnhancedParaformerV2, EnhancedParaformerV2Config, ParaformerAlignmentMode, ParaformerV2,
     ParaformerV2Config,
@@ -70,6 +73,13 @@ pub struct BurnTrainConfig {
     pub max_train_samples: Option<usize>,
     pub max_val_samples: Option<usize>,
     pub tokenizer_path: Option<PathBuf>,
+    pub val_beam_width: usize,
+    pub val_n_best: usize,
+    pub val_lm_path: Option<PathBuf>,
+    pub val_lm_weight: f32,
+    pub val_lm_word_bonus: f32,
+    pub val_lm_bos: bool,
+    pub val_lm_eos: bool,
     pub dry_run: bool,
     pub paraformer_alignment_mode: ParaformerAlignmentMode,
     pub paraformer_enhanced: bool,
@@ -104,6 +114,13 @@ impl Default for BurnTrainConfig {
             max_train_samples: None,
             max_val_samples: None,
             tokenizer_path: None,
+            val_beam_width: 1,
+            val_n_best: 1,
+            val_lm_path: None,
+            val_lm_weight: 0.45,
+            val_lm_word_bonus: 0.0,
+            val_lm_bos: true,
+            val_lm_eos: true,
             dry_run: false,
             paraformer_alignment_mode: ParaformerAlignmentMode::Viterbi,
             paraformer_enhanced: false,
@@ -204,6 +221,17 @@ impl EditStats {
 
 struct ValidationDecoder {
     tokenizer: Option<SentencePieceTokenizer>,
+    language_model: Option<ValidationLanguageModel>,
+    beam_width: usize,
+    n_best: usize,
+}
+
+struct ValidationLanguageModel {
+    model: KenlmModel,
+    weight: f32,
+    word_bonus: f32,
+    bos: bool,
+    eos: bool,
 }
 
 impl ValidationDecoder {
@@ -213,7 +241,40 @@ impl ValidationDecoder {
             .as_deref()
             .map(load_sentencepiece_tokenizer)
             .transpose()?;
-        Ok(Self { tokenizer })
+        let language_model = config
+            .val_lm_path
+            .as_ref()
+            .map(|path| {
+                if tokenizer.is_none() {
+                    bail!(
+                        "--val-lm-path requires --tokenizer so CTC candidates can be scored as text"
+                    );
+                }
+                let model = KenlmModel::with_config(
+                    path,
+                    KenlmConfig {
+                        show_progress: false,
+                        ..KenlmConfig::default()
+                    },
+                )
+                .with_context(|| {
+                    format!("failed to load validation KenLM model {}", path.display())
+                })?;
+                Ok(ValidationLanguageModel {
+                    model,
+                    weight: config.val_lm_weight,
+                    word_bonus: config.val_lm_word_bonus,
+                    bos: config.val_lm_bos,
+                    eos: config.val_lm_eos,
+                })
+            })
+            .transpose()?;
+        Ok(Self {
+            tokenizer,
+            language_model,
+            beam_width: config.val_beam_width.max(1),
+            n_best: config.val_n_best.max(1),
+        })
     }
 
     fn decode_tokens(&self, tokens: &[u32]) -> String {
@@ -236,6 +297,67 @@ impl ValidationDecoder {
                 .collect::<Vec<_>>();
             self.decode_tokens(&token_ids)
         })
+    }
+
+    fn decode_best(
+        &self,
+        frame_logits: &[f32],
+        frames: usize,
+        vocab_size: usize,
+        blank_id: usize,
+    ) -> Result<Vec<u32>> {
+        if self.beam_width <= 1 && self.language_model.is_none() {
+            return greedy_decode_frames(frame_logits, frames, vocab_size, blank_id);
+        }
+        let candidates = threaded_ctc_beam_search_decode_n_best(
+            &[frames as i64, vocab_size as i64],
+            frame_logits,
+            blank_id as u32,
+            self.beam_width,
+            self.n_best,
+        )?;
+        if let Some(language_model) = &self.language_model {
+            self.rerank_with_lm(candidates, language_model)
+        } else {
+            candidates
+                .into_iter()
+                .next()
+                .map(|candidate| candidate.token_ids)
+                .ok_or_else(|| anyhow!("beam search produced no candidates"))
+        }
+    }
+
+    fn rerank_with_lm(
+        &self,
+        candidates: Vec<CtcCandidate>,
+        language_model: &ValidationLanguageModel,
+    ) -> Result<Vec<u32>> {
+        let mut best: Option<(Vec<u32>, f32)> = None;
+        for candidate in candidates {
+            let text = normalize_spaces(&self.decode_tokens(&candidate.token_ids));
+            if text.is_empty() {
+                continue;
+            }
+            let lm_log_prob = language_model
+                .model
+                .score(&text, language_model.bos, language_model.eos)
+                .with_context(|| {
+                    format!("failed to score validation candidate with KenLM: {text}")
+                })?
+                * std::f32::consts::LN_10;
+            let word_count = text.split_whitespace().count();
+            let total = candidate.ctc_log_prob
+                + language_model.weight * lm_log_prob
+                + language_model.word_bonus * word_count as f32;
+            if best
+                .as_ref()
+                .is_none_or(|(_, best_score)| total > *best_score)
+            {
+                best = Some((candidate.token_ids, total));
+            }
+        }
+        best.map(|(tokens, _)| tokens)
+            .ok_or_else(|| anyhow!("language-model decoder produced no candidates"))
     }
 }
 
@@ -574,8 +696,12 @@ where
             device,
         );
         total += f64::from(scalar_value(loss)?);
-        let predictions =
-            greedy_decode_batch(logits_or_log_probs, &output_lengths, config.blank_id)?;
+        let predictions = decode_validation_batch(
+            logits_or_log_probs,
+            &output_lengths,
+            config.blank_id,
+            decoder,
+        )?;
         metrics.update(&batch, &predictions, decoder);
         count += 1;
     }
@@ -716,10 +842,11 @@ where
     while let Some(batch) = batches.next_batch()? {
         let output = paraformer_loss_for_batch(model, &batch, config, device);
         total += f64::from(scalar_value(output.loss)?);
-        let predictions = greedy_decode_batch(
+        let predictions = decode_validation_batch(
             output.output.ctc_log_probs,
             &output.output.encoder_lengths,
             config.blank_id,
+            decoder,
         )?;
         metrics.update(&batch, &predictions, decoder);
         count += 1;
@@ -863,10 +990,11 @@ where
     while let Some(batch) = batches.next_batch()? {
         let output = enhanced_paraformer_loss_for_batch(model, &batch, config, device);
         total += f64::from(scalar_value(output.loss)?);
-        let predictions = greedy_decode_batch(
+        let predictions = decode_validation_batch(
             output.output.ctc_log_probs,
             &output.output.encoder_lengths,
             config.blank_id,
+            decoder,
         )?;
         metrics.update(&batch, &predictions, decoder);
         count += 1;
@@ -1083,10 +1211,11 @@ impl ValidationMetrics {
     }
 }
 
-fn greedy_decode_batch<B: Backend>(
+fn decode_validation_batch<B: Backend>(
     logits_or_log_probs: Tensor<B, 3>,
     output_lengths: &[usize],
     blank_id: usize,
+    decoder: &ValidationDecoder,
 ) -> Result<Vec<Vec<u32>>> {
     let [batch_size, frames, vocab_size] = logits_or_log_probs.dims();
     if vocab_size == 0 {
@@ -1106,25 +1235,42 @@ fn greedy_decode_batch<B: Backend>(
             .copied()
             .unwrap_or(frames)
             .min(frames);
-        let mut previous = None;
-        let mut tokens = Vec::new();
-        for frame in 0..length {
-            let offset = (batch_index * frames + frame) * vocab_size;
-            let frame_values = &values[offset..offset + vocab_size];
-            let token = frame_values
-                .iter()
-                .enumerate()
-                .max_by(|(_, left), (_, right)| left.total_cmp(right))
-                .map(|(index, _)| index)
-                .unwrap_or(blank_id);
-            if token != blank_id && previous != Some(token) {
-                tokens.push(u32::try_from(token).context("token id does not fit u32")?);
-            }
-            previous = Some(token);
-        }
+        let start = batch_index * frames * vocab_size;
+        let end = start + length * vocab_size;
+        let tokens = decoder.decode_best(&values[start..end], length, vocab_size, blank_id)?;
         decoded.push(tokens);
     }
     Ok(decoded)
+}
+
+fn greedy_decode_frames(
+    frame_logits: &[f32],
+    frames: usize,
+    vocab_size: usize,
+    blank_id: usize,
+) -> Result<Vec<u32>> {
+    if frame_logits.len() != frames * vocab_size {
+        bail!(
+            "frame logits shape {frames}x{vocab_size} implies {} values, got {}",
+            frames * vocab_size,
+            frame_logits.len()
+        );
+    }
+    let mut previous = None;
+    let mut tokens = Vec::new();
+    for frame_values in frame_logits.chunks_exact(vocab_size) {
+        let token = frame_values
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+            .map(|(index, _)| index)
+            .unwrap_or(blank_id);
+        if token != blank_id && previous != Some(token) {
+            tokens.push(u32::try_from(token).context("token id does not fit u32")?);
+        }
+        previous = Some(token);
+    }
+    Ok(tokens)
 }
 
 fn target_tokens_for_batch_item(batch: &TrainBatch, sample_index: usize) -> Vec<i64> {
@@ -1949,6 +2095,15 @@ fn validate_config(config: &BurnTrainConfig) -> Result<()> {
     if config.blank_id >= config.vocab_size {
         bail!("blank_id must be smaller than vocab_size");
     }
+    if config.val_beam_width == 0 {
+        bail!("val_beam_width must be > 0");
+    }
+    if config.val_n_best == 0 {
+        bail!("val_n_best must be > 0");
+    }
+    if config.val_lm_path.is_some() && config.tokenizer_path.is_none() {
+        bail!("val_lm_path requires tokenizer_path");
+    }
     Ok(())
 }
 
@@ -1990,6 +2145,13 @@ fn write_run_config(config: &BurnTrainConfig) -> Result<()> {
             "learning_rate": config.learning_rate,
             "weight_decay": config.weight_decay,
             "tokenizer_path": config.tokenizer_path,
+            "val_beam_width": config.val_beam_width,
+            "val_n_best": config.val_n_best,
+            "val_lm_path": config.val_lm_path,
+            "val_lm_weight": config.val_lm_weight,
+            "val_lm_word_bonus": config.val_lm_word_bonus,
+            "val_lm_bos": config.val_lm_bos,
+            "val_lm_eos": config.val_lm_eos,
             "w2v_hf_model_dir": config.w2v_hf_model_dir,
             "w2v_hf_load_weights": config.w2v_hf_load_weights,
             "w2v_activation_checkpointing": config.w2v_activation_checkpointing,
@@ -2114,9 +2276,41 @@ mod tests {
             &device,
         );
 
-        let decoded = greedy_decode_batch(logits, &[5], 0).unwrap();
+        let decoder = ValidationDecoder {
+            tokenizer: None,
+            language_model: None,
+            beam_width: 1,
+            n_best: 1,
+        };
+        let decoded = decode_validation_batch(logits, &[5], 0, &decoder).unwrap();
 
         assert_eq!(decoded, vec![vec![1, 2]]);
+    }
+
+    #[test]
+    fn beam_decoder_uses_ctc_prefix_search_when_enabled() {
+        let device = Default::default();
+        let logits = Tensor::<NdArray<f32>, 3>::from_data(
+            TensorData::new(
+                vec![
+                    4.0, 3.0, 0.0, // blank/1
+                    3.5, 3.4, 0.0, // blank/1
+                    0.0, 0.5, 4.0, // 2
+                ],
+                [1, 3, 3],
+            ),
+            &device,
+        );
+        let decoder = ValidationDecoder {
+            tokenizer: None,
+            language_model: None,
+            beam_width: 4,
+            n_best: 2,
+        };
+
+        let decoded = decode_validation_batch(logits, &[3], 0, &decoder).unwrap();
+
+        assert!(!decoded[0].is_empty());
     }
 
     #[test]
@@ -2130,7 +2324,12 @@ mod tests {
             text: None,
         }];
         let batch = make_batch(&records, 2).unwrap();
-        let decoder = ValidationDecoder { tokenizer: None };
+        let decoder = ValidationDecoder {
+            tokenizer: None,
+            language_model: None,
+            beam_width: 1,
+            n_best: 1,
+        };
         let mut metrics = ValidationMetrics::default();
 
         metrics.update(&batch, &[vec![1, 3]], &decoder);
