@@ -1,8 +1,6 @@
 use burn::module::{Initializer, Module, Param};
 #[cfg(feature = "asr-cubecl-kernels")]
 use burn::tensor::Int;
-#[cfg(feature = "asr-cubecl-kernels")]
-use burn::tensor::TensorPrimitive;
 use burn::tensor::activation::{sigmoid, silu, softmax, tanh};
 #[cfg(feature = "asr-cubecl-kernels")]
 use burn::tensor::backend::AutodiffBackend;
@@ -66,33 +64,6 @@ impl<C> ZipformerKernelBackend for burn_autodiff::Autodiff<burn_ndarray::NdArray
 }
 
 #[cfg(feature = "asr-cubecl-kernels")]
-fn autodiff_to_inner<B, C, const D: usize>(
-    tensor: Tensor<burn_autodiff::Autodiff<B, C>, D>,
-) -> Tensor<B, D>
-where
-    B: Backend,
-    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
-{
-    let tensor =
-        <burn_autodiff::Autodiff<B, C> as AutodiffBackend>::inner(tensor.into_primitive().tensor());
-    Tensor::from_primitive(TensorPrimitive::Float(tensor))
-}
-
-#[cfg(feature = "asr-cubecl-kernels")]
-fn inner_to_autodiff<B, C, const D: usize>(
-    tensor: Tensor<B, D>,
-) -> Tensor<burn_autodiff::Autodiff<B, C>, D>
-where
-    B: Backend,
-    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
-{
-    let tensor = <burn_autodiff::Autodiff<B, C> as AutodiffBackend>::from_inner(
-        tensor.into_primitive().tensor(),
-    );
-    Tensor::from_primitive(TensorPrimitive::Float(tensor))
-}
-
-#[cfg(feature = "asr-cubecl-kernels")]
 fn inner_bool_to_autodiff<B, C, const D: usize>(
     tensor: Tensor<B, D, Bool>,
 ) -> Tensor<burn_autodiff::Autodiff<B, C>, D, Bool>
@@ -104,18 +75,6 @@ where
         tensor.into_primitive(),
     );
     Tensor::from_primitive(tensor)
-}
-
-#[cfg(feature = "asr-cubecl-kernels")]
-fn attach_autodiff_gradient<B, C, const D: usize>(
-    raw: Tensor<burn_autodiff::Autodiff<B, C>, D>,
-    portable: Tensor<burn_autodiff::Autodiff<B, C>, D>,
-) -> Tensor<burn_autodiff::Autodiff<B, C>, D>
-where
-    B: Backend,
-    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
-{
-    raw + portable.clone() - portable.detach()
 }
 
 #[cfg(all(feature = "asr-cubecl-kernels", feature = "burn-cuda-backend"))]
@@ -176,9 +135,7 @@ where
     C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
 {
     fn relative_shift(input: Tensor<Self, 4>, seq_len: usize) -> Tensor<Self, 4> {
-        let portable = relative_shift_fallback(input.clone(), seq_len);
-        let raw = crate::cubecl_kernels::relative_shift(autodiff_to_inner(input), seq_len);
-        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+        crate::asr_autodiff_kernels::relative_shift(input, seq_len)
     }
 
     fn mask_time(input: Tensor<Self, 3>, lengths: &[usize]) -> Tensor<Self, 3> {
@@ -194,9 +151,7 @@ where
     }
 
     fn glu_last_dim(input: Tensor<Self, 3>) -> Tensor<Self, 3> {
-        let portable = glu_last_dim_fallback(input.clone());
-        let raw = crate::cubecl_kernels::glu_last_dim(autodiff_to_inner(input));
-        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+        crate::asr_autodiff_kernels::glu_last_dim(input)
     }
 
     fn attention_mask_4d(
@@ -218,18 +173,7 @@ where
         lengths: &[usize],
         weights: Tensor<Self, 1>,
     ) -> (Tensor<Self, 3>, Vec<usize>) {
-        let (portable, output_lengths) =
-            pairwise_downsample_fallback(input.clone(), lengths, weights.clone());
-        let input_inner = autodiff_to_inner(input);
-        let length_tensor = lengths_tensor::<burn_cuda::Cuda<F, I>>(lengths, &input_inner.device());
-        let weights_inner = autodiff_to_inner(weights);
-        let raw =
-            crate::cubecl_kernels::pairwise_downsample(input_inner, length_tensor, weights_inner);
-        let raw = crate::cubecl_kernels::mask_time(raw, &output_lengths);
-        (
-            attach_autodiff_gradient(inner_to_autodiff(raw), portable),
-            output_lengths,
-        )
+        crate::asr_autodiff_kernels::pairwise_downsample(input, lengths, weights)
     }
 }
 
@@ -293,9 +237,7 @@ where
     C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
 {
     fn relative_shift(input: Tensor<Self, 4>, seq_len: usize) -> Tensor<Self, 4> {
-        let portable = relative_shift_fallback(input.clone(), seq_len);
-        let raw = crate::cubecl_kernels::relative_shift(autodiff_to_inner(input), seq_len);
-        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+        crate::asr_autodiff_kernels::relative_shift(input, seq_len)
     }
 
     fn mask_time(input: Tensor<Self, 3>, lengths: &[usize]) -> Tensor<Self, 3> {
@@ -311,9 +253,7 @@ where
     }
 
     fn glu_last_dim(input: Tensor<Self, 3>) -> Tensor<Self, 3> {
-        let portable = glu_last_dim_fallback(input.clone());
-        let raw = crate::cubecl_kernels::glu_last_dim(autodiff_to_inner(input));
-        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+        crate::asr_autodiff_kernels::glu_last_dim(input)
     }
 
     fn attention_mask_4d(
@@ -335,19 +275,7 @@ where
         lengths: &[usize],
         weights: Tensor<Self, 1>,
     ) -> (Tensor<Self, 3>, Vec<usize>) {
-        let (portable, output_lengths) =
-            pairwise_downsample_fallback(input.clone(), lengths, weights.clone());
-        let input_inner = autodiff_to_inner(input);
-        let length_tensor =
-            lengths_tensor::<burn_wgpu::Wgpu<F, I, BT>>(lengths, &input_inner.device());
-        let weights_inner = autodiff_to_inner(weights);
-        let raw =
-            crate::cubecl_kernels::pairwise_downsample(input_inner, length_tensor, weights_inner);
-        let raw = crate::cubecl_kernels::mask_time(raw, &output_lengths);
-        (
-            attach_autodiff_gradient(inner_to_autodiff(raw), portable),
-            output_lengths,
-        )
+        crate::asr_autodiff_kernels::pairwise_downsample(input, lengths, weights)
     }
 }
 

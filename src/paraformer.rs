@@ -1,6 +1,4 @@
 use burn::module::Module;
-#[cfg(feature = "asr-cubecl-kernels")]
-use burn::tensor::TensorPrimitive;
 use burn::tensor::activation::{log_softmax, relu, sigmoid, silu, softmax};
 #[cfg(feature = "asr-cubecl-kernels")]
 use burn::tensor::backend::AutodiffBackend;
@@ -45,33 +43,6 @@ impl<C> ParaformerKernelBackend for burn_autodiff::Autodiff<burn_ndarray::NdArra
 }
 
 #[cfg(feature = "asr-cubecl-kernels")]
-fn autodiff_to_inner<B, C, const D: usize>(
-    tensor: Tensor<burn_autodiff::Autodiff<B, C>, D>,
-) -> Tensor<B, D>
-where
-    B: Backend,
-    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
-{
-    let tensor =
-        <burn_autodiff::Autodiff<B, C> as AutodiffBackend>::inner(tensor.into_primitive().tensor());
-    Tensor::from_primitive(TensorPrimitive::Float(tensor))
-}
-
-#[cfg(feature = "asr-cubecl-kernels")]
-fn inner_to_autodiff<B, C, const D: usize>(
-    tensor: Tensor<B, D>,
-) -> Tensor<burn_autodiff::Autodiff<B, C>, D>
-where
-    B: Backend,
-    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
-{
-    let tensor = <burn_autodiff::Autodiff<B, C> as AutodiffBackend>::from_inner(
-        tensor.into_primitive().tensor(),
-    );
-    Tensor::from_primitive(TensorPrimitive::Float(tensor))
-}
-
-#[cfg(feature = "asr-cubecl-kernels")]
 fn inner_bool_to_autodiff<B, C, const D: usize>(
     tensor: Tensor<B, D, Bool>,
 ) -> Tensor<burn_autodiff::Autodiff<B, C>, D, Bool>
@@ -83,18 +54,6 @@ where
         tensor.into_primitive(),
     );
     Tensor::from_primitive(tensor)
-}
-
-#[cfg(feature = "asr-cubecl-kernels")]
-fn attach_autodiff_gradient<B, C, const D: usize>(
-    raw: Tensor<burn_autodiff::Autodiff<B, C>, D>,
-    portable: Tensor<burn_autodiff::Autodiff<B, C>, D>,
-) -> Tensor<burn_autodiff::Autodiff<B, C>, D>
-where
-    B: Backend,
-    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
-{
-    raw + portable.clone() - portable.detach()
 }
 
 #[cfg(all(feature = "asr-cubecl-kernels", feature = "burn-cuda-backend"))]
@@ -149,9 +108,7 @@ where
     }
 
     fn glu_channel_dim(input: Tensor<Self, 3>) -> Tensor<Self, 3> {
-        let portable = glu_channel_dim_fallback(input.clone());
-        let raw = crate::cubecl_kernels::glu_channel_dim(autodiff_to_inner(input));
-        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+        crate::asr_autodiff_kernels::glu_channel_dim(input)
     }
 }
 
@@ -209,9 +166,7 @@ where
     }
 
     fn glu_channel_dim(input: Tensor<Self, 3>) -> Tensor<Self, 3> {
-        let portable = glu_channel_dim_fallback(input.clone());
-        let raw = crate::cubecl_kernels::glu_channel_dim(autodiff_to_inner(input));
-        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+        crate::asr_autodiff_kernels::glu_channel_dim(input)
     }
 }
 
