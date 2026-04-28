@@ -1008,6 +1008,8 @@ fn run_burn_training_inner<InnerBackend>(
 ) -> Result<TrainSummary>
 where
     InnerBackend: Backend + ZipformerKernelBackend,
+    burn_autodiff::Autodiff<InnerBackend>:
+        Backend<Device = InnerBackend::Device> + ZipformerKernelBackend,
 {
     type TrainBackend<InnerBackend> = burn_autodiff::Autodiff<InnerBackend>;
     let device = devices

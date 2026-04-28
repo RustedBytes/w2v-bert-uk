@@ -1,7 +1,11 @@
 use burn::module::{Initializer, Module, Param};
 #[cfg(feature = "asr-cubecl-kernels")]
 use burn::tensor::Int;
+#[cfg(feature = "asr-cubecl-kernels")]
+use burn::tensor::TensorPrimitive;
 use burn::tensor::activation::{sigmoid, silu, softmax, tanh};
+#[cfg(feature = "asr-cubecl-kernels")]
+use burn::tensor::backend::AutodiffBackend;
 use burn::tensor::ops::PadMode;
 use burn::tensor::{Bool, Tensor, TensorData, backend::Backend};
 use burn_nn::conv::{Conv1d, Conv1dConfig, Conv2d, Conv2dConfig};
@@ -56,11 +60,62 @@ pub trait ZipformerKernelBackend: Backend + Sized {
 
 impl ZipformerKernelBackend for burn_ndarray::NdArray<f32> {}
 
-impl<B, C> ZipformerKernelBackend for burn_autodiff::Autodiff<B, C>
+impl<C> ZipformerKernelBackend for burn_autodiff::Autodiff<burn_ndarray::NdArray<f32>, C> where
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy
+{
+}
+
+#[cfg(feature = "asr-cubecl-kernels")]
+fn autodiff_to_inner<B, C, const D: usize>(
+    tensor: Tensor<burn_autodiff::Autodiff<B, C>, D>,
+) -> Tensor<B, D>
 where
     B: Backend,
     C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
 {
+    let tensor =
+        <burn_autodiff::Autodiff<B, C> as AutodiffBackend>::inner(tensor.into_primitive().tensor());
+    Tensor::from_primitive(TensorPrimitive::Float(tensor))
+}
+
+#[cfg(feature = "asr-cubecl-kernels")]
+fn inner_to_autodiff<B, C, const D: usize>(
+    tensor: Tensor<B, D>,
+) -> Tensor<burn_autodiff::Autodiff<B, C>, D>
+where
+    B: Backend,
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
+{
+    let tensor = <burn_autodiff::Autodiff<B, C> as AutodiffBackend>::from_inner(
+        tensor.into_primitive().tensor(),
+    );
+    Tensor::from_primitive(TensorPrimitive::Float(tensor))
+}
+
+#[cfg(feature = "asr-cubecl-kernels")]
+fn inner_bool_to_autodiff<B, C, const D: usize>(
+    tensor: Tensor<B, D, Bool>,
+) -> Tensor<burn_autodiff::Autodiff<B, C>, D, Bool>
+where
+    B: Backend,
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
+{
+    let tensor = <burn_autodiff::Autodiff<B, C> as AutodiffBackend>::bool_from_inner(
+        tensor.into_primitive(),
+    );
+    Tensor::from_primitive(tensor)
+}
+
+#[cfg(feature = "asr-cubecl-kernels")]
+fn attach_autodiff_gradient<B, C, const D: usize>(
+    raw: Tensor<burn_autodiff::Autodiff<B, C>, D>,
+    portable: Tensor<burn_autodiff::Autodiff<B, C>, D>,
+) -> Tensor<burn_autodiff::Autodiff<B, C>, D>
+where
+    B: Backend,
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
+{
+    raw + portable.clone() - portable.detach()
 }
 
 #[cfg(all(feature = "asr-cubecl-kernels", feature = "burn-cuda-backend"))]
@@ -110,6 +165,83 @@ where
         let length_tensor = lengths_tensor::<Self>(lengths, &input.device());
         let output = crate::cubecl_kernels::pairwise_downsample(input, length_tensor, weights);
         (Self::mask_time(output, &output_lengths), output_lengths)
+    }
+}
+
+#[cfg(all(feature = "asr-cubecl-kernels", feature = "burn-cuda-backend"))]
+impl<F, I, C> ZipformerKernelBackend for burn_autodiff::Autodiff<burn_cuda::Cuda<F, I>, C>
+where
+    F: burn_cubecl::FloatElement,
+    I: burn_cubecl::IntElement,
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
+{
+    fn relative_shift(input: Tensor<Self, 4>, seq_len: usize) -> Tensor<Self, 4> {
+        let portable = relative_shift_fallback(input.clone(), seq_len);
+        let raw = crate::cubecl_kernels::relative_shift(autodiff_to_inner(input), seq_len);
+        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+    }
+
+    fn mask_time(input: Tensor<Self, 3>, lengths: &[usize]) -> Tensor<Self, 3> {
+        let portable = mask_time_fallback(input.clone(), lengths);
+        let raw = crate::cubecl_kernels::mask_time(autodiff_to_inner(input), lengths);
+        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+    }
+
+    fn mask_add_time(
+        residual: Tensor<Self, 3>,
+        update: Tensor<Self, 3>,
+        lengths: &[usize],
+    ) -> Tensor<Self, 3> {
+        let portable = mask_time_fallback(residual.clone() + update.clone(), lengths);
+        let residual_inner = autodiff_to_inner(residual);
+        let update_inner = autodiff_to_inner(update);
+        let lengths_inner =
+            lengths_tensor::<burn_cuda::Cuda<F, I>>(lengths, &residual_inner.device());
+        let raw = crate::cubecl_kernels::residual_add_mask_time(
+            residual_inner,
+            update_inner,
+            lengths_inner,
+        );
+        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+    }
+
+    fn glu_last_dim(input: Tensor<Self, 3>) -> Tensor<Self, 3> {
+        let portable = glu_last_dim_fallback(input.clone());
+        let raw = crate::cubecl_kernels::glu_last_dim(autodiff_to_inner(input));
+        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+    }
+
+    fn attention_mask_4d(
+        lengths: &[usize],
+        heads: usize,
+        query_len: usize,
+        key_len: usize,
+        device: &Self::Device,
+    ) -> Tensor<Self, 4, Bool> {
+        let lengths = lengths_tensor::<burn_cuda::Cuda<F, I>>(lengths, device);
+        let raw = crate::cubecl_kernels::attention_mask_4d_with_lengths(
+            lengths, heads, query_len, key_len,
+        );
+        inner_bool_to_autodiff(raw)
+    }
+
+    fn pairwise_downsample(
+        input: Tensor<Self, 3>,
+        lengths: &[usize],
+        weights: Tensor<Self, 1>,
+    ) -> (Tensor<Self, 3>, Vec<usize>) {
+        let (portable, output_lengths) =
+            pairwise_downsample_fallback(input.clone(), lengths, weights.clone());
+        let input_inner = autodiff_to_inner(input);
+        let length_tensor = lengths_tensor::<burn_cuda::Cuda<F, I>>(lengths, &input_inner.device());
+        let weights_inner = autodiff_to_inner(weights);
+        let raw =
+            crate::cubecl_kernels::pairwise_downsample(input_inner, length_tensor, weights_inner);
+        let raw = crate::cubecl_kernels::mask_time(raw, &output_lengths);
+        (
+            attach_autodiff_gradient(inner_to_autodiff(raw), portable),
+            output_lengths,
+        )
     }
 }
 
@@ -164,12 +296,101 @@ where
     }
 }
 
+#[cfg(all(feature = "asr-cubecl-kernels", feature = "burn-wgpu-backend"))]
+impl<F, I, BT, C> ZipformerKernelBackend for burn_autodiff::Autodiff<burn_wgpu::Wgpu<F, I, BT>, C>
+where
+    F: burn_cubecl::FloatElement,
+    I: burn_cubecl::IntElement,
+    BT: burn_cubecl::element::BoolElement,
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
+{
+    fn relative_shift(input: Tensor<Self, 4>, seq_len: usize) -> Tensor<Self, 4> {
+        let portable = relative_shift_fallback(input.clone(), seq_len);
+        let raw = crate::cubecl_kernels::relative_shift(autodiff_to_inner(input), seq_len);
+        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+    }
+
+    fn mask_time(input: Tensor<Self, 3>, lengths: &[usize]) -> Tensor<Self, 3> {
+        let portable = mask_time_fallback(input.clone(), lengths);
+        let raw = crate::cubecl_kernels::mask_time(autodiff_to_inner(input), lengths);
+        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+    }
+
+    fn mask_add_time(
+        residual: Tensor<Self, 3>,
+        update: Tensor<Self, 3>,
+        lengths: &[usize],
+    ) -> Tensor<Self, 3> {
+        let portable = mask_time_fallback(residual.clone() + update.clone(), lengths);
+        let residual_inner = autodiff_to_inner(residual);
+        let update_inner = autodiff_to_inner(update);
+        let lengths_inner =
+            lengths_tensor::<burn_wgpu::Wgpu<F, I, BT>>(lengths, &residual_inner.device());
+        let raw = crate::cubecl_kernels::residual_add_mask_time(
+            residual_inner,
+            update_inner,
+            lengths_inner,
+        );
+        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+    }
+
+    fn glu_last_dim(input: Tensor<Self, 3>) -> Tensor<Self, 3> {
+        let portable = glu_last_dim_fallback(input.clone());
+        let raw = crate::cubecl_kernels::glu_last_dim(autodiff_to_inner(input));
+        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+    }
+
+    fn attention_mask_4d(
+        lengths: &[usize],
+        heads: usize,
+        query_len: usize,
+        key_len: usize,
+        device: &Self::Device,
+    ) -> Tensor<Self, 4, Bool> {
+        let lengths = lengths_tensor::<burn_wgpu::Wgpu<F, I, BT>>(lengths, device);
+        let raw = crate::cubecl_kernels::attention_mask_4d_with_lengths(
+            lengths, heads, query_len, key_len,
+        );
+        inner_bool_to_autodiff(raw)
+    }
+
+    fn pairwise_downsample(
+        input: Tensor<Self, 3>,
+        lengths: &[usize],
+        weights: Tensor<Self, 1>,
+    ) -> (Tensor<Self, 3>, Vec<usize>) {
+        let (portable, output_lengths) =
+            pairwise_downsample_fallback(input.clone(), lengths, weights.clone());
+        let input_inner = autodiff_to_inner(input);
+        let length_tensor =
+            lengths_tensor::<burn_wgpu::Wgpu<F, I, BT>>(lengths, &input_inner.device());
+        let weights_inner = autodiff_to_inner(weights);
+        let raw =
+            crate::cubecl_kernels::pairwise_downsample(input_inner, length_tensor, weights_inner);
+        let raw = crate::cubecl_kernels::mask_time(raw, &output_lengths);
+        (
+            attach_autodiff_gradient(inner_to_autodiff(raw), portable),
+            output_lengths,
+        )
+    }
+}
+
 #[cfg(all(feature = "burn-cuda-backend", not(feature = "asr-cubecl-kernels")))]
 impl<F, I> ZipformerKernelBackend for burn_cuda::Cuda<F, I>
 where
     F: burn_cubecl::FloatElement,
     I: burn_cubecl::IntElement,
     burn_cuda::Cuda<F, I>: Backend,
+{
+}
+
+#[cfg(all(feature = "burn-cuda-backend", not(feature = "asr-cubecl-kernels")))]
+impl<F, I, C> ZipformerKernelBackend for burn_autodiff::Autodiff<burn_cuda::Cuda<F, I>, C>
+where
+    F: burn_cubecl::FloatElement,
+    I: burn_cubecl::IntElement,
+    burn_cuda::Cuda<F, I>: Backend,
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
 {
 }
 
@@ -180,6 +401,17 @@ where
     I: burn_cubecl::IntElement,
     BT: burn_cubecl::element::BoolElement,
     burn_wgpu::Wgpu<F, I, BT>: Backend,
+{
+}
+
+#[cfg(all(feature = "burn-wgpu-backend", not(feature = "asr-cubecl-kernels")))]
+impl<F, I, BT, C> ZipformerKernelBackend for burn_autodiff::Autodiff<burn_wgpu::Wgpu<F, I, BT>, C>
+where
+    F: burn_cubecl::FloatElement,
+    I: burn_cubecl::IntElement,
+    BT: burn_cubecl::element::BoolElement,
+    burn_wgpu::Wgpu<F, I, BT>: Backend,
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
 {
 }
 

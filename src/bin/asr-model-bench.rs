@@ -154,6 +154,7 @@ fn run_wgpu(_args: Args) -> Result<()> {
 fn run_backend_body<B>(args: &Args, backend_name: &str, device: &B::Device) -> Result<()>
 where
     B: Backend + ZipformerKernelBackend,
+    burn_autodiff::Autodiff<B>: Backend<Device = B::Device> + ZipformerKernelBackend,
 {
     let input_dim = resolved_input_dim(args);
     let lengths = input_lengths(args.batch, args.frames);
@@ -293,7 +294,8 @@ fn bench_forward_backward<Inner, M>(
 ) -> Result<BenchResult>
 where
     Inner: Backend,
-    burn_autodiff::Autodiff<Inner>: AutodiffBackend<Device = Inner::Device>,
+    burn_autodiff::Autodiff<Inner>:
+        AutodiffBackend<Device = Inner::Device> + ZipformerKernelBackend,
 {
     type AD<B> = burn_autodiff::Autodiff<B>;
 
