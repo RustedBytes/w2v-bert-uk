@@ -19,9 +19,12 @@ typedef struct W2vBertUkOptions {
   const char *ort_dylib_path;
   const char *ort_optimization;
   const char *w2v_model_source;
+  const char *const *hot_words;
   uint32_t beam_width;
   float lm_weight;
   float word_bonus;
+  uintptr_t hot_words_len;
+  float hot_word_bonus;
   uint32_t fallback_sample_rate;
   uint32_t w2v_sample_rate;
   uint32_t w2v_feature_size;

@@ -20,6 +20,8 @@ func main() {
 		BeamWidth:          32,
 		LMWeight:           0.45,
 		WordBonus:          0.2,
+		HotWords:           []string{"Kyiv"},
+		HotWordBonus:       2.0,
 		LogLanguageModel:   w2vbertuk.BoolFalse,
 		LogAccelerator:     w2vbertuk.BoolTrue,
 		FallbackSampleRate: 16000,

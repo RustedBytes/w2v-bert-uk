@@ -49,6 +49,14 @@ struct Args {
     #[arg(default_value_t = 0.2)]
     word_bonus: f32,
 
+    /// Hot word or phrase to boost during KenLM reranking. Can be repeated.
+    #[arg(long = "hot-word")]
+    hot_words: Vec<String>,
+
+    /// Score bonus applied for each hot word or phrase match.
+    #[arg(long, default_value_t = 0.0)]
+    hot_word_bonus: f32,
+
     /// Optional ONNX Runtime dynamic library path.
     #[arg(long)]
     ort_dylib: Option<PathBuf>,
@@ -167,6 +175,8 @@ fn main() -> Result<()> {
             path: args.lm,
             weight: args.lm_weight,
             word_bonus: args.word_bonus,
+            hot_words: args.hot_words,
+            hot_word_bonus: args.hot_word_bonus,
             log_language_model: !args.no_lm_log,
             bos: !args.lm_no_bos,
             eos: !args.lm_no_eos,

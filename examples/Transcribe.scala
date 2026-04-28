@@ -15,6 +15,8 @@ object Transcribe {
     options.beamWidth = 32
     options.lmWeight = 0.45f
     options.wordBonus = 0.2f
+    options.hotWords = Array("Kyiv")
+    options.hotWordBonus = 2.0f
     options.logLanguageModel = false
     options.ortOptimization = "disable"
     options.logAccelerator = true

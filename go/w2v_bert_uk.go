@@ -35,6 +35,8 @@ type Options struct {
 	BeamWidth           uint32
 	LMWeight            float32
 	WordBonus           float32
+	HotWords            []string
+	HotWordBonus        float32
 	FallbackSampleRate  uint32
 	W2vSampleRate       uint32
 	W2vFeatureSize      uint32
@@ -216,6 +218,7 @@ func (t *Transcriber) TranscribeBytes(audioBytes []byte, formatHint string) (str
 func withCOptions(options Options, call func(*C.W2vBertUkOptions) error) error {
 	cOptions := C.w2v_bert_uk_options_default()
 	strings := []*C.char{}
+	hotWords := []*C.char{}
 	defer func() {
 		for _, value := range strings {
 			C.free(unsafe.Pointer(value))
@@ -247,6 +250,24 @@ func withCOptions(options Options, call func(*C.W2vBertUkOptions) error) error {
 	if options.WordBonus != 0 {
 		cOptions.word_bonus = C.float(options.WordBonus)
 	}
+	if len(options.HotWords) != 0 {
+		hotWords = make([]*C.char, 0, len(options.HotWords))
+		for _, value := range options.HotWords {
+			if value == "" {
+				continue
+			}
+			cValue := C.CString(value)
+			strings = append(strings, cValue)
+			hotWords = append(hotWords, cValue)
+		}
+		if len(hotWords) != 0 {
+			cOptions.hot_words = &hotWords[0]
+			cOptions.hot_words_len = C.uintptr_t(len(hotWords))
+		}
+	}
+	if options.HotWordBonus != 0 {
+		cOptions.hot_word_bonus = C.float(options.HotWordBonus)
+	}
 	if options.FallbackSampleRate != 0 {
 		cOptions.fallback_sample_rate = C.uint32_t(options.FallbackSampleRate)
 	}
@@ -277,7 +298,9 @@ func withCOptions(options Options, call func(*C.W2vBertUkOptions) error) error {
 	assignBoolOption(options.LMBOS, &cOptions.lm_bos)
 	assignBoolOption(options.LMEOS, &cOptions.lm_eos)
 
-	return call(&cOptions)
+	err := call(&cOptions)
+	runtime.KeepAlive(hotWords)
+	return err
 }
 
 func assignBoolOption(value BoolOption, target *C.int32_t) {

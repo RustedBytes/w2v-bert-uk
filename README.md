@@ -33,6 +33,7 @@ n-best          beam-width
 lm.binary       lm.binary
 lm-weight       0.45
 word-bonus      0.2
+hot-word-bonus  0.0
 ```
 
 If the default LM path does not exist, the CLI disables KenLM and decodes without LM reranking.
@@ -80,6 +81,9 @@ cargo run --release -- example_1.wav \
   --no-normalize-spaces \
   --no-accelerator-log \
   --no-lm-log \
+  --hot-word "Київ" \
+  --hot-word "Іван Франко" \
+  --hot-word-bonus 2.0 \
   --lm-no-bos \
   --lm-no-eos
 ```
@@ -245,6 +249,8 @@ transcriber = w2v_bert_uk.Transcriber(
     lm="news-titles.arpa",
     lm_weight=0.45,
     word_bonus=0.2,
+    hot_words=["Київ", "Іван Франко"],
+    hot_word_bonus=2.0,
     log_language_model=False,
     ort_dylib_path=None,
     ort_optimization="disable",
@@ -507,12 +513,14 @@ RTF/RFT: 1.158x
 If an LM path is configured, the decoder reranks CTC N-best candidates using shallow fusion:
 
 ```text
-total = ctc_log_prob + lm_weight * lm_log_prob + word_bonus * word_count
+total = ctc_log_prob + lm_weight * lm_log_prob + word_bonus * word_count + hot_word_score
 ```
 
 Candidates are scored by KenLM with their decoded casing preserved, so the language model should use casing that matches the tokenizer output.
 
-Tune `lm-weight` and `word-bonus` on validation audio before using the defaults for evaluation.
+Pass `--hot-word <word-or-phrase>` one or more times with `--hot-word-bonus <score>` to boost candidates that contain those hot words after whitespace normalization. Hot-word matching is case-insensitive and token-based.
+
+Tune `lm-weight`, `word-bonus`, and `hot-word-bonus` on validation audio before using the defaults for evaluation.
 
 ## Development
 

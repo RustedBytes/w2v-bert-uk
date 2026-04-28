@@ -31,9 +31,12 @@ pub struct W2vBertUkOptions {
     pub ort_dylib_path: *const c_char,
     pub ort_optimization: *const c_char,
     pub w2v_model_source: *const c_char,
+    pub hot_words: *const *const c_char,
     pub beam_width: u32,
     pub lm_weight: f32,
     pub word_bonus: f32,
+    pub hot_words_len: usize,
+    pub hot_word_bonus: f32,
     pub fallback_sample_rate: u32,
     pub w2v_sample_rate: u32,
     pub w2v_feature_size: u32,
@@ -65,9 +68,12 @@ pub unsafe extern "C" fn w2v_bert_uk_options_default() -> W2vBertUkOptions {
         ort_dylib_path: ptr::null(),
         ort_optimization: ptr::null(),
         w2v_model_source: ptr::null(),
+        hot_words: ptr::null(),
         beam_width: 32,
         lm_weight: 0.45,
         word_bonus: 0.2,
+        hot_words_len: 0,
+        hot_word_bonus: 0.0,
         fallback_sample_rate: 16_000,
         w2v_sample_rate: 0,
         w2v_feature_size: 0,
@@ -258,6 +264,7 @@ fn config_from_options(options: *const W2vBertUkOptions) -> anyhow::Result<Trans
         drop_empty_candidates,
     };
     let beam_width = non_zero_u32(options.beam_width, 32) as usize;
+    let hot_words = strings_from_ptrs(options.hot_words, options.hot_words_len)?;
 
     Ok(TranscriptionConfig {
         runtime: RuntimeConfig {
@@ -321,6 +328,8 @@ fn config_from_options(options: *const W2vBertUkOptions) -> anyhow::Result<Trans
                 } else {
                     options.word_bonus
                 },
+                hot_words,
+                hot_word_bonus: options.hot_word_bonus,
                 log_language_model: bool_or_default(options.log_language_model, true),
                 bos: bool_or_default(options.lm_bos, true),
                 eos: bool_or_default(options.lm_eos, true),
@@ -368,6 +377,19 @@ fn str_opt_from_ptr(value: *const c_char) -> anyhow::Result<Option<String>> {
     } else {
         str_from_ptr(value).map(Some)
     }
+}
+
+fn strings_from_ptrs(ptr: *const *const c_char, len: usize) -> anyhow::Result<Vec<String>> {
+    if ptr.is_null() || len == 0 {
+        return Ok(Vec::new());
+    }
+
+    unsafe { slice::from_raw_parts(ptr, len) }
+        .iter()
+        .copied()
+        .filter(|value| !value.is_null())
+        .map(str_from_ptr)
+        .collect()
 }
 
 fn write_c_string(out: *mut *mut c_char, value: String) -> anyhow::Result<()> {

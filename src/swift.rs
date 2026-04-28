@@ -23,6 +23,8 @@ mod ffi {
         beam_width: u32,
         lm_weight: f32,
         word_bonus: f32,
+        hot_words: Vec<String>,
+        hot_word_bonus: f32,
         fallback_sample_rate: u32,
         w2v_sample_rate: u32,
         w2v_feature_size: u32,
@@ -88,6 +90,8 @@ fn swift_options_default() -> SwiftTranscriptionOptions {
         beam_width: 32,
         lm_weight: 0.45,
         word_bonus: 0.2,
+        hot_words: Vec::new(),
+        hot_word_bonus: 0.0,
         fallback_sample_rate: 16_000,
         w2v_sample_rate: 0,
         w2v_feature_size: 0,
@@ -233,6 +237,8 @@ fn config_from_options(options: SwiftTranscriptionOptions) -> Result<Transcripti
                     } else {
                         options.word_bonus
                     },
+                    hot_words: options.hot_words,
+                    hot_word_bonus: options.hot_word_bonus,
                     log_language_model: options.log_language_model,
                     bos: options.lm_bos,
                     eos: options.lm_eos,

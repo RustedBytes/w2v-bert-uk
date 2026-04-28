@@ -12,6 +12,8 @@ const transcriber = new w2vBertUk.Transcriber({
   lm: fromRoot("news-titles.arpa"),
   lmWeight: 0.45,
   wordBonus: 0.2,
+  hotWords: ["Kyiv"],
+  hotWordBonus: 2.0,
   logLanguageModel: false,
   ortDylibPath: null,
   ortOptimization: "disable",

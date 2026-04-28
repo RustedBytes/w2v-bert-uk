@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use jni::{
     Env, EnvUnowned,
     errors::ThrowRuntimeExAndDefault,
-    objects::{JByteArray, JObject, JString},
+    objects::{JByteArray, JObject, JObjectArray, JString},
     refs::Reference,
     sys::{jboolean, jfloat, jint, jlong},
 };
@@ -93,6 +93,8 @@ pub extern "system" fn Java_io_github_rustedbytes_w2vbertuk_W2vBertUkNative_nati
     beam_width: jint,
     lm_weight: jfloat,
     word_bonus: jfloat,
+    hot_words: JObjectArray<'local, JString<'local>>,
+    hot_word_bonus: jfloat,
     fallback_sample_rate: jint,
     w2v_sample_rate: jint,
     w2v_feature_size: jint,
@@ -122,6 +124,8 @@ pub extern "system" fn Java_io_github_rustedbytes_w2vbertuk_W2vBertUkNative_nati
             beam_width,
             lm_weight,
             word_bonus,
+            &hot_words,
+            hot_word_bonus,
             fallback_sample_rate,
             w2v_sample_rate,
             w2v_feature_size,
@@ -159,6 +163,8 @@ pub extern "system" fn Java_io_github_rustedbytes_w2vbertuk_W2vBertUkNative_nati
     beam_width: jint,
     lm_weight: jfloat,
     word_bonus: jfloat,
+    hot_words: JObjectArray<'local, JString<'local>>,
+    hot_word_bonus: jfloat,
     fallback_sample_rate: jint,
     w2v_sample_rate: jint,
     w2v_feature_size: jint,
@@ -187,6 +193,8 @@ pub extern "system" fn Java_io_github_rustedbytes_w2vbertuk_W2vBertUkNative_nati
             beam_width,
             lm_weight,
             word_bonus,
+            &hot_words,
+            hot_word_bonus,
             fallback_sample_rate,
             w2v_sample_rate,
             w2v_feature_size,
@@ -265,7 +273,7 @@ pub extern "system" fn Java_io_github_rustedbytes_w2vbertuk_W2vBertUkNative_nati
 }
 
 fn config_from_jni(
-    env: &Env<'_>,
+    env: &mut Env<'_>,
     model: &JString<'_>,
     tokenizer: &JString<'_>,
     lm: &JString<'_>,
@@ -275,6 +283,8 @@ fn config_from_jni(
     beam_width: jint,
     lm_weight: jfloat,
     word_bonus: jfloat,
+    hot_words: &JObjectArray<'_, JString<'_>>,
+    hot_word_bonus: jfloat,
     fallback_sample_rate: jint,
     w2v_sample_rate: jint,
     w2v_feature_size: jint,
@@ -294,6 +304,7 @@ fn config_from_jni(
     let normalize_spaces = jboolean_to_bool(normalize_spaces);
     let drop_empty_candidates = jboolean_to_bool(drop_empty_candidates);
     let beam_width = non_zero_jint(beam_width, 32) as usize;
+    let hot_words = strings_from_jarray(env, hot_words)?;
 
     Ok(TranscriptionConfig {
         runtime: RuntimeConfig {
@@ -349,6 +360,8 @@ fn config_from_jni(
                 path,
                 weight: if lm_weight == 0.0 { 0.45 } else { lm_weight },
                 word_bonus: if word_bonus == 0.0 { 0.2 } else { word_bonus },
+                hot_words,
+                hot_word_bonus,
                 log_language_model: jboolean_to_bool(log_language_model),
                 bos: jboolean_to_bool(lm_bos),
                 eos: jboolean_to_bool(lm_eos),
@@ -359,6 +372,25 @@ fn config_from_jni(
             }),
         },
     })
+}
+
+fn strings_from_jarray(
+    env: &mut Env<'_>,
+    values: &JObjectArray<'_, JString<'_>>,
+) -> anyhow::Result<Vec<String>> {
+    if values.is_null() {
+        return Ok(Vec::new());
+    }
+
+    let len = values.len(env)?;
+    let mut strings = Vec::with_capacity(len);
+    for index in 0..len {
+        let value = values.get_element(env, index)?;
+        if !value.is_null() {
+            strings.push(str_from_jstring(env, &value)?);
+        }
+    }
+    Ok(strings)
 }
 
 fn transcriber_from_handle(handle: jlong) -> anyhow::Result<&'static mut RustTranscriber> {

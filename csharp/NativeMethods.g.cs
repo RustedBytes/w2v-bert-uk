@@ -63,9 +63,12 @@ namespace W2vBertUk.Native
         public byte* ort_dylib_path;
         public byte* ort_optimization;
         public byte* w2v_model_source;
+        public byte** hot_words;
         public uint beam_width;
         public float lm_weight;
         public float word_bonus;
+        public nuint hot_words_len;
+        public float hot_word_bonus;
         public uint fallback_sample_rate;
         public uint w2v_sample_rate;
         public uint w2v_feature_size;

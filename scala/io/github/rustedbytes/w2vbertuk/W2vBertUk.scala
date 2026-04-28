@@ -24,6 +24,8 @@ object W2vBertUk {
       resolved.beamWidth,
       resolved.lmWeight,
       resolved.wordBonus,
+      resolved.hotWords,
+      resolved.hotWordBonus,
       resolved.fallbackSampleRate,
       resolved.w2vSampleRate,
       resolved.w2vFeatureSize,
@@ -54,6 +56,8 @@ object W2vBertUk {
       resolved.beamWidth,
       resolved.lmWeight,
       resolved.wordBonus,
+      resolved.hotWords,
+      resolved.hotWordBonus,
       resolved.fallbackSampleRate,
       resolved.w2vSampleRate,
       resolved.w2vFeatureSize,
@@ -113,6 +117,8 @@ object W2vBertUk {
     var beamWidth: Int = 32
     var lmWeight: Float = 0.45f
     var wordBonus: Float = 0.2f
+    var hotWords: Array[String] = Array.empty
+    var hotWordBonus: Float = 0.0f
     var fallbackSampleRate: Int = 16000
     var w2vSampleRate: Int = 0
     var w2vFeatureSize: Int = 0
@@ -155,6 +161,8 @@ private[w2vbertuk] object W2vBertUkNative {
       beamWidth: Int,
       lmWeight: Float,
       wordBonus: Float,
+      hotWords: Array[String],
+      hotWordBonus: Float,
       fallbackSampleRate: Int,
       w2vSampleRate: Int,
       w2vFeatureSize: Int,
@@ -182,6 +190,8 @@ private[w2vbertuk] object W2vBertUkNative {
       beamWidth,
       lmWeight,
       wordBonus,
+      hotWords,
+      hotWordBonus,
       fallbackSampleRate,
       w2vSampleRate,
       w2vFeatureSize,
@@ -209,6 +219,8 @@ private[w2vbertuk] object W2vBertUkNative {
       beamWidth: Int,
       lmWeight: Float,
       wordBonus: Float,
+      hotWords: Array[String],
+      hotWordBonus: Float,
       fallbackSampleRate: Int,
       w2vSampleRate: Int,
       w2vFeatureSize: Int,
@@ -235,6 +247,8 @@ private[w2vbertuk] object W2vBertUkNative {
       beamWidth,
       lmWeight,
       wordBonus,
+      hotWords,
+      hotWordBonus,
       fallbackSampleRate,
       w2vSampleRate,
       w2vFeatureSize,
@@ -276,6 +290,8 @@ private[w2vbertuk] final class W2vBertUkNative {
       beamWidth: Int,
       lmWeight: Float,
       wordBonus: Float,
+      hotWords: Array[String],
+      hotWordBonus: Float,
       fallbackSampleRate: Int,
       w2vSampleRate: Int,
       w2vFeatureSize: Int,
@@ -302,6 +318,8 @@ private[w2vbertuk] final class W2vBertUkNative {
       beamWidth: Int,
       lmWeight: Float,
       wordBonus: Float,
+      hotWords: Array[String],
+      hotWordBonus: Float,
       fallbackSampleRate: Int,
       w2vSampleRate: Int,
       w2vFeatureSize: Int,

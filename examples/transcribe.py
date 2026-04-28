@@ -14,6 +14,8 @@ def main() -> None:
         lm=ROOT / "news-titles.arpa",
         lm_weight=0.45,
         word_bonus=0.2,
+        hot_words=["Kyiv"],
+        hot_word_bonus=2.0,
         log_language_model=False,
         ort_dylib_path=None,
         ort_optimization="disable",

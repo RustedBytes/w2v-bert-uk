@@ -154,6 +154,8 @@ fn build_config(options: Option<&ZendHashTable>) -> PhpResult<TranscriptionConfi
                 path,
                 weight: option_f32(options, "lm_weight")?.unwrap_or(0.45),
                 word_bonus: option_f32(options, "word_bonus")?.unwrap_or(0.2),
+                hot_words: option_string_array(options, "hot_words")?.unwrap_or_default(),
+                hot_word_bonus: option_f32(options, "hot_word_bonus")?.unwrap_or(0.0),
                 log_language_model: option_bool(options, "log_language_model")?.unwrap_or(true),
                 bos: option_bool(options, "lm_bos")?.unwrap_or(true),
                 eos: option_bool(options, "lm_eos")?.unwrap_or(true),
@@ -293,6 +295,7 @@ fn candidate_to_php(candidate: &ScoredCandidate) -> PhpResult<ZBox<ZendHashTable
     hash.insert("text", candidate.text.clone())?;
     hash.insert("ctc_log_prob", candidate.ctc_log_prob as f64)?;
     hash.insert("lm_log_prob", candidate.lm_log_prob as f64)?;
+    hash.insert("hot_word_score", candidate.hot_word_score as f64)?;
     hash.insert("word_count", candidate.word_count as i64)?;
     hash.insert("total_score", candidate.total_score as f64)?;
     Ok(hash)
@@ -310,6 +313,24 @@ fn option_string(options: Option<&ZendHashTable>, key: &str) -> PhpResult<Option
             value
                 .coerce_to_string()
                 .ok_or_else(|| format!("option {key:?} must be a string").into())
+        })
+        .transpose()
+}
+
+fn option_string_array(options: Option<&ZendHashTable>, key: &str) -> PhpResult<Option<Vec<String>>> {
+    option_value(options, key)
+        .map(|value| {
+            let array = value
+                .array()
+                .ok_or_else(|| format!("option {key:?} must be an array").into())?;
+            array
+                .iter()
+                .map(|(_index, value)| {
+                    value
+                        .coerce_to_string()
+                        .ok_or_else(|| format!("option {key:?} values must be strings").into())
+                })
+                .collect()
         })
         .transpose()
 }

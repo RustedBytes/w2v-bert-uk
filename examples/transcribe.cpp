@@ -14,6 +14,10 @@ int main(int argc, char **argv) {
   options.tokenizer = argv[3];
   options.lm = argc > 4 ? argv[4] : nullptr;
   options.ort_optimization = "disable";
+  const char *hot_words[] = {"Kyiv"};
+  options.hot_words = hot_words;
+  options.hot_words_len = 1;
+  options.hot_word_bonus = 2.0f;
 
   char *transcript = nullptr;
   int status = w2v_bert_uk::w2v_bert_uk_transcribe_file(argv[1], &options, &transcript);

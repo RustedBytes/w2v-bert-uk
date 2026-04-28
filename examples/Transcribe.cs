@@ -16,6 +16,9 @@ unsafe class Transcribe
             using var tokenizer = new Utf8String(FromRoot("tokenizer.model"));
             using var languageModel = new Utf8String(FromRoot("news-titles.arpa"));
             using var ortOptimization = new Utf8String("disable");
+            using var hotWord = new Utf8String("Kyiv");
+            byte** hotWords = stackalloc byte*[1];
+            hotWords[0] = hotWord.Pointer;
 
             var options = NativeMethods.w2v_bert_uk_options_default();
             options.model = model.Pointer;
@@ -24,6 +27,9 @@ unsafe class Transcribe
             options.lm = languageModel.Pointer;
             options.lm_weight = 0.45f;
             options.word_bonus = 0.2f;
+            options.hot_words = hotWords;
+            options.hot_words_len = 1;
+            options.hot_word_bonus = 2.0f;
             options.log_language_model = 0;
             options.ort_dylib_path = null;
             options.ort_optimization = ortOptimization.Pointer;

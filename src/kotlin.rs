@@ -22,6 +22,8 @@ pub struct KotlinOptions {
     pub beam_width: i32,
     pub lm_weight: f32,
     pub word_bonus: f32,
+    pub hot_words: Vec<String>,
+    pub hot_word_bonus: f32,
     pub fallback_sample_rate: i32,
     pub w2v_sample_rate: Option<i32>,
     pub w2v_feature_size: Option<i32>,
@@ -51,6 +53,8 @@ impl Default for KotlinOptions {
             beam_width: 32,
             lm_weight: 0.45,
             word_bonus: 0.2,
+            hot_words: Vec::new(),
+            hot_word_bonus: 0.0,
             fallback_sample_rate: 16_000,
             w2v_sample_rate: None,
             w2v_feature_size: None,
@@ -232,6 +236,8 @@ fn config_from_options(options: KotlinOptions) -> anyhow::Result<TranscriptionCo
                     } else {
                         options.word_bonus
                     },
+                    hot_words: options.hot_words,
+                    hot_word_bonus: options.hot_word_bonus,
                     log_language_model: options.log_language_model,
                     bos: options.lm_bos,
                     eos: options.lm_eos,

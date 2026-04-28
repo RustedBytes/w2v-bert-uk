@@ -21,8 +21,8 @@ public final class W2vBertUk {
         Options resolved = options == null ? Options.defaults() : options;
         return nativeTranscribeFile(audioFile.toString(), resolved.model, resolved.tokenizer, resolved.lm,
                 resolved.ortDylibPath, resolved.ortOptimization, resolved.w2vModelSource,
-                resolved.beamWidth, resolved.lmWeight, resolved.wordBonus, resolved.fallbackSampleRate,
-                resolved.w2vSampleRate, resolved.w2vFeatureSize, resolved.w2vStride, resolved.w2vFeatureDim,
+                resolved.beamWidth, resolved.lmWeight, resolved.wordBonus, resolved.hotWords, resolved.hotWordBonus,
+                resolved.fallbackSampleRate, resolved.w2vSampleRate, resolved.w2vFeatureSize, resolved.w2vStride, resolved.w2vFeatureDim,
                 resolved.w2vPaddingValue, resolved.blankId, resolved.nBest, resolved.logLanguageModel,
                 resolved.logAccelerator, resolved.skipDecodeErrors, resolved.normalizeSpaces,
                 resolved.dropEmptyCandidates, resolved.lmBos, resolved.lmEos);
@@ -32,8 +32,8 @@ public final class W2vBertUk {
         Options resolved = options == null ? Options.defaults() : options;
         long handle = nativeCreateTranscriber(resolved.model, resolved.tokenizer, resolved.lm,
                 resolved.ortDylibPath, resolved.ortOptimization, resolved.w2vModelSource,
-                resolved.beamWidth, resolved.lmWeight, resolved.wordBonus, resolved.fallbackSampleRate,
-                resolved.w2vSampleRate, resolved.w2vFeatureSize, resolved.w2vStride, resolved.w2vFeatureDim,
+                resolved.beamWidth, resolved.lmWeight, resolved.wordBonus, resolved.hotWords, resolved.hotWordBonus,
+                resolved.fallbackSampleRate, resolved.w2vSampleRate, resolved.w2vFeatureSize, resolved.w2vStride, resolved.w2vFeatureDim,
                 resolved.w2vPaddingValue, resolved.blankId, resolved.nBest, resolved.logLanguageModel,
                 resolved.logAccelerator, resolved.skipDecodeErrors, resolved.normalizeSpaces,
                 resolved.dropEmptyCandidates, resolved.lmBos, resolved.lmEos);
@@ -87,6 +87,8 @@ public final class W2vBertUk {
         public int beamWidth = 32;
         public float lmWeight = 0.45f;
         public float wordBonus = 0.2f;
+        public String[] hotWords = new String[0];
+        public float hotWordBonus = 0.0f;
         public int fallbackSampleRate = 16_000;
         public int w2vSampleRate = 0;
         public int w2vFeatureSize = 0;
@@ -112,13 +114,13 @@ public final class W2vBertUk {
     private static native void nativePreloadCudaDylibs(String cudaLibDir, String cudnnLibDir);
     private static native String nativeTranscribeFile(String audioFile, String model, String tokenizer, String lm,
             String ortDylibPath, String ortOptimization, String w2vModelSource, int beamWidth, float lmWeight,
-            float wordBonus, int fallbackSampleRate, int w2vSampleRate, int w2vFeatureSize, int w2vStride,
+            float wordBonus, String[] hotWords, float hotWordBonus, int fallbackSampleRate, int w2vSampleRate, int w2vFeatureSize, int w2vStride,
             int w2vFeatureDim, float w2vPaddingValue, int blankId, int nBest, boolean logLanguageModel,
             boolean logAccelerator, boolean skipDecodeErrors, boolean normalizeSpaces, boolean dropEmptyCandidates,
             boolean lmBos, boolean lmEos);
     private static native long nativeCreateTranscriber(String model, String tokenizer, String lm, String ortDylibPath,
             String ortOptimization, String w2vModelSource, int beamWidth, float lmWeight, float wordBonus,
-            int fallbackSampleRate, int w2vSampleRate, int w2vFeatureSize, int w2vStride, int w2vFeatureDim,
+            String[] hotWords, float hotWordBonus, int fallbackSampleRate, int w2vSampleRate, int w2vFeatureSize, int w2vStride, int w2vFeatureDim,
             float w2vPaddingValue, int blankId, int nBest, boolean logLanguageModel, boolean logAccelerator,
             boolean skipDecodeErrors, boolean normalizeSpaces, boolean dropEmptyCandidates, boolean lmBos,
             boolean lmEos);

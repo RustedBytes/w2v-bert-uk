@@ -9,6 +9,8 @@ fun main(args: Array<String>) {
         tokenizer = "tokenizer.model",
         lm = "news-titles.arpa",
         beamWidth = 32,
+        hotWords = listOf("Kyiv"),
+        hotWordBonus = 2.0f,
     )
 
     KotlinTranscriber(options).use { transcriber ->

@@ -137,6 +137,8 @@ fn build_config(options: Option<RHash>) -> Result<TranscriptionConfig, Error> {
                 path,
                 weight: hash_get(options, "lm_weight")?.unwrap_or(0.45),
                 word_bonus: hash_get(options, "word_bonus")?.unwrap_or(0.2),
+                hot_words: hash_get(options, "hot_words")?.unwrap_or_default(),
+                hot_word_bonus: hash_get(options, "hot_word_bonus")?.unwrap_or(0.0),
                 log_language_model: hash_get(options, "log_language_model")?.unwrap_or(true),
                 bos: hash_get(options, "lm_bos")?.unwrap_or(true),
                 eos: hash_get(options, "lm_eos")?.unwrap_or(true),
@@ -300,6 +302,7 @@ fn candidate_to_ruby(ruby: &Ruby, candidate: &ScoredCandidate) -> Result<RHash, 
     hash.aset("text", candidate.text.clone())?;
     hash.aset("ctc_log_prob", candidate.ctc_log_prob)?;
     hash.aset("lm_log_prob", candidate.lm_log_prob)?;
+    hash.aset("hot_word_score", candidate.hot_word_score)?;
     hash.aset("word_count", candidate.word_count)?;
     hash.aset("total_score", candidate.total_score)?;
     Ok(hash)

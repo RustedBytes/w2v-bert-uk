@@ -222,6 +222,8 @@ pub struct LmConfig {
     pub path: PathBuf,
     pub weight: f32,
     pub word_bonus: f32,
+    pub hot_words: Vec<String>,
+    pub hot_word_bonus: f32,
     pub log_language_model: bool,
     pub bos: bool,
     pub eos: bool,
@@ -234,6 +236,8 @@ impl Default for LmConfig {
             path: PathBuf::from("lm.binary"),
             weight: 0.45,
             word_bonus: 0.2,
+            hot_words: Vec::new(),
+            hot_word_bonus: 0.0,
             log_language_model: true,
             bos: true,
             eos: true,
@@ -360,10 +364,12 @@ impl LmDecoder {
     fn new(config: LmConfig) -> Result<Self> {
         if config.log_language_model {
             info!(
-                "KenLM: {} weight={:.3} word_bonus={:.3}",
+                "KenLM: {} weight={:.3} word_bonus={:.3} hot_words={} hot_word_bonus={:.3}",
                 config.path.display(),
                 config.weight,
-                config.word_bonus
+                config.word_bonus,
+                config.hot_words.len(),
+                config.hot_word_bonus
             );
         }
 
@@ -385,6 +391,7 @@ pub struct ScoredCandidate {
     pub text: String,
     pub ctc_log_prob: f32,
     pub lm_log_prob: f32,
+    pub hot_word_score: f32,
     pub word_count: usize,
     pub total_score: f32,
 }
@@ -574,13 +581,17 @@ fn rerank_with_kenlm(
             .with_context(|| format!("failed to score candidate with KenLM: {text}"))?
             * std::f32::consts::LN_10;
         let word_count = text.split_whitespace().count();
-        let total_score =
-            ctc_log_prob + config.weight * lm_log_prob + config.word_bonus * word_count as f32;
+        let hot_word_score = hot_word_score(&text, &config.hot_words, config.hot_word_bonus);
+        let total_score = ctc_log_prob
+            + config.weight * lm_log_prob
+            + config.word_bonus * word_count as f32
+            + hot_word_score;
 
         ranked.push(ScoredCandidate {
             text,
             ctc_log_prob,
             lm_log_prob,
+            hot_word_score,
             word_count,
             total_score,
         });
@@ -600,8 +611,51 @@ fn score_without_lm(
         text,
         ctc_log_prob: candidate.ctc_log_prob,
         lm_log_prob: 0.0,
+        hot_word_score: 0.0,
         total_score: candidate.ctc_log_prob,
     })
+}
+
+fn hot_word_score(text: &str, hot_words: &[String], hot_word_bonus: f32) -> f32 {
+    if hot_words.is_empty() || hot_word_bonus == 0.0 {
+        return 0.0;
+    }
+
+    let text_tokens = normalized_lowercase_tokens(text);
+    if text_tokens.is_empty() {
+        return 0.0;
+    }
+
+    let matches = hot_words
+        .iter()
+        .map(|hot_word| normalized_lowercase_tokens(hot_word))
+        .filter(|hot_word_tokens| !hot_word_tokens.is_empty())
+        .map(|hot_word_tokens| count_token_phrase_matches(&text_tokens, &hot_word_tokens))
+        .sum::<usize>();
+
+    hot_word_bonus * matches as f32
+}
+
+fn normalized_lowercase_tokens(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .map(|token| token.to_lowercase())
+        .collect()
+}
+
+fn count_token_phrase_matches(text_tokens: &[String], hot_word_tokens: &[String]) -> usize {
+    if hot_word_tokens.len() > text_tokens.len() {
+        return 0;
+    }
+
+    text_tokens
+        .windows(hot_word_tokens.len())
+        .filter(|window| {
+            window
+                .iter()
+                .zip(hot_word_tokens)
+                .all(|(candidate, hot_word)| candidate == hot_word)
+        })
+        .count()
 }
 
 fn process_candidate_text(text: &str, config: &CandidateProcessingConfig) -> Option<String> {
@@ -628,5 +682,27 @@ pub fn format_duration(duration: Duration) -> String {
         format!("{seconds:.3}s")
     } else {
         format!("{:.3}ms", seconds * 1_000.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hot_words_score_single_words_and_phrases() {
+        let hot_words = vec!["kyiv".to_string(), "Ivan Franko".to_string()];
+
+        assert_eq!(
+            hot_word_score("Ivan Franko returned to Kyiv", &hot_words, 2.5),
+            5.0
+        );
+    }
+
+    #[test]
+    fn hot_words_match_token_boundaries() {
+        let hot_words = vec!["home".to_string()];
+
+        assert_eq!(hot_word_score("homebound home", &hot_words, 1.0), 1.0);
     }
 }
