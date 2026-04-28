@@ -133,9 +133,7 @@ where
     C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
 {
     fn mask_time(input: Tensor<Self, 3>, lengths: &[usize]) -> Tensor<Self, 3> {
-        let portable = mask_time_fallback(input.clone(), lengths);
-        let raw = crate::cubecl_kernels::mask_time(autodiff_to_inner(input), lengths);
-        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+        crate::asr_autodiff_kernels::mask_time(input, lengths)
     }
 
     fn sequence_mask(
@@ -187,9 +185,7 @@ where
     C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
 {
     fn mask_time(input: Tensor<Self, 3>, lengths: &[usize]) -> Tensor<Self, 3> {
-        let portable = mask_time_fallback(input.clone(), lengths);
-        let raw = crate::cubecl_kernels::mask_time(autodiff_to_inner(input), lengths);
-        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+        crate::asr_autodiff_kernels::mask_time(input, lengths)
     }
 
     fn sequence_mask(

@@ -20,6 +20,11 @@ use crate::tokenizer::load_sentencepiece_tokenizer;
 #[cfg(feature = "kotlin")]
 uniffi::setup_scaffolding!();
 
+#[cfg(all(
+    feature = "asr-cubecl-kernels",
+    any(feature = "burn-cuda-backend", feature = "burn-wgpu-backend")
+))]
+mod asr_autodiff_kernels;
 pub mod audio;
 #[cfg(any(feature = "c", feature = "cpp", feature = "csharp", feature = "go"))]
 #[path = "csharp.rs"]

@@ -138,15 +138,11 @@ where
     }
 
     fn mask_time(input: Tensor<Self, 3>, lengths: &[usize]) -> Tensor<Self, 3> {
-        let portable = apply_time_mask_fallback(input.clone(), lengths);
-        let raw = crate::cubecl_kernels::mask_time(autodiff_to_inner(input), lengths);
-        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+        crate::asr_autodiff_kernels::mask_time(input, lengths)
     }
 
     fn mask_channel_time(input: Tensor<Self, 3>, lengths: &[usize]) -> Tensor<Self, 3> {
-        let portable = apply_channel_time_mask_fallback(input.clone(), lengths);
-        let raw = crate::cubecl_kernels::mask_channel_time(autodiff_to_inner(input), lengths);
-        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+        crate::asr_autodiff_kernels::mask_channel_time(input, lengths)
     }
 
     fn attention_mask(
@@ -204,15 +200,11 @@ where
     }
 
     fn mask_time(input: Tensor<Self, 3>, lengths: &[usize]) -> Tensor<Self, 3> {
-        let portable = apply_time_mask_fallback(input.clone(), lengths);
-        let raw = crate::cubecl_kernels::mask_time(autodiff_to_inner(input), lengths);
-        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+        crate::asr_autodiff_kernels::mask_time(input, lengths)
     }
 
     fn mask_channel_time(input: Tensor<Self, 3>, lengths: &[usize]) -> Tensor<Self, 3> {
-        let portable = apply_channel_time_mask_fallback(input.clone(), lengths);
-        let raw = crate::cubecl_kernels::mask_channel_time(autodiff_to_inner(input), lengths);
-        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+        crate::asr_autodiff_kernels::mask_channel_time(input, lengths)
     }
 
     fn attention_mask(

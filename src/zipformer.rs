@@ -182,9 +182,7 @@ where
     }
 
     fn mask_time(input: Tensor<Self, 3>, lengths: &[usize]) -> Tensor<Self, 3> {
-        let portable = mask_time_fallback(input.clone(), lengths);
-        let raw = crate::cubecl_kernels::mask_time(autodiff_to_inner(input), lengths);
-        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+        crate::asr_autodiff_kernels::mask_time(input, lengths)
     }
 
     fn mask_add_time(
@@ -192,17 +190,7 @@ where
         update: Tensor<Self, 3>,
         lengths: &[usize],
     ) -> Tensor<Self, 3> {
-        let portable = mask_time_fallback(residual.clone() + update.clone(), lengths);
-        let residual_inner = autodiff_to_inner(residual);
-        let update_inner = autodiff_to_inner(update);
-        let lengths_inner =
-            lengths_tensor::<burn_cuda::Cuda<F, I>>(lengths, &residual_inner.device());
-        let raw = crate::cubecl_kernels::residual_add_mask_time(
-            residual_inner,
-            update_inner,
-            lengths_inner,
-        );
-        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+        crate::asr_autodiff_kernels::residual_add_mask_time(residual, update, lengths)
     }
 
     fn glu_last_dim(input: Tensor<Self, 3>) -> Tensor<Self, 3> {
@@ -311,9 +299,7 @@ where
     }
 
     fn mask_time(input: Tensor<Self, 3>, lengths: &[usize]) -> Tensor<Self, 3> {
-        let portable = mask_time_fallback(input.clone(), lengths);
-        let raw = crate::cubecl_kernels::mask_time(autodiff_to_inner(input), lengths);
-        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+        crate::asr_autodiff_kernels::mask_time(input, lengths)
     }
 
     fn mask_add_time(
@@ -321,17 +307,7 @@ where
         update: Tensor<Self, 3>,
         lengths: &[usize],
     ) -> Tensor<Self, 3> {
-        let portable = mask_time_fallback(residual.clone() + update.clone(), lengths);
-        let residual_inner = autodiff_to_inner(residual);
-        let update_inner = autodiff_to_inner(update);
-        let lengths_inner =
-            lengths_tensor::<burn_wgpu::Wgpu<F, I, BT>>(lengths, &residual_inner.device());
-        let raw = crate::cubecl_kernels::residual_add_mask_time(
-            residual_inner,
-            update_inner,
-            lengths_inner,
-        );
-        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+        crate::asr_autodiff_kernels::residual_add_mask_time(residual, update, lengths)
     }
 
     fn glu_last_dim(input: Tensor<Self, 3>) -> Tensor<Self, 3> {
