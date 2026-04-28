@@ -16,7 +16,7 @@ use crate::{
     normalize_spaces,
 };
 
-use super::SqueezeformerCtc;
+use super::{SqueezeformerCtc, SqueezeformerKernelBackend};
 
 #[derive(Clone, Debug, Default)]
 pub struct SqueezeformerTranscriptionConfig {
@@ -71,7 +71,7 @@ impl SqueezeformerTimingReport {
     }
 }
 
-pub struct SqueezeformerTranscriber<B: Backend> {
+pub struct SqueezeformerTranscriber<B: SqueezeformerKernelBackend> {
     audio: AudioDecodeConfig,
     frontend: W2vBertFrontendConfig,
     model: SqueezeformerCtc<B>,
@@ -82,7 +82,7 @@ pub struct SqueezeformerTranscriber<B: Backend> {
     tokenizer_load_elapsed: Option<Duration>,
 }
 
-impl<B: Backend> SqueezeformerTranscriber<B> {
+impl<B: SqueezeformerKernelBackend> SqueezeformerTranscriber<B> {
     pub fn new(
         model: SqueezeformerCtc<B>,
         device: B::Device,

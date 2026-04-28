@@ -41,12 +41,17 @@ use crate::audio::{
 };
 use crate::ctc::{CtcCandidate, threaded_ctc_beam_search_decode_n_best};
 use crate::paraformer::{
-    EnhancedParaformerV2, EnhancedParaformerV2Config, ParaformerAlignmentMode, ParaformerV2,
-    ParaformerV2Config,
+    EnhancedParaformerV2, EnhancedParaformerV2Config, ParaformerAlignmentMode,
+    ParaformerKernelBackend, ParaformerV2, ParaformerV2Config,
 };
-use crate::squeezeformer::{SqueezeformerCtc, SqueezeformerCtcConfig, SqueezeformerEncoderConfig};
+use crate::squeezeformer::{
+    SqueezeformerCtc, SqueezeformerCtcConfig, SqueezeformerEncoderConfig,
+    SqueezeformerKernelBackend,
+};
 use crate::tokenizer::{load_sentencepiece_tokenizer, load_sentencepiece_transcript_tokenizer};
-use crate::wav2vec::{Wav2VecBertConfig, Wav2VecBertCtc, Wav2VecBertCtcConfig};
+use crate::wav2vec::{
+    Wav2VecBertConfig, Wav2VecBertCtc, Wav2VecBertCtcConfig, Wav2VecKernelBackend,
+};
 use crate::zipformer::{ZipformerConfig, ZipformerCtc, ZipformerCtcConfig, ZipformerKernelBackend};
 use crate::{W2vBertEncoderConfig, normalize_spaces};
 
@@ -1010,6 +1015,12 @@ where
     InnerBackend: Backend + ZipformerKernelBackend,
     burn_autodiff::Autodiff<InnerBackend>:
         Backend<Device = InnerBackend::Device> + ZipformerKernelBackend,
+    InnerBackend: SqueezeformerKernelBackend + Wav2VecKernelBackend,
+    burn_autodiff::Autodiff<InnerBackend>: SqueezeformerKernelBackend + Wav2VecKernelBackend,
+    InnerBackend: ParaformerKernelBackend,
+    burn_autodiff::Autodiff<InnerBackend>: ParaformerKernelBackend,
+    burn_autodiff::Autodiff<InnerBackend, BalancedCheckpointing>:
+        Backend<Device = InnerBackend::Device> + Wav2VecKernelBackend,
 {
     type TrainBackend<InnerBackend> = burn_autodiff::Autodiff<InnerBackend>;
     let device = devices
@@ -1253,7 +1264,8 @@ fn build_wav2vec_model<B: Backend>(
 
 fn train_wav2vec_model<B>(config: &BurnTrainConfig, devices: &[B::Device]) -> Result<TrainSummary>
 where
-    B: AutodiffBackend,
+    B: AutodiffBackend + Wav2VecKernelBackend,
+    B::InnerBackend: Wav2VecKernelBackend,
 {
     let device = devices
         .first()
@@ -1308,7 +1320,7 @@ trait ValidCtc<B: Backend>: Module<B> {
     -> (Tensor<B, 3>, Vec<usize>);
 }
 
-impl<B: AutodiffBackend> TrainableCtc<B> for SqueezeformerCtc<B> {
+impl<B: AutodiffBackend + SqueezeformerKernelBackend> TrainableCtc<B> for SqueezeformerCtc<B> {
     fn ctc_logits(
         &self,
         features: Tensor<B, 3>,
@@ -1318,7 +1330,7 @@ impl<B: AutodiffBackend> TrainableCtc<B> for SqueezeformerCtc<B> {
     }
 }
 
-impl<B: Backend> ValidCtc<B> for SqueezeformerCtc<B> {
+impl<B: Backend + SqueezeformerKernelBackend> ValidCtc<B> for SqueezeformerCtc<B> {
     fn ctc_logits(
         &self,
         features: Tensor<B, 3>,
@@ -1348,7 +1360,7 @@ impl<B: Backend + ZipformerKernelBackend> ValidCtc<B> for ZipformerCtc<B> {
     }
 }
 
-impl<B: AutodiffBackend> TrainableCtc<B> for Wav2VecBertCtc<B> {
+impl<B: AutodiffBackend + Wav2VecKernelBackend> TrainableCtc<B> for Wav2VecBertCtc<B> {
     fn ctc_logits(
         &self,
         features: Tensor<B, 3>,
@@ -1358,7 +1370,7 @@ impl<B: AutodiffBackend> TrainableCtc<B> for Wav2VecBertCtc<B> {
     }
 }
 
-impl<B: Backend> ValidCtc<B> for Wav2VecBertCtc<B> {
+impl<B: Backend + Wav2VecKernelBackend> ValidCtc<B> for Wav2VecBertCtc<B> {
     fn ctc_logits(
         &self,
         features: Tensor<B, 3>,
@@ -1368,7 +1380,7 @@ impl<B: Backend> ValidCtc<B> for Wav2VecBertCtc<B> {
     }
 }
 
-impl<B: AutodiffBackend> TrainableCtc<B> for ParaformerV2<B> {
+impl<B: AutodiffBackend + ParaformerKernelBackend> TrainableCtc<B> for ParaformerV2<B> {
     fn ctc_logits(
         &self,
         features: Tensor<B, 3>,
@@ -1379,7 +1391,7 @@ impl<B: AutodiffBackend> TrainableCtc<B> for ParaformerV2<B> {
     }
 }
 
-impl<B: Backend> ValidCtc<B> for ParaformerV2<B> {
+impl<B: Backend + ParaformerKernelBackend> ValidCtc<B> for ParaformerV2<B> {
     fn ctc_logits(
         &self,
         features: Tensor<B, 3>,
@@ -2179,7 +2191,8 @@ fn train_paraformer_model<B>(
     devices: &[B::Device],
 ) -> Result<TrainSummary>
 where
-    B: AutodiffBackend,
+    B: AutodiffBackend + ParaformerKernelBackend,
+    B::InnerBackend: ParaformerKernelBackend,
 {
     let device = devices
         .first()
@@ -2516,7 +2529,8 @@ fn evaluate_paraformer_model<B>(
     decoder: &ValidationDecoder,
 ) -> Result<ValidationSummary>
 where
-    B: AutodiffBackend,
+    B: AutodiffBackend + ParaformerKernelBackend,
+    B::InnerBackend: ParaformerKernelBackend,
 {
     let mut total = 0.0f64;
     let mut count = 0usize;
@@ -2580,7 +2594,8 @@ fn train_enhanced_paraformer_model<B>(
     devices: &[B::Device],
 ) -> Result<TrainSummary>
 where
-    B: AutodiffBackend,
+    B: AutodiffBackend + ParaformerKernelBackend,
+    B::InnerBackend: ParaformerKernelBackend,
 {
     let device = devices
         .first()
@@ -2938,7 +2953,8 @@ fn evaluate_enhanced_paraformer_model<B>(
     decoder: &ValidationDecoder,
 ) -> Result<ValidationSummary>
 where
-    B: AutodiffBackend,
+    B: AutodiffBackend + ParaformerKernelBackend,
+    B::InnerBackend: ParaformerKernelBackend,
 {
     let mut total = 0.0f64;
     let mut count = 0usize;
@@ -3001,7 +3017,7 @@ fn paraformer_loss_for_batch<B>(
     augment: bool,
 ) -> crate::paraformer::ParaformerLossOutput<B>
 where
-    B: AutodiffBackend,
+    B: AutodiffBackend + ParaformerKernelBackend,
 {
     let features = Tensor::<B, 3>::from_data(
         TensorData::new(
@@ -3036,7 +3052,7 @@ fn enhanced_paraformer_loss_for_batch<B>(
     augment: bool,
 ) -> crate::paraformer::EnhancedParaformerLossOutput<B>
 where
-    B: AutodiffBackend,
+    B: AutodiffBackend + ParaformerKernelBackend,
 {
     let features = Tensor::<B, 3>::from_data(
         TensorData::new(

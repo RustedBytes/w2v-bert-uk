@@ -1,5 +1,9 @@
 use burn::module::{Initializer, Module, Param, RunningState};
+#[cfg(feature = "asr-cubecl-kernels")]
+use burn::tensor::TensorPrimitive;
 use burn::tensor::activation::{relu, silu, softmax};
+#[cfg(feature = "asr-cubecl-kernels")]
+use burn::tensor::backend::AutodiffBackend;
 use burn::tensor::ops::PadMode;
 use burn::tensor::{Bool, Tensor, TensorData, backend::Backend};
 use burn_nn::conv::{Conv1d, Conv1dConfig, Conv2d, Conv2dConfig};
@@ -10,6 +14,258 @@ use burn_nn::{
 pub mod transcribe;
 
 const DEFAULT_MAX_POSITION: usize = 5000;
+
+pub trait SqueezeformerKernelBackend: Backend + Sized {
+    fn relative_shift(input: Tensor<Self, 4>, seq_len: usize) -> Tensor<Self, 4> {
+        relative_shift_fallback(input, seq_len)
+    }
+
+    fn mask_time(input: Tensor<Self, 3>, lengths: &[usize]) -> Tensor<Self, 3> {
+        apply_time_mask_fallback(input, lengths)
+    }
+
+    fn mask_channel_time(input: Tensor<Self, 3>, lengths: &[usize]) -> Tensor<Self, 3> {
+        apply_channel_time_mask_fallback(input, lengths)
+    }
+
+    fn attention_mask(
+        lengths: &[usize],
+        max_len: usize,
+        device: &Self::Device,
+    ) -> Tensor<Self, 3, Bool> {
+        attention_mask_fallback(lengths, max_len, device)
+    }
+}
+
+impl SqueezeformerKernelBackend for burn_ndarray::NdArray<f32> {}
+
+impl<C> SqueezeformerKernelBackend for burn_autodiff::Autodiff<burn_ndarray::NdArray<f32>, C> where
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy
+{
+}
+
+#[cfg(feature = "asr-cubecl-kernels")]
+fn autodiff_to_inner<B, C, const D: usize>(
+    tensor: Tensor<burn_autodiff::Autodiff<B, C>, D>,
+) -> Tensor<B, D>
+where
+    B: Backend,
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
+{
+    let tensor =
+        <burn_autodiff::Autodiff<B, C> as AutodiffBackend>::inner(tensor.into_primitive().tensor());
+    Tensor::from_primitive(TensorPrimitive::Float(tensor))
+}
+
+#[cfg(feature = "asr-cubecl-kernels")]
+fn inner_to_autodiff<B, C, const D: usize>(
+    tensor: Tensor<B, D>,
+) -> Tensor<burn_autodiff::Autodiff<B, C>, D>
+where
+    B: Backend,
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
+{
+    let tensor = <burn_autodiff::Autodiff<B, C> as AutodiffBackend>::from_inner(
+        tensor.into_primitive().tensor(),
+    );
+    Tensor::from_primitive(TensorPrimitive::Float(tensor))
+}
+
+#[cfg(feature = "asr-cubecl-kernels")]
+fn inner_bool_to_autodiff<B, C, const D: usize>(
+    tensor: Tensor<B, D, Bool>,
+) -> Tensor<burn_autodiff::Autodiff<B, C>, D, Bool>
+where
+    B: Backend,
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
+{
+    let tensor = <burn_autodiff::Autodiff<B, C> as AutodiffBackend>::bool_from_inner(
+        tensor.into_primitive(),
+    );
+    Tensor::from_primitive(tensor)
+}
+
+#[cfg(feature = "asr-cubecl-kernels")]
+fn attach_autodiff_gradient<B, C, const D: usize>(
+    raw: Tensor<burn_autodiff::Autodiff<B, C>, D>,
+    portable: Tensor<burn_autodiff::Autodiff<B, C>, D>,
+) -> Tensor<burn_autodiff::Autodiff<B, C>, D>
+where
+    B: Backend,
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
+{
+    raw + portable.clone() - portable.detach()
+}
+
+#[cfg(all(feature = "asr-cubecl-kernels", feature = "burn-cuda-backend"))]
+impl<F, I> SqueezeformerKernelBackend for burn_cuda::Cuda<F, I>
+where
+    F: burn_cubecl::FloatElement,
+    I: burn_cubecl::IntElement,
+{
+    fn relative_shift(input: Tensor<Self, 4>, seq_len: usize) -> Tensor<Self, 4> {
+        crate::cubecl_kernels::relative_shift(input, seq_len)
+    }
+
+    fn mask_time(input: Tensor<Self, 3>, lengths: &[usize]) -> Tensor<Self, 3> {
+        crate::cubecl_kernels::mask_time(input, lengths)
+    }
+
+    fn mask_channel_time(input: Tensor<Self, 3>, lengths: &[usize]) -> Tensor<Self, 3> {
+        crate::cubecl_kernels::mask_channel_time(input, lengths)
+    }
+
+    fn attention_mask(
+        lengths: &[usize],
+        max_len: usize,
+        device: &Self::Device,
+    ) -> Tensor<Self, 3, Bool> {
+        crate::cubecl_kernels::attention_mask(lengths, max_len, max_len, device)
+    }
+}
+
+#[cfg(all(feature = "asr-cubecl-kernels", feature = "burn-cuda-backend"))]
+impl<F, I, C> SqueezeformerKernelBackend for burn_autodiff::Autodiff<burn_cuda::Cuda<F, I>, C>
+where
+    F: burn_cubecl::FloatElement,
+    I: burn_cubecl::IntElement,
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
+{
+    fn relative_shift(input: Tensor<Self, 4>, seq_len: usize) -> Tensor<Self, 4> {
+        let portable = relative_shift_fallback(input.clone(), seq_len);
+        let raw = crate::cubecl_kernels::relative_shift(autodiff_to_inner(input), seq_len);
+        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+    }
+
+    fn mask_time(input: Tensor<Self, 3>, lengths: &[usize]) -> Tensor<Self, 3> {
+        let portable = apply_time_mask_fallback(input.clone(), lengths);
+        let raw = crate::cubecl_kernels::mask_time(autodiff_to_inner(input), lengths);
+        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+    }
+
+    fn mask_channel_time(input: Tensor<Self, 3>, lengths: &[usize]) -> Tensor<Self, 3> {
+        let portable = apply_channel_time_mask_fallback(input.clone(), lengths);
+        let raw = crate::cubecl_kernels::mask_channel_time(autodiff_to_inner(input), lengths);
+        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+    }
+
+    fn attention_mask(
+        lengths: &[usize],
+        max_len: usize,
+        device: &Self::Device,
+    ) -> Tensor<Self, 3, Bool> {
+        let raw =
+            crate::cubecl_kernels::attention_mask::<_, F, I, u8>(lengths, max_len, max_len, device);
+        inner_bool_to_autodiff(raw)
+    }
+}
+
+#[cfg(all(feature = "asr-cubecl-kernels", feature = "burn-wgpu-backend"))]
+impl<F, I, BT> SqueezeformerKernelBackend for burn_wgpu::Wgpu<F, I, BT>
+where
+    F: burn_cubecl::FloatElement,
+    I: burn_cubecl::IntElement,
+    BT: burn_cubecl::element::BoolElement,
+{
+    fn relative_shift(input: Tensor<Self, 4>, seq_len: usize) -> Tensor<Self, 4> {
+        crate::cubecl_kernels::relative_shift(input, seq_len)
+    }
+
+    fn mask_time(input: Tensor<Self, 3>, lengths: &[usize]) -> Tensor<Self, 3> {
+        crate::cubecl_kernels::mask_time(input, lengths)
+    }
+
+    fn mask_channel_time(input: Tensor<Self, 3>, lengths: &[usize]) -> Tensor<Self, 3> {
+        crate::cubecl_kernels::mask_channel_time(input, lengths)
+    }
+
+    fn attention_mask(
+        lengths: &[usize],
+        max_len: usize,
+        device: &Self::Device,
+    ) -> Tensor<Self, 3, Bool> {
+        crate::cubecl_kernels::attention_mask(lengths, max_len, max_len, device)
+    }
+}
+
+#[cfg(all(feature = "asr-cubecl-kernels", feature = "burn-wgpu-backend"))]
+impl<F, I, BT, C> SqueezeformerKernelBackend
+    for burn_autodiff::Autodiff<burn_wgpu::Wgpu<F, I, BT>, C>
+where
+    F: burn_cubecl::FloatElement,
+    I: burn_cubecl::IntElement,
+    BT: burn_cubecl::element::BoolElement,
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
+{
+    fn relative_shift(input: Tensor<Self, 4>, seq_len: usize) -> Tensor<Self, 4> {
+        let portable = relative_shift_fallback(input.clone(), seq_len);
+        let raw = crate::cubecl_kernels::relative_shift(autodiff_to_inner(input), seq_len);
+        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+    }
+
+    fn mask_time(input: Tensor<Self, 3>, lengths: &[usize]) -> Tensor<Self, 3> {
+        let portable = apply_time_mask_fallback(input.clone(), lengths);
+        let raw = crate::cubecl_kernels::mask_time(autodiff_to_inner(input), lengths);
+        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+    }
+
+    fn mask_channel_time(input: Tensor<Self, 3>, lengths: &[usize]) -> Tensor<Self, 3> {
+        let portable = apply_channel_time_mask_fallback(input.clone(), lengths);
+        let raw = crate::cubecl_kernels::mask_channel_time(autodiff_to_inner(input), lengths);
+        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+    }
+
+    fn attention_mask(
+        lengths: &[usize],
+        max_len: usize,
+        device: &Self::Device,
+    ) -> Tensor<Self, 3, Bool> {
+        let raw =
+            crate::cubecl_kernels::attention_mask::<_, F, I, BT>(lengths, max_len, max_len, device);
+        inner_bool_to_autodiff(raw)
+    }
+}
+
+#[cfg(all(feature = "burn-cuda-backend", not(feature = "asr-cubecl-kernels")))]
+impl<F, I> SqueezeformerKernelBackend for burn_cuda::Cuda<F, I>
+where
+    F: burn_cubecl::FloatElement,
+    I: burn_cubecl::IntElement,
+    burn_cuda::Cuda<F, I>: Backend,
+{
+}
+
+#[cfg(all(feature = "burn-cuda-backend", not(feature = "asr-cubecl-kernels")))]
+impl<F, I, C> SqueezeformerKernelBackend for burn_autodiff::Autodiff<burn_cuda::Cuda<F, I>, C>
+where
+    F: burn_cubecl::FloatElement,
+    I: burn_cubecl::IntElement,
+    burn_cuda::Cuda<F, I>: Backend,
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
+{
+}
+
+#[cfg(all(feature = "burn-wgpu-backend", not(feature = "asr-cubecl-kernels")))]
+impl<F, I, BT> SqueezeformerKernelBackend for burn_wgpu::Wgpu<F, I, BT>
+where
+    F: burn_cubecl::FloatElement,
+    I: burn_cubecl::IntElement,
+    BT: burn_cubecl::element::BoolElement,
+    burn_wgpu::Wgpu<F, I, BT>: Backend,
+{
+}
+
+#[cfg(all(feature = "burn-wgpu-backend", not(feature = "asr-cubecl-kernels")))]
+impl<F, I, BT, C> SqueezeformerKernelBackend
+    for burn_autodiff::Autodiff<burn_wgpu::Wgpu<F, I, BT>, C>
+where
+    F: burn_cubecl::FloatElement,
+    I: burn_cubecl::IntElement,
+    BT: burn_cubecl::element::BoolElement,
+    burn_wgpu::Wgpu<F, I, BT>: Backend,
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
+{
+}
 
 #[derive(Clone, Debug)]
 pub struct ScaleBiasLayerConfig {
@@ -142,7 +398,7 @@ pub struct RelPositionMultiHeadAttention<B: Backend> {
     head_dim: usize,
 }
 
-impl<B: Backend> RelPositionMultiHeadAttention<B> {
+impl<B: SqueezeformerKernelBackend> RelPositionMultiHeadAttention<B> {
     pub fn forward(
         &self,
         query: Tensor<B, 3>,
@@ -167,7 +423,7 @@ impl<B: Backend> RelPositionMultiHeadAttention<B> {
             .reshape([1, self.n_heads, 1, self.head_dim]);
 
         let content_scores = q_u.matmul(k.swap_dims(2, 3));
-        let position_scores = self.relative_shift(q_v.matmul(p.swap_dims(2, 3)), seq_len);
+        let position_scores = B::relative_shift(q_v.matmul(p.swap_dims(2, 3)), seq_len);
         let mut scores = (content_scores + position_scores) / (self.head_dim as f64).sqrt();
 
         let expanded_mask = mask.unsqueeze_dim::<4>(1).repeat_dim(1, self.n_heads);
@@ -193,16 +449,6 @@ impl<B: Backend> RelPositionMultiHeadAttention<B> {
         input
             .reshape([batch_size, seq_len, self.n_heads, self.head_dim])
             .swap_dims(1, 2)
-    }
-
-    fn relative_shift(&self, input: Tensor<B, 4>, seq_len: usize) -> Tensor<B, 4> {
-        let [batch_size, n_heads, _, pos_len] = input.dims();
-        let padded = input.pad([(0, 0), (0, 1)], PadMode::Constant(0.0));
-        padded
-            .reshape([batch_size, n_heads, pos_len + 1, seq_len])
-            .slice_dim(2, 1..pos_len + 1)
-            .reshape([batch_size, n_heads, seq_len, pos_len])
-            .slice_dim(3, 0..seq_len)
     }
 }
 
@@ -302,7 +548,7 @@ pub struct AttentionModule<B: Backend> {
     dropout: Dropout,
 }
 
-impl<B: Backend> AttentionModule<B> {
+impl<B: SqueezeformerKernelBackend> AttentionModule<B> {
     pub fn forward(
         &self,
         input: Tensor<B, 3>,
@@ -378,7 +624,7 @@ pub struct ConvolutionModule<B: Backend> {
     dropout: Dropout,
 }
 
-impl<B: Backend> ConvolutionModule<B> {
+impl<B: SqueezeformerKernelBackend> ConvolutionModule<B> {
     pub fn forward(&self, input: Tensor<B, 3>, lengths: &[usize]) -> Tensor<B, 3> {
         let residual = input.clone();
         let [batch_size, seq_len, d_model] = input.dims();
@@ -387,11 +633,11 @@ impl<B: Backend> ConvolutionModule<B> {
         let output = output.swap_dims(1, 2);
         let output = self.pointwise_in.forward(output);
         let output = silu(output);
-        let output = apply_channel_time_mask(output, lengths);
+        let output = B::mask_channel_time(output, lengths);
         let output = self.depthwise.forward(output);
         let output = self.batch_norm.forward(output);
         let output = silu(output);
-        let output = apply_channel_time_mask(output, lengths);
+        let output = B::mask_channel_time(output, lengths);
         let output = self.pointwise_out.forward(output);
         let output = self.dropout.forward(output);
 
@@ -591,7 +837,7 @@ pub struct MhsaFfModule<B: Backend> {
     out_norm: LayerNorm<B>,
 }
 
-impl<B: Backend> MhsaFfModule<B> {
+impl<B: SqueezeformerKernelBackend> MhsaFfModule<B> {
     pub fn forward(
         &self,
         input: Tensor<B, 3>,
@@ -613,7 +859,7 @@ pub struct ConvFfModule<B: Backend> {
     out_norm: LayerNorm<B>,
 }
 
-impl<B: Backend> ConvFfModule<B> {
+impl<B: SqueezeformerKernelBackend> ConvFfModule<B> {
     pub fn forward(&self, input: Tensor<B, 3>, lengths: &[usize]) -> Tensor<B, 3> {
         let output = self.convolution.forward(input, lengths);
         let output = self.mid_norm.forward(output);
@@ -628,7 +874,7 @@ pub struct SqueezeformerBlock<B: Backend> {
     conv_ff: ConvFfModule<B>,
 }
 
-impl<B: Backend> SqueezeformerBlock<B> {
+impl<B: SqueezeformerKernelBackend> SqueezeformerBlock<B> {
     pub fn forward(
         &self,
         input: Tensor<B, 3>,
@@ -738,9 +984,9 @@ pub struct TimeReductionLayer<B: Backend> {
     stride: usize,
 }
 
-impl<B: Backend> TimeReductionLayer<B> {
+impl<B: SqueezeformerKernelBackend> TimeReductionLayer<B> {
     pub fn forward(&self, input: Tensor<B, 3>, lengths: &[usize]) -> (Tensor<B, 3>, Vec<usize>) {
-        let output = apply_time_mask(input, lengths).swap_dims(1, 2);
+        let output = B::mask_time(input, lengths).swap_dims(1, 2);
         let output = output.pad(
             [(0, self.kernel_size.saturating_sub(self.stride))],
             PadMode::Constant(0.0),
@@ -923,7 +1169,7 @@ pub struct SqueezeformerEncoder<B: Backend> {
     d_model: usize,
 }
 
-impl<B: Backend> SqueezeformerEncoder<B> {
+impl<B: SqueezeformerKernelBackend> SqueezeformerEncoder<B> {
     pub fn forward(&self, input: Tensor<B, 3>) -> Tensor<B, 3> {
         let [batch_size, seq_len, _] = input.dims();
         self.forward_with_lengths(input, vec![seq_len; batch_size])
@@ -941,7 +1187,7 @@ impl<B: Backend> SqueezeformerEncoder<B> {
         output = self.input_projection.forward(output) * (self.d_model as f64).sqrt();
         output = self.input_dropout.forward(output);
         output = self.input_norm.forward(output);
-        output = apply_time_mask(output, &lengths);
+        output = B::mask_time(output, &lengths);
 
         let mut stack = Vec::new();
         for (index, block) in self.blocks.iter().enumerate() {
@@ -967,9 +1213,9 @@ impl<B: Backend> SqueezeformerEncoder<B> {
 
             let seq_len = output.dims()[1];
             let pos_embedding = self.pos_encoding.forward::<B>(seq_len, &device);
-            let mask = attention_mask::<B>(&lengths, seq_len, &device);
+            let mask = B::attention_mask(&lengths, seq_len, &device);
             output = block.forward(output, &lengths, pos_embedding, mask);
-            output = apply_time_mask(output, &lengths);
+            output = B::mask_time(output, &lengths);
         }
 
         (output, lengths)
@@ -1020,7 +1266,7 @@ pub struct SqueezeformerCtc<B: Backend> {
     classifier: Linear<B>,
 }
 
-impl<B: Backend> SqueezeformerCtc<B> {
+impl<B: SqueezeformerKernelBackend> SqueezeformerCtc<B> {
     pub fn forward(&self, input: Tensor<B, 3>) -> Tensor<B, 3> {
         self.forward_with_lengths(input, None).0
     }
@@ -1059,7 +1305,17 @@ fn sequence_mask<B: Backend>(
     Tensor::from_data(TensorData::new(values, [lengths.len(), max_len]), device)
 }
 
-fn attention_mask<B: Backend>(
+fn relative_shift_fallback<B: Backend>(input: Tensor<B, 4>, seq_len: usize) -> Tensor<B, 4> {
+    let [batch_size, n_heads, _, pos_len] = input.dims();
+    let padded = input.pad([(0, 0), (0, 1)], PadMode::Constant(0.0));
+    padded
+        .reshape([batch_size, n_heads, pos_len + 1, seq_len])
+        .slice_dim(2, 1..pos_len + 1)
+        .reshape([batch_size, n_heads, seq_len, pos_len])
+        .slice_dim(3, 0..seq_len)
+}
+
+fn attention_mask_fallback<B: Backend>(
     lengths: &[usize],
     max_len: usize,
     device: &B::Device,
@@ -1071,7 +1327,7 @@ fn attention_mask<B: Backend>(
         .bool_and(mask.unsqueeze_dim::<3>(2).repeat_dim(2, max_len))
 }
 
-fn apply_time_mask<B: Backend>(input: Tensor<B, 3>, lengths: &[usize]) -> Tensor<B, 3> {
+fn apply_time_mask_fallback<B: Backend>(input: Tensor<B, 3>, lengths: &[usize]) -> Tensor<B, 3> {
     let [_, seq_len, _] = input.dims();
     let mask = sequence_mask::<B>(lengths, seq_len, &input.device())
         .float()
@@ -1079,7 +1335,10 @@ fn apply_time_mask<B: Backend>(input: Tensor<B, 3>, lengths: &[usize]) -> Tensor
     input * mask
 }
 
-fn apply_channel_time_mask<B: Backend>(input: Tensor<B, 3>, lengths: &[usize]) -> Tensor<B, 3> {
+fn apply_channel_time_mask_fallback<B: Backend>(
+    input: Tensor<B, 3>,
+    lengths: &[usize],
+) -> Tensor<B, 3> {
     let [_, _, seq_len] = input.dims();
     let mask = sequence_mask::<B>(lengths, seq_len, &input.device())
         .float()

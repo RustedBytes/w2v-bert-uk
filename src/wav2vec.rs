@@ -5,7 +5,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use burn::module::Module;
 use burn::module::{Initializer, Param};
+#[cfg(feature = "asr-cubecl-kernels")]
+use burn::tensor::TensorPrimitive;
 use burn::tensor::activation::{gelu, log_softmax, sigmoid, softmax};
+#[cfg(feature = "asr-cubecl-kernels")]
+use burn::tensor::backend::AutodiffBackend;
 use burn::tensor::ops::PadMode;
 use burn::tensor::{Bool, Int, Tensor, TensorData, backend::Backend};
 use burn_nn::conv::{Conv1d, Conv1dConfig};
@@ -19,6 +23,230 @@ use safetensors::tensor::{Dtype, TensorView};
 use serde_json::{Map, Value, json};
 
 pub const DEFAULT_W2V_BERT_MODEL: &str = "facebook/w2v-bert-2.0";
+
+pub trait Wav2VecKernelBackend: Backend + Sized {
+    fn mask_time(input: Tensor<Self, 3>, lengths: &[usize]) -> Tensor<Self, 3> {
+        mask_time_fallback(input, lengths)
+    }
+
+    fn sequence_mask(
+        lengths: &[usize],
+        max_len: usize,
+        device: &Self::Device,
+    ) -> Tensor<Self, 2, Bool> {
+        sequence_mask_fallback(lengths, max_len, device)
+    }
+
+    fn glu_channel_dim(input: Tensor<Self, 3>) -> Tensor<Self, 3> {
+        glu_fallback(input, 1)
+    }
+}
+
+impl Wav2VecKernelBackend for burn_ndarray::NdArray<f32> {}
+
+impl<C> Wav2VecKernelBackend for burn_autodiff::Autodiff<burn_ndarray::NdArray<f32>, C> where
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy
+{
+}
+
+#[cfg(feature = "asr-cubecl-kernels")]
+fn autodiff_to_inner<B, C, const D: usize>(
+    tensor: Tensor<burn_autodiff::Autodiff<B, C>, D>,
+) -> Tensor<B, D>
+where
+    B: Backend,
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
+{
+    let tensor =
+        <burn_autodiff::Autodiff<B, C> as AutodiffBackend>::inner(tensor.into_primitive().tensor());
+    Tensor::from_primitive(TensorPrimitive::Float(tensor))
+}
+
+#[cfg(feature = "asr-cubecl-kernels")]
+fn inner_to_autodiff<B, C, const D: usize>(
+    tensor: Tensor<B, D>,
+) -> Tensor<burn_autodiff::Autodiff<B, C>, D>
+where
+    B: Backend,
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
+{
+    let tensor = <burn_autodiff::Autodiff<B, C> as AutodiffBackend>::from_inner(
+        tensor.into_primitive().tensor(),
+    );
+    Tensor::from_primitive(TensorPrimitive::Float(tensor))
+}
+
+#[cfg(feature = "asr-cubecl-kernels")]
+fn inner_bool_to_autodiff<B, C, const D: usize>(
+    tensor: Tensor<B, D, Bool>,
+) -> Tensor<burn_autodiff::Autodiff<B, C>, D, Bool>
+where
+    B: Backend,
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
+{
+    let tensor = <burn_autodiff::Autodiff<B, C> as AutodiffBackend>::bool_from_inner(
+        tensor.into_primitive(),
+    );
+    Tensor::from_primitive(tensor)
+}
+
+#[cfg(feature = "asr-cubecl-kernels")]
+fn attach_autodiff_gradient<B, C, const D: usize>(
+    raw: Tensor<burn_autodiff::Autodiff<B, C>, D>,
+    portable: Tensor<burn_autodiff::Autodiff<B, C>, D>,
+) -> Tensor<burn_autodiff::Autodiff<B, C>, D>
+where
+    B: Backend,
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
+{
+    raw + portable.clone() - portable.detach()
+}
+
+#[cfg(all(feature = "asr-cubecl-kernels", feature = "burn-cuda-backend"))]
+impl<F, I> Wav2VecKernelBackend for burn_cuda::Cuda<F, I>
+where
+    F: burn_cubecl::FloatElement,
+    I: burn_cubecl::IntElement,
+{
+    fn mask_time(input: Tensor<Self, 3>, lengths: &[usize]) -> Tensor<Self, 3> {
+        crate::cubecl_kernels::mask_time(input, lengths)
+    }
+
+    fn sequence_mask(
+        lengths: &[usize],
+        max_len: usize,
+        device: &Self::Device,
+    ) -> Tensor<Self, 2, Bool> {
+        crate::cubecl_kernels::sequence_mask(lengths, max_len, device)
+    }
+
+    fn glu_channel_dim(input: Tensor<Self, 3>) -> Tensor<Self, 3> {
+        crate::cubecl_kernels::glu_channel_dim(input)
+    }
+}
+
+#[cfg(all(feature = "asr-cubecl-kernels", feature = "burn-cuda-backend"))]
+impl<F, I, C> Wav2VecKernelBackend for burn_autodiff::Autodiff<burn_cuda::Cuda<F, I>, C>
+where
+    F: burn_cubecl::FloatElement,
+    I: burn_cubecl::IntElement,
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
+{
+    fn mask_time(input: Tensor<Self, 3>, lengths: &[usize]) -> Tensor<Self, 3> {
+        let portable = mask_time_fallback(input.clone(), lengths);
+        let raw = crate::cubecl_kernels::mask_time(autodiff_to_inner(input), lengths);
+        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+    }
+
+    fn sequence_mask(
+        lengths: &[usize],
+        max_len: usize,
+        device: &Self::Device,
+    ) -> Tensor<Self, 2, Bool> {
+        let raw = crate::cubecl_kernels::sequence_mask::<_, F, I, u8>(lengths, max_len, device);
+        inner_bool_to_autodiff(raw)
+    }
+
+    fn glu_channel_dim(input: Tensor<Self, 3>) -> Tensor<Self, 3> {
+        let portable = glu_fallback(input.clone(), 1);
+        let raw = crate::cubecl_kernels::glu_channel_dim(autodiff_to_inner(input));
+        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+    }
+}
+
+#[cfg(all(feature = "asr-cubecl-kernels", feature = "burn-wgpu-backend"))]
+impl<F, I, BT> Wav2VecKernelBackend for burn_wgpu::Wgpu<F, I, BT>
+where
+    F: burn_cubecl::FloatElement,
+    I: burn_cubecl::IntElement,
+    BT: burn_cubecl::element::BoolElement,
+{
+    fn mask_time(input: Tensor<Self, 3>, lengths: &[usize]) -> Tensor<Self, 3> {
+        crate::cubecl_kernels::mask_time(input, lengths)
+    }
+
+    fn sequence_mask(
+        lengths: &[usize],
+        max_len: usize,
+        device: &Self::Device,
+    ) -> Tensor<Self, 2, Bool> {
+        crate::cubecl_kernels::sequence_mask(lengths, max_len, device)
+    }
+
+    fn glu_channel_dim(input: Tensor<Self, 3>) -> Tensor<Self, 3> {
+        crate::cubecl_kernels::glu_channel_dim(input)
+    }
+}
+
+#[cfg(all(feature = "asr-cubecl-kernels", feature = "burn-wgpu-backend"))]
+impl<F, I, BT, C> Wav2VecKernelBackend for burn_autodiff::Autodiff<burn_wgpu::Wgpu<F, I, BT>, C>
+where
+    F: burn_cubecl::FloatElement,
+    I: burn_cubecl::IntElement,
+    BT: burn_cubecl::element::BoolElement,
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
+{
+    fn mask_time(input: Tensor<Self, 3>, lengths: &[usize]) -> Tensor<Self, 3> {
+        let portable = mask_time_fallback(input.clone(), lengths);
+        let raw = crate::cubecl_kernels::mask_time(autodiff_to_inner(input), lengths);
+        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+    }
+
+    fn sequence_mask(
+        lengths: &[usize],
+        max_len: usize,
+        device: &Self::Device,
+    ) -> Tensor<Self, 2, Bool> {
+        let raw = crate::cubecl_kernels::sequence_mask::<_, F, I, BT>(lengths, max_len, device);
+        inner_bool_to_autodiff(raw)
+    }
+
+    fn glu_channel_dim(input: Tensor<Self, 3>) -> Tensor<Self, 3> {
+        let portable = glu_fallback(input.clone(), 1);
+        let raw = crate::cubecl_kernels::glu_channel_dim(autodiff_to_inner(input));
+        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+    }
+}
+
+#[cfg(all(feature = "burn-cuda-backend", not(feature = "asr-cubecl-kernels")))]
+impl<F, I> Wav2VecKernelBackend for burn_cuda::Cuda<F, I>
+where
+    F: burn_cubecl::FloatElement,
+    I: burn_cubecl::IntElement,
+    burn_cuda::Cuda<F, I>: Backend,
+{
+}
+
+#[cfg(all(feature = "burn-cuda-backend", not(feature = "asr-cubecl-kernels")))]
+impl<F, I, C> Wav2VecKernelBackend for burn_autodiff::Autodiff<burn_cuda::Cuda<F, I>, C>
+where
+    F: burn_cubecl::FloatElement,
+    I: burn_cubecl::IntElement,
+    burn_cuda::Cuda<F, I>: Backend,
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
+{
+}
+
+#[cfg(all(feature = "burn-wgpu-backend", not(feature = "asr-cubecl-kernels")))]
+impl<F, I, BT> Wav2VecKernelBackend for burn_wgpu::Wgpu<F, I, BT>
+where
+    F: burn_cubecl::FloatElement,
+    I: burn_cubecl::IntElement,
+    BT: burn_cubecl::element::BoolElement,
+    burn_wgpu::Wgpu<F, I, BT>: Backend,
+{
+}
+
+#[cfg(all(feature = "burn-wgpu-backend", not(feature = "asr-cubecl-kernels")))]
+impl<F, I, BT, C> Wav2VecKernelBackend for burn_autodiff::Autodiff<burn_wgpu::Wgpu<F, I, BT>, C>
+where
+    F: burn_cubecl::FloatElement,
+    I: burn_cubecl::IntElement,
+    BT: burn_cubecl::element::BoolElement,
+    burn_wgpu::Wgpu<F, I, BT>: Backend,
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
+{
+}
 
 #[derive(Clone, Debug)]
 pub struct Wav2VecBertConfig {
@@ -414,7 +642,7 @@ pub struct Wav2VecBertModel<B: Backend> {
     adapter: Option<Wav2VecBertAdapter<B>>,
 }
 
-impl<B: Backend> Wav2VecBertModel<B> {
+impl<B: Wav2VecKernelBackend> Wav2VecBertModel<B> {
     pub fn forward(
         &self,
         input_features: Tensor<B, 3>,
@@ -428,14 +656,14 @@ impl<B: Backend> Wav2VecBertModel<B> {
         );
         let lengths = clamp_lengths(&lengths, input_features.dims()[1]);
         let mut hidden = self.feature_projection.forward(input_features);
-        hidden = mask_time(hidden, &lengths);
+        hidden = B::mask_time(hidden, &lengths);
         let mut encoded = self.encoder.forward(hidden, &lengths, &device);
         let mut output_lengths = lengths;
         if let Some(adapter) = &self.adapter {
             (encoded, output_lengths) = adapter.forward(encoded, &output_lengths);
         }
         output_lengths = clamp_lengths(&output_lengths, encoded.dims()[1]);
-        (mask_time(encoded, &output_lengths), output_lengths)
+        (B::mask_time(encoded, &output_lengths), output_lengths)
     }
 }
 
@@ -479,18 +707,18 @@ struct Wav2VecBertEncoder<B: Backend> {
     dropout: Dropout,
 }
 
-impl<B: Backend> Wav2VecBertEncoder<B> {
+impl<B: Wav2VecKernelBackend> Wav2VecBertEncoder<B> {
     fn forward(
         &self,
         hidden_states: Tensor<B, 3>,
         lengths: &[usize],
         device: &B::Device,
     ) -> Tensor<B, 3> {
-        let mut hidden_states = self.dropout.forward(mask_time(hidden_states, lengths));
+        let mut hidden_states = self.dropout.forward(B::mask_time(hidden_states, lengths));
         for layer in &self.layers {
             hidden_states = layer.forward(hidden_states, lengths, device);
         }
-        mask_time(hidden_states, lengths)
+        B::mask_time(hidden_states, lengths)
     }
 }
 
@@ -557,7 +785,7 @@ struct Wav2VecBertEncoderLayer<B: Backend> {
     final_layer_norm: LayerNorm<B>,
 }
 
-impl<B: Backend> Wav2VecBertEncoderLayer<B> {
+impl<B: Wav2VecKernelBackend> Wav2VecBertEncoderLayer<B> {
     fn forward(
         &self,
         hidden_states: Tensor<B, 3>,
@@ -674,7 +902,7 @@ struct Wav2VecBertSelfAttention<B: Backend> {
     right_max_position_embeddings: usize,
 }
 
-impl<B: Backend> Wav2VecBertSelfAttention<B> {
+impl<B: Wav2VecKernelBackend> Wav2VecBertSelfAttention<B> {
     fn forward(
         &self,
         hidden_states: Tensor<B, 3>,
@@ -712,7 +940,7 @@ impl<B: Backend> Wav2VecBertSelfAttention<B> {
             scores = scores + relative_scores / (self.head_size as f64).sqrt();
         }
 
-        let mask = sequence_mask::<B>(lengths, seq_len, device)
+        let mask = B::sequence_mask(lengths, seq_len, device)
             .unsqueeze_dim::<3>(1)
             .unsqueeze_dim::<4>(2)
             .repeat_dim(1, self.num_heads)
@@ -778,12 +1006,14 @@ struct Wav2VecBertConvolutionModule<B: Backend> {
     dropout: Dropout,
 }
 
-impl<B: Backend> Wav2VecBertConvolutionModule<B> {
+impl<B: Wav2VecKernelBackend> Wav2VecBertConvolutionModule<B> {
     fn forward(&self, hidden_states: Tensor<B, 3>, lengths: &[usize]) -> Tensor<B, 3> {
         let [batch_size, seq_len, hidden_size] = hidden_states.dims();
-        let mut hidden_states = self.layer_norm.forward(mask_time(hidden_states, lengths));
+        let mut hidden_states = self
+            .layer_norm
+            .forward(B::mask_time(hidden_states, lengths));
         hidden_states = hidden_states.swap_dims(1, 2);
-        hidden_states = glu(self.pointwise_conv1.forward(hidden_states), 1);
+        hidden_states = B::glu_channel_dim(self.pointwise_conv1.forward(hidden_states));
         let pad_left = self.depthwise_conv.kernel_size.saturating_sub(1);
         if pad_left > 0 {
             hidden_states = hidden_states.pad([(0, 0), (pad_left, 0)], PadMode::Constant(0.0));
@@ -796,7 +1026,7 @@ impl<B: Backend> Wav2VecBertConvolutionModule<B> {
         hidden_states = gelu(hidden_states);
         hidden_states = self.pointwise_conv2.forward(hidden_states);
         hidden_states = self.dropout.forward(hidden_states).swap_dims(1, 2);
-        mask_time(
+        B::mask_time(
             hidden_states.reshape([batch_size, seq_len, hidden_size]),
             lengths,
         )
@@ -841,7 +1071,7 @@ struct Wav2VecBertAdapter<B: Backend> {
     kernel_size: usize,
 }
 
-impl<B: Backend> Wav2VecBertAdapter<B> {
+impl<B: Wav2VecKernelBackend> Wav2VecBertAdapter<B> {
     fn forward(
         &self,
         mut hidden_states: Tensor<B, 3>,
@@ -925,7 +1155,7 @@ struct Wav2VecBertAdapterLayer<B: Backend> {
     ffn: Wav2VecBertFeedForward<B>,
 }
 
-impl<B: Backend> Wav2VecBertAdapterLayer<B> {
+impl<B: Wav2VecKernelBackend> Wav2VecBertAdapterLayer<B> {
     fn forward(&self, hidden_states: Tensor<B, 3>, output_lengths: &[usize]) -> Tensor<B, 3> {
         let device = hidden_states.device();
         let residual = self.residual_conv.forward(
@@ -933,14 +1163,14 @@ impl<B: Backend> Wav2VecBertAdapterLayer<B> {
                 .forward(hidden_states.clone())
                 .swap_dims(1, 2),
         );
-        let residual = glu(residual, 1).swap_dims(1, 2);
+        let residual = B::glu_channel_dim(residual).swap_dims(1, 2);
 
         let hidden_states = self.self_attn_conv.forward(
             self.self_attn_layer_norm
                 .forward(hidden_states)
                 .swap_dims(1, 2),
         );
-        let hidden_states = glu(hidden_states, 1).swap_dims(1, 2);
+        let hidden_states = B::glu_channel_dim(hidden_states).swap_dims(1, 2);
         let hidden_states = self.self_attn_dropout.forward(self.self_attn.forward(
             hidden_states,
             output_lengths,
@@ -995,7 +1225,7 @@ impl Wav2VecBertCtcConfig {
         })
     }
 
-    pub fn init_from_huggingface_dir<B: Backend>(
+    pub fn init_from_huggingface_dir<B: Wav2VecKernelBackend>(
         path: impl AsRef<Path>,
         vocab_size: Option<usize>,
         device: &B::Device,
@@ -1037,7 +1267,7 @@ impl Wav2VecBertImportReport {
     }
 }
 
-impl<B: Backend> Wav2VecBertCtc<B> {
+impl<B: Wav2VecKernelBackend> Wav2VecBertCtc<B> {
     pub fn forward(&self, input_features: Tensor<B, 3>) -> Tensor<B, 3> {
         let [batch_size, seq_len, _] = input_features.dims();
         self.forward_with_lengths(input_features, vec![seq_len; batch_size])
@@ -1733,7 +1963,7 @@ fn transpose_2d(values: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     transposed
 }
 
-fn glu<B: Backend>(input: Tensor<B, 3>, dim: usize) -> Tensor<B, 3> {
+fn glu_fallback<B: Backend>(input: Tensor<B, 3>, dim: usize) -> Tensor<B, 3> {
     let mut chunks = input.chunk(2, dim);
     let gate = chunks.remove(1);
     let value = chunks.remove(0);
@@ -1810,7 +2040,7 @@ fn ctc_loss_from_log_probs<B: Backend>(
         )
 }
 
-fn sequence_mask<B: Backend>(
+fn sequence_mask_fallback<B: Backend>(
     lengths: &[usize],
     max_len: usize,
     device: &B::Device,
@@ -1824,9 +2054,9 @@ fn sequence_mask<B: Backend>(
     Tensor::from_data(TensorData::new(values, [lengths.len(), max_len]), device)
 }
 
-fn mask_time<B: Backend>(input: Tensor<B, 3>, lengths: &[usize]) -> Tensor<B, 3> {
+fn mask_time_fallback<B: Backend>(input: Tensor<B, 3>, lengths: &[usize]) -> Tensor<B, 3> {
     let seq_len = input.dims()[1];
-    let mask = sequence_mask::<B>(lengths, seq_len, &input.device())
+    let mask = sequence_mask_fallback::<B>(lengths, seq_len, &input.device())
         .float()
         .unsqueeze_dim::<3>(2);
     input * mask

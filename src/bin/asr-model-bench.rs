@@ -2,8 +2,10 @@ use anyhow::{Result, bail};
 use burn::tensor::{Distribution, Tensor, backend::AutodiffBackend, backend::Backend};
 use clap::{Parser, ValueEnum};
 use std::time::{Duration, Instant};
-use w2v_bert_uk::squeezeformer::{SqueezeformerCtcConfig, SqueezeformerEncoderConfig};
-use w2v_bert_uk::wav2vec::{Wav2VecBertConfig, Wav2VecBertCtcConfig};
+use w2v_bert_uk::squeezeformer::{
+    SqueezeformerCtcConfig, SqueezeformerEncoderConfig, SqueezeformerKernelBackend,
+};
+use w2v_bert_uk::wav2vec::{Wav2VecBertConfig, Wav2VecBertCtcConfig, Wav2VecKernelBackend};
 use w2v_bert_uk::zipformer::{ZipformerConfig, ZipformerCtcConfig, ZipformerKernelBackend};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -155,6 +157,8 @@ fn run_backend_body<B>(args: &Args, backend_name: &str, device: &B::Device) -> R
 where
     B: Backend + ZipformerKernelBackend,
     burn_autodiff::Autodiff<B>: Backend<Device = B::Device> + ZipformerKernelBackend,
+    B: SqueezeformerKernelBackend + Wav2VecKernelBackend,
+    burn_autodiff::Autodiff<B>: SqueezeformerKernelBackend + Wav2VecKernelBackend,
 {
     let input_dim = resolved_input_dim(args);
     let lengths = input_lengths(args.batch, args.frames);
@@ -296,6 +300,8 @@ where
     Inner: Backend,
     burn_autodiff::Autodiff<Inner>:
         AutodiffBackend<Device = Inner::Device> + ZipformerKernelBackend,
+    Inner: SqueezeformerKernelBackend + Wav2VecKernelBackend,
+    burn_autodiff::Autodiff<Inner>: SqueezeformerKernelBackend + Wav2VecKernelBackend,
 {
     type AD<B> = burn_autodiff::Autodiff<B>;
 

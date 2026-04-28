@@ -1,5 +1,9 @@
 use burn::module::Module;
+#[cfg(feature = "asr-cubecl-kernels")]
+use burn::tensor::TensorPrimitive;
 use burn::tensor::activation::{log_softmax, relu, sigmoid, silu, softmax};
+#[cfg(feature = "asr-cubecl-kernels")]
+use burn::tensor::backend::AutodiffBackend;
 use burn::tensor::{Bool, Int, Tensor, TensorData, backend::Backend};
 use burn_nn::attention::{MhaInput, MultiHeadAttention, MultiHeadAttentionConfig};
 use burn_nn::conv::{Conv1d, Conv1dConfig, Conv2d, Conv2dConfig};
@@ -10,6 +14,246 @@ use burn_nn::{
 };
 
 use crate::squeezeformer::PositiveLossBatchNorm1d;
+
+pub trait ParaformerKernelBackend: Backend + Sized {
+    fn sequence_mask(
+        lengths: &[usize],
+        max_len: usize,
+        device: &Self::Device,
+    ) -> Tensor<Self, 2, Bool> {
+        sequence_mask_fallback(lengths, max_len, device)
+    }
+
+    fn padding_mask(
+        lengths: &[usize],
+        max_len: usize,
+        device: &Self::Device,
+    ) -> Tensor<Self, 2, Bool> {
+        padding_mask_fallback(lengths, max_len, device)
+    }
+
+    fn glu_channel_dim(input: Tensor<Self, 3>) -> Tensor<Self, 3> {
+        glu_channel_dim_fallback(input)
+    }
+}
+
+impl ParaformerKernelBackend for burn_ndarray::NdArray<f32> {}
+
+impl<C> ParaformerKernelBackend for burn_autodiff::Autodiff<burn_ndarray::NdArray<f32>, C> where
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy
+{
+}
+
+#[cfg(feature = "asr-cubecl-kernels")]
+fn autodiff_to_inner<B, C, const D: usize>(
+    tensor: Tensor<burn_autodiff::Autodiff<B, C>, D>,
+) -> Tensor<B, D>
+where
+    B: Backend,
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
+{
+    let tensor =
+        <burn_autodiff::Autodiff<B, C> as AutodiffBackend>::inner(tensor.into_primitive().tensor());
+    Tensor::from_primitive(TensorPrimitive::Float(tensor))
+}
+
+#[cfg(feature = "asr-cubecl-kernels")]
+fn inner_to_autodiff<B, C, const D: usize>(
+    tensor: Tensor<B, D>,
+) -> Tensor<burn_autodiff::Autodiff<B, C>, D>
+where
+    B: Backend,
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
+{
+    let tensor = <burn_autodiff::Autodiff<B, C> as AutodiffBackend>::from_inner(
+        tensor.into_primitive().tensor(),
+    );
+    Tensor::from_primitive(TensorPrimitive::Float(tensor))
+}
+
+#[cfg(feature = "asr-cubecl-kernels")]
+fn inner_bool_to_autodiff<B, C, const D: usize>(
+    tensor: Tensor<B, D, Bool>,
+) -> Tensor<burn_autodiff::Autodiff<B, C>, D, Bool>
+where
+    B: Backend,
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
+{
+    let tensor = <burn_autodiff::Autodiff<B, C> as AutodiffBackend>::bool_from_inner(
+        tensor.into_primitive(),
+    );
+    Tensor::from_primitive(tensor)
+}
+
+#[cfg(feature = "asr-cubecl-kernels")]
+fn attach_autodiff_gradient<B, C, const D: usize>(
+    raw: Tensor<burn_autodiff::Autodiff<B, C>, D>,
+    portable: Tensor<burn_autodiff::Autodiff<B, C>, D>,
+) -> Tensor<burn_autodiff::Autodiff<B, C>, D>
+where
+    B: Backend,
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
+{
+    raw + portable.clone() - portable.detach()
+}
+
+#[cfg(all(feature = "asr-cubecl-kernels", feature = "burn-cuda-backend"))]
+impl<F, I> ParaformerKernelBackend for burn_cuda::Cuda<F, I>
+where
+    F: burn_cubecl::FloatElement,
+    I: burn_cubecl::IntElement,
+{
+    fn sequence_mask(
+        lengths: &[usize],
+        max_len: usize,
+        device: &Self::Device,
+    ) -> Tensor<Self, 2, Bool> {
+        crate::cubecl_kernels::sequence_mask(lengths, max_len, device)
+    }
+
+    fn padding_mask(
+        lengths: &[usize],
+        max_len: usize,
+        device: &Self::Device,
+    ) -> Tensor<Self, 2, Bool> {
+        Self::sequence_mask(lengths, max_len, device).bool_not()
+    }
+
+    fn glu_channel_dim(input: Tensor<Self, 3>) -> Tensor<Self, 3> {
+        crate::cubecl_kernels::glu_channel_dim(input)
+    }
+}
+
+#[cfg(all(feature = "asr-cubecl-kernels", feature = "burn-cuda-backend"))]
+impl<F, I, C> ParaformerKernelBackend for burn_autodiff::Autodiff<burn_cuda::Cuda<F, I>, C>
+where
+    F: burn_cubecl::FloatElement,
+    I: burn_cubecl::IntElement,
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
+{
+    fn sequence_mask(
+        lengths: &[usize],
+        max_len: usize,
+        device: &Self::Device,
+    ) -> Tensor<Self, 2, Bool> {
+        let raw = crate::cubecl_kernels::sequence_mask::<_, F, I, u8>(lengths, max_len, device);
+        inner_bool_to_autodiff(raw)
+    }
+
+    fn padding_mask(
+        lengths: &[usize],
+        max_len: usize,
+        device: &Self::Device,
+    ) -> Tensor<Self, 2, Bool> {
+        Self::sequence_mask(lengths, max_len, device).bool_not()
+    }
+
+    fn glu_channel_dim(input: Tensor<Self, 3>) -> Tensor<Self, 3> {
+        let portable = glu_channel_dim_fallback(input.clone());
+        let raw = crate::cubecl_kernels::glu_channel_dim(autodiff_to_inner(input));
+        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+    }
+}
+
+#[cfg(all(feature = "asr-cubecl-kernels", feature = "burn-wgpu-backend"))]
+impl<F, I, BT> ParaformerKernelBackend for burn_wgpu::Wgpu<F, I, BT>
+where
+    F: burn_cubecl::FloatElement,
+    I: burn_cubecl::IntElement,
+    BT: burn_cubecl::element::BoolElement,
+{
+    fn sequence_mask(
+        lengths: &[usize],
+        max_len: usize,
+        device: &Self::Device,
+    ) -> Tensor<Self, 2, Bool> {
+        crate::cubecl_kernels::sequence_mask(lengths, max_len, device)
+    }
+
+    fn padding_mask(
+        lengths: &[usize],
+        max_len: usize,
+        device: &Self::Device,
+    ) -> Tensor<Self, 2, Bool> {
+        Self::sequence_mask(lengths, max_len, device).bool_not()
+    }
+
+    fn glu_channel_dim(input: Tensor<Self, 3>) -> Tensor<Self, 3> {
+        crate::cubecl_kernels::glu_channel_dim(input)
+    }
+}
+
+#[cfg(all(feature = "asr-cubecl-kernels", feature = "burn-wgpu-backend"))]
+impl<F, I, BT, C> ParaformerKernelBackend for burn_autodiff::Autodiff<burn_wgpu::Wgpu<F, I, BT>, C>
+where
+    F: burn_cubecl::FloatElement,
+    I: burn_cubecl::IntElement,
+    BT: burn_cubecl::element::BoolElement,
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
+{
+    fn sequence_mask(
+        lengths: &[usize],
+        max_len: usize,
+        device: &Self::Device,
+    ) -> Tensor<Self, 2, Bool> {
+        let raw = crate::cubecl_kernels::sequence_mask::<_, F, I, BT>(lengths, max_len, device);
+        inner_bool_to_autodiff(raw)
+    }
+
+    fn padding_mask(
+        lengths: &[usize],
+        max_len: usize,
+        device: &Self::Device,
+    ) -> Tensor<Self, 2, Bool> {
+        Self::sequence_mask(lengths, max_len, device).bool_not()
+    }
+
+    fn glu_channel_dim(input: Tensor<Self, 3>) -> Tensor<Self, 3> {
+        let portable = glu_channel_dim_fallback(input.clone());
+        let raw = crate::cubecl_kernels::glu_channel_dim(autodiff_to_inner(input));
+        attach_autodiff_gradient(inner_to_autodiff(raw), portable)
+    }
+}
+
+#[cfg(all(feature = "burn-cuda-backend", not(feature = "asr-cubecl-kernels")))]
+impl<F, I> ParaformerKernelBackend for burn_cuda::Cuda<F, I>
+where
+    F: burn_cubecl::FloatElement,
+    I: burn_cubecl::IntElement,
+    burn_cuda::Cuda<F, I>: Backend,
+{
+}
+
+#[cfg(all(feature = "burn-cuda-backend", not(feature = "asr-cubecl-kernels")))]
+impl<F, I, C> ParaformerKernelBackend for burn_autodiff::Autodiff<burn_cuda::Cuda<F, I>, C>
+where
+    F: burn_cubecl::FloatElement,
+    I: burn_cubecl::IntElement,
+    burn_cuda::Cuda<F, I>: Backend,
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
+{
+}
+
+#[cfg(all(feature = "burn-wgpu-backend", not(feature = "asr-cubecl-kernels")))]
+impl<F, I, BT> ParaformerKernelBackend for burn_wgpu::Wgpu<F, I, BT>
+where
+    F: burn_cubecl::FloatElement,
+    I: burn_cubecl::IntElement,
+    BT: burn_cubecl::element::BoolElement,
+    burn_wgpu::Wgpu<F, I, BT>: Backend,
+{
+}
+
+#[cfg(all(feature = "burn-wgpu-backend", not(feature = "asr-cubecl-kernels")))]
+impl<F, I, BT, C> ParaformerKernelBackend for burn_autodiff::Autodiff<burn_wgpu::Wgpu<F, I, BT>, C>
+where
+    F: burn_cubecl::FloatElement,
+    I: burn_cubecl::IntElement,
+    BT: burn_cubecl::element::BoolElement,
+    burn_wgpu::Wgpu<F, I, BT>: Backend,
+    C: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
+{
+}
 
 #[derive(Clone, Debug)]
 pub struct ParaformerV2Config {
@@ -412,7 +656,7 @@ struct ConformerBlock<B: Backend> {
     final_norm: LayerNorm<B>,
 }
 
-impl<B: Backend> ConformerBlock<B> {
+impl<B: ParaformerKernelBackend> ConformerBlock<B> {
     fn forward(&self, input: Tensor<B, 3>, key_padding_mask: Tensor<B, 2, Bool>) -> Tensor<B, 3> {
         let output = input.clone() + self.ff1.forward(input) * 0.5;
 
@@ -424,11 +668,7 @@ impl<B: Backend> ConformerBlock<B> {
 
         let [batch_size, seq_len, dim] = output.dims();
         let conv_input = self.conv_norm.forward(output.clone()).swap_dims(1, 2);
-        let conv = self.conv_in.forward(conv_input);
-        let mut chunks = conv.chunk(2, 1);
-        let gate = chunks.remove(1);
-        let value = chunks.remove(0);
-        let conv = value * sigmoid(gate);
+        let conv = B::glu_channel_dim(self.conv_in.forward(conv_input));
         let conv = silu(self.batch_norm.forward(self.depthwise.forward(conv)));
         let conv = self.conv_dropout.forward(self.conv_out.forward(conv));
         let output = output + conv.swap_dims(1, 2).reshape([batch_size, seq_len, dim]);
@@ -445,11 +685,11 @@ struct ConformerEncoder<B: Backend> {
     layers: Vec<ConformerBlock<B>>,
 }
 
-impl<B: Backend> ConformerEncoder<B> {
+impl<B: ParaformerKernelBackend> ConformerEncoder<B> {
     fn forward(&self, features: Tensor<B, 3>, lengths: Vec<usize>) -> (Tensor<B, 3>, Vec<usize>) {
         let device = features.device();
         let (mut output, lengths) = self.subsampling.forward(features, lengths);
-        let mask = padding_mask::<B>(&lengths, output.dims()[1], &device);
+        let mask = B::padding_mask(&lengths, output.dims()[1], &device);
         for layer in self.layers.iter() {
             output = layer.forward(output, mask.clone());
         }
@@ -496,7 +736,7 @@ struct MultiResolutionConformerEncoder<B: Backend> {
     shallow_index: usize,
 }
 
-impl<B: Backend> MultiResolutionConformerEncoder<B> {
+impl<B: ParaformerKernelBackend> MultiResolutionConformerEncoder<B> {
     fn forward(
         &self,
         features: Tensor<B, 3>,
@@ -504,7 +744,7 @@ impl<B: Backend> MultiResolutionConformerEncoder<B> {
     ) -> (Tensor<B, 3>, Tensor<B, 3>, Vec<usize>) {
         let device = features.device();
         let (mut output, lengths) = self.subsampling.forward(features, lengths);
-        let mask = padding_mask::<B>(&lengths, output.dims()[1], &device);
+        let mask = B::padding_mask(&lengths, output.dims()[1], &device);
         let mut shallow = None;
         for (index, layer) in self.layers.iter().enumerate() {
             output = layer.forward(output, mask.clone());
@@ -597,7 +837,7 @@ pub struct EnhancedParaformerLossOutput<B: Backend> {
     pub output: EnhancedParaformerOutput<B>,
 }
 
-impl<B: Backend> ParaformerV2<B> {
+impl<B: ParaformerKernelBackend> ParaformerV2<B> {
     pub fn forward(&self, features: Tensor<B, 3>, lengths: Vec<usize>) -> ParaformerOutput<B> {
         let (encoder_out, encoder_lengths) = self.encoder.forward(features, lengths);
         let ctc_logits = self.ctc_projection.forward(encoder_out.clone());
@@ -722,8 +962,8 @@ impl<B: Backend> ParaformerV2<B> {
             Some(projection) => projection.forward(encoder_out),
             None => encoder_out,
         };
-        let target_mask = padding_mask::<B>(&query_lengths, decoder_in.dims()[1], &device);
-        let memory_mask = padding_mask::<B>(&encoder_lengths, memory.dims()[1], &device);
+        let target_mask = B::padding_mask(&query_lengths, decoder_in.dims()[1], &device);
+        let memory_mask = B::padding_mask(&encoder_lengths, memory.dims()[1], &device);
         let decoder_out = self.decoder.forward(
             TransformerDecoderInput::new(decoder_in, memory)
                 .target_mask_pad(target_mask)
@@ -750,7 +990,7 @@ impl<B: Backend> ParaformerOutput<B> {
     }
 }
 
-impl<B: Backend> EnhancedParaformerV2<B> {
+impl<B: ParaformerKernelBackend> EnhancedParaformerV2<B> {
     pub fn ctc_log_probs(
         &self,
         features: Tensor<B, 3>,
@@ -821,8 +1061,8 @@ impl<B: Backend> EnhancedParaformerV2<B> {
             Some(projection) => projection.forward(final_out),
             None => final_out,
         };
-        let target_mask = padding_mask::<B>(&query_lengths, decoder_in.dims()[1], &memory.device());
-        let memory_mask = padding_mask::<B>(&encoder_lengths, memory.dims()[1], &memory.device());
+        let target_mask = B::padding_mask(&query_lengths, decoder_in.dims()[1], &memory.device());
+        let memory_mask = B::padding_mask(&encoder_lengths, memory.dims()[1], &memory.device());
         let decoder_out = self.decoder.forward(
             TransformerDecoderInput::new(decoder_in, memory.clone())
                 .target_mask_pad(target_mask.clone())
@@ -1130,7 +1370,7 @@ fn nonblank_segments(labels: &[i64], blank_id: usize) -> Vec<(usize, usize, usiz
     segments
 }
 
-fn masked_cross_entropy<B: Backend>(
+fn masked_cross_entropy<B: ParaformerKernelBackend>(
     logits: Tensor<B, 3>,
     targets: Tensor<B, 2, Int>,
     target_lengths: Vec<usize>,
@@ -1149,7 +1389,7 @@ fn masked_cross_entropy<B: Backend>(
     let gathered = log_probs
         .gather(2, trimmed_targets.clone().unsqueeze_dim::<3>(2))
         .reshape([batch_size, usable_len]);
-    let mask = sequence_mask::<B>(&target_lengths, usable_len, &device).float();
+    let mask = B::sequence_mask(&target_lengths, usable_len, &device).float();
     let denom = mask.clone().sum().clamp_min(1.0);
     -(gathered * mask).sum() / denom
 }
@@ -1184,14 +1424,14 @@ fn ctc_loss_from_log_probs<B: Backend>(
         )
 }
 
-fn boundary_bce_loss<B: Backend>(
+fn boundary_bce_loss<B: ParaformerKernelBackend>(
     logits: Tensor<B, 2>,
     alignments: &[i64],
     lengths: &[usize],
 ) -> Tensor<B, 1> {
     let [batch_size, max_time] = logits.dims();
     let targets = build_boundary_targets::<B>(alignments, lengths, max_time, &logits.device());
-    let mask = sequence_mask::<B>(lengths, max_time, &logits.device()).float();
+    let mask = B::sequence_mask(lengths, max_time, &logits.device()).float();
     let probs = sigmoid(logits).clamp(1.0e-6, 1.0 - 1.0e-6);
     let one = Tensor::ones([batch_size, max_time], &probs.device());
     let loss =
@@ -1356,7 +1596,14 @@ fn ctc_viterbi_alignment(
     path
 }
 
-fn sequence_mask<B: Backend>(
+fn glu_channel_dim_fallback<B: Backend>(input: Tensor<B, 3>) -> Tensor<B, 3> {
+    let mut chunks = input.chunk(2, 1);
+    let gate = chunks.remove(1);
+    let value = chunks.remove(0);
+    value * sigmoid(gate)
+}
+
+fn sequence_mask_fallback<B: Backend>(
     lengths: &[usize],
     max_len: usize,
     device: &B::Device,
@@ -1374,7 +1621,7 @@ fn to_i64(values: Vec<usize>) -> Vec<i64> {
     values.into_iter().map(|value| value as i64).collect()
 }
 
-fn padding_mask<B: Backend>(
+fn padding_mask_fallback<B: Backend>(
     lengths: &[usize],
     max_len: usize,
     device: &B::Device,
