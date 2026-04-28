@@ -632,7 +632,7 @@ fn build_config(
 }
 
 #[pymodule]
-fn w2v_bert_uk(module: &Bound<'_, PyModule>) -> PyResult<()> {
+fn rust_asr(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(initialize_ort, module)?)?;
     module.add_function(wrap_pyfunction!(preload_cuda_dylibs, module)?)?;
     module.add_function(wrap_pyfunction!(transcribe_file, module)?)?;

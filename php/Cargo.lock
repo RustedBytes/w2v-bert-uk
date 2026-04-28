@@ -2308,7 +2308,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "w2v-bert-uk"
+name = "rust-asr"
 version = "0.1.4"
 dependencies = [
  "anyhow",
@@ -2329,11 +2329,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "w2v-bert-uk-php"
+name = "rust-asr-php"
 version = "0.1.4"
 dependencies = [
  "ext-php-rs",
- "w2v-bert-uk",
+ "rust-asr",
 ]
 
 [[package]]

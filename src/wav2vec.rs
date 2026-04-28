@@ -2120,7 +2120,7 @@ mod tests {
     #[test]
     fn wav2vec_config_loads_local_huggingface_config_json() {
         let dir =
-            std::env::temp_dir().join(format!("w2v_bert_uk_hf_config_{}", std::process::id()));
+            std::env::temp_dir().join(format!("rust_asr_hf_config_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         fs::write(
@@ -2159,7 +2159,7 @@ mod tests {
     #[test]
     fn wav2vec_imports_matching_huggingface_safetensors() {
         let dir =
-            std::env::temp_dir().join(format!("w2v_bert_uk_hf_weights_{}", std::process::id()));
+            std::env::temp_dir().join(format!("rust_asr_hf_weights_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let weight_values = (0..(6 * 16))

@@ -194,12 +194,12 @@ different Colab runtime needs an even older CUDA image, for example:
 
 ```bash
 COLAB_BASE_IMAGE=nvidia/cuda:12.4.1-devel-ubuntu20.04 \
-  COLAB_GLIBC_IMAGE_TAG=w2v-bert-uk-colab-glibc:ubuntu20.04-cuda12.4 \
+  COLAB_GLIBC_IMAGE_TAG=rust-asr-colab-glibc:ubuntu20.04-cuda12.4 \
   ./scripts/build-colab-glibc.sh
 ```
 
 The default trainer path still uses portable Burn tensor operations unless code
-is explicitly routed through `w2v_bert_uk::cubecl_kernels`.
+is explicitly routed through `rust_asr::cubecl_kernels`.
 
 Example CUDA benchmark run:
 

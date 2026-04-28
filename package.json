@@ -1,9 +1,9 @@
 {
-  "name": "w2v-bert-uk",
+  "name": "rust-asr",
   "version": "0.1.4",
   "private": true,
   "napi": {
-    "name": "w2v_bert_uk"
+    "name": "rust_asr"
   },
   "scripts": {
     "build:nodejs": "node scripts/build-nodejs.js"

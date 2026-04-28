@@ -2,11 +2,11 @@ use anyhow::{Result, bail};
 use burn::tensor::{Distribution, Tensor, backend::AutodiffBackend, backend::Backend};
 use clap::{Parser, ValueEnum};
 use std::time::{Duration, Instant};
-use w2v_bert_uk::squeezeformer::{
+use rust_asr::squeezeformer::{
     SqueezeformerCtcConfig, SqueezeformerEncoderConfig, SqueezeformerKernelBackend,
 };
-use w2v_bert_uk::wav2vec::{Wav2VecBertConfig, Wav2VecBertCtcConfig, Wav2VecKernelBackend};
-use w2v_bert_uk::zipformer::{ZipformerConfig, ZipformerCtcConfig, ZipformerKernelBackend};
+use rust_asr::wav2vec::{Wav2VecBertConfig, Wav2VecBertCtcConfig, Wav2VecKernelBackend};
+use rust_asr::zipformer::{ZipformerConfig, ZipformerCtcConfig, ZipformerKernelBackend};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum BenchBackend {
@@ -336,7 +336,7 @@ fn build_squeezeformer<B: Backend>(
     args: &Args,
     input_dim: usize,
     device: &B::Device,
-) -> w2v_bert_uk::squeezeformer::SqueezeformerCtc<B> {
+) -> rust_asr::squeezeformer::SqueezeformerCtc<B> {
     let encoder = SqueezeformerEncoderConfig::variant(&args.variant).unwrap_or_else(|| {
         SqueezeformerEncoderConfig::new(input_dim, args.d_model, args.num_layers, args.num_heads)
             .with_time_indices(Vec::new(), Vec::new())
@@ -352,7 +352,7 @@ fn build_zipformer<B: Backend>(
     args: &Args,
     input_dim: usize,
     device: &B::Device,
-) -> w2v_bert_uk::zipformer::ZipformerCtc<B> {
+) -> rust_asr::zipformer::ZipformerCtc<B> {
     let mut encoder =
         ZipformerConfig::variant(&args.variant).unwrap_or_else(|| ZipformerConfig::new(input_dim));
     encoder.input_dim = input_dim;
@@ -367,7 +367,7 @@ fn build_w2v_bert<B: Backend>(
     args: &Args,
     input_dim: usize,
     device: &B::Device,
-) -> w2v_bert_uk::wav2vec::Wav2VecBertCtc<B> {
+) -> rust_asr::wav2vec::Wav2VecBertCtc<B> {
     let heads = args.num_heads.max(1);
     let mut encoder = Wav2VecBertConfig::new(input_dim, args.d_model)
         .with_layers(args.num_layers)

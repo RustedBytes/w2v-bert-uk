@@ -8,7 +8,7 @@ use clap::{Parser, ValueEnum};
 use env_logger::Env;
 use log::info;
 use serde_json::json;
-use w2v_bert_uk::{
+use rust_asr::{
     EncoderConfig, W2vBertEncoderConfig,
     audio::{AudioDecodeConfig, audio_file_to_w2v_bert_features_with_config},
     ctc::{CtcAlignmentConfig, CtcAlignmentSegment, align_token_sequences},

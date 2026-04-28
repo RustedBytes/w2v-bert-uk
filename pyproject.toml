@@ -3,13 +3,13 @@ requires = ["maturin>=1.7,<2"]
 build-backend = "maturin"
 
 [project]
-name = "w2v-bert-uk"
+name = "rust-asr"
 version = "0.1.4"
-description = "Python bindings for the w2v-bert-uk transcription pipeline"
+description = "Python bindings for the rust-asr transcription pipeline"
 requires-python = ">=3.10"
 license = "GPL-3.0-only"
 
 [tool.maturin]
 bindings = "pyo3"
 features = ["python"]
-module-name = "w2v_bert_uk"
+module-name = "rust_asr"

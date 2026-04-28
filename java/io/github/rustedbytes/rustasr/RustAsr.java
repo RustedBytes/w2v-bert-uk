@@ -1,11 +1,11 @@
-package io.github.rustedbytes.w2vbertuk;
+package io.github.rustedbytes.rustasr;
 
 import java.io.Closeable;
 import java.nio.file.Path;
 import java.util.Objects;
 
-public final class W2vBertUk {
-    private W2vBertUk() {
+public final class RustAsr {
+    private RustAsr() {
     }
 
     public static boolean initializeOrt(String ortDylibPath) {

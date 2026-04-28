@@ -1,5 +1,5 @@
-import io.github.rustedbytes.w2vbertuk.KotlinTranscriber
-import io.github.rustedbytes.w2vbertuk.defaultOptions
+import io.github.rustedbytes.rustasr.KotlinTranscriber
+import io.github.rustedbytes.rustasr.defaultOptions
 
 fun main(args: Array<String>) {
     require(args.isNotEmpty()) { "usage: TranscribeKt <audio-file>" }

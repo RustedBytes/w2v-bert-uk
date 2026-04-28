@@ -1,19 +1,19 @@
-package io.github.rustedbytes.w2vbertuk
+package io.github.rustedbytes.rustasr
 
 import java.nio.file.Path
 import java.util.Objects
 
-object W2vBertUk {
+object RustAsr {
   def initializeOrt(ortDylibPath: String = null): Boolean =
-    W2vBertUkNative.nativeInitializeOrt(ortDylibPath)
+    RustAsrNative.nativeInitializeOrt(ortDylibPath)
 
   def preloadCudaDylibs(cudaLibDir: String = null, cudnnLibDir: String = null): Unit =
-    W2vBertUkNative.nativePreloadCudaDylibs(cudaLibDir, cudnnLibDir)
+    RustAsrNative.nativePreloadCudaDylibs(cudaLibDir, cudnnLibDir)
 
   def transcribeFile(audioFile: Path, options: Options = Options.defaults()): String = {
     Objects.requireNonNull(audioFile, "audioFile")
     val resolved = if (options == null) Options.defaults() else options
-    W2vBertUkNative.nativeTranscribeFile(
+    RustAsrNative.nativeTranscribeFile(
       audioFile.toString,
       resolved.model,
       resolved.tokenizer,
@@ -46,7 +46,7 @@ object W2vBertUk {
 
   def createTranscriber(options: Options = Options.defaults()): Transcriber = {
     val resolved = if (options == null) Options.defaults() else options
-    val handle = W2vBertUkNative.nativeCreateTranscriber(
+    val handle = RustAsrNative.nativeCreateTranscriber(
       resolved.model,
       resolved.tokenizer,
       resolved.lm,
@@ -80,22 +80,22 @@ object W2vBertUk {
     new Transcriber(handle)
   }
 
-  final class Transcriber private[w2vbertuk] (private var handle: Long) extends AutoCloseable {
+  final class Transcriber private[rustasr] (private var handle: Long) extends AutoCloseable {
     def transcribeFile(audioFile: Path): String = {
       Objects.requireNonNull(audioFile, "audioFile")
-      W2vBertUkNative.nativeTranscriberTranscribeFile(requireOpen(), audioFile.toString)
+      RustAsrNative.nativeTranscriberTranscribeFile(requireOpen(), audioFile.toString)
     }
 
     def transcribeBytes(audioBytes: Array[Byte], formatHint: String = null): String = {
       Objects.requireNonNull(audioBytes, "audioBytes")
-      W2vBertUkNative.nativeTranscriberTranscribeBytes(requireOpen(), audioBytes, formatHint)
+      RustAsrNative.nativeTranscriberTranscribeBytes(requireOpen(), audioBytes, formatHint)
     }
 
     override def close(): Unit = {
       val current = handle
       handle = 0L
       if (current != 0L) {
-        W2vBertUkNative.nativeFreeTranscriber(current)
+        RustAsrNative.nativeFreeTranscriber(current)
       }
     }
 
@@ -141,8 +141,8 @@ object W2vBertUk {
   }
 }
 
-private[w2vbertuk] object W2vBertUkNative {
-  private val instance = new W2vBertUkNative()
+private[rustasr] object RustAsrNative {
+  private val instance = new RustAsrNative()
 
   def nativeInitializeOrt(ortDylibPath: String): Boolean =
     instance.nativeInitializeOrt(ortDylibPath)
@@ -276,7 +276,7 @@ private[w2vbertuk] object W2vBertUkNative {
     instance.nativeTranscriberTranscribeBytes(handle, audioBytes, formatHint)
 }
 
-private[w2vbertuk] final class W2vBertUkNative {
+private[rustasr] final class RustAsrNative {
   @native def nativeInitializeOrt(ortDylibPath: String): Boolean
   @native def nativePreloadCudaDylibs(cudaLibDir: String, cudnnLibDir: String): Unit
   @native def nativeTranscribeFile(

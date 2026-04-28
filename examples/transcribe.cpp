@@ -1,6 +1,6 @@
 #include <iostream>
 
-#include "w2v_bert_uk.hpp"
+#include "rust_asr.hpp"
 
 int main(int argc, char **argv) {
   if (argc < 4) {
@@ -9,7 +9,7 @@ int main(int argc, char **argv) {
     return 2;
   }
 
-  w2v_bert_uk::W2vBertUkOptions options = w2v_bert_uk::w2v_bert_uk_options_default();
+  rust_asr::RustAsrOptions options = rust_asr::rust_asr_options_default();
   options.model = argv[2];
   options.tokenizer = argv[3];
   options.lm = argc > 4 ? argv[4] : nullptr;
@@ -20,16 +20,16 @@ int main(int argc, char **argv) {
   options.hot_word_bonus = 2.0f;
 
   char *transcript = nullptr;
-  int status = w2v_bert_uk::w2v_bert_uk_transcribe_file(argv[1], &options, &transcript);
-  if (status != w2v_bert_uk::W2V_BERT_UK_OK) {
-    char *message = w2v_bert_uk::w2v_bert_uk_last_error_message();
+  int status = rust_asr::rust_asr_transcribe_file(argv[1], &options, &transcript);
+  if (status != rust_asr::RUST_ASR_OK) {
+    char *message = rust_asr::rust_asr_last_error_message();
     std::cerr << "transcription failed: " << (message != nullptr ? message : "unknown error")
               << '\n';
-    w2v_bert_uk::w2v_bert_uk_string_free(message);
+    rust_asr::rust_asr_string_free(message);
     return 1;
   }
 
   std::cout << transcript << '\n';
-  w2v_bert_uk::w2v_bert_uk_string_free(transcript);
+  rust_asr::rust_asr_string_free(transcript);
   return 0;
 }

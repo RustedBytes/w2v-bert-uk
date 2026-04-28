@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::Parser;
 use env_logger::Env;
-use w2v_bert_uk::train::{BurnExportConfig, run_burn_export};
+use rust_asr::train::{BurnExportConfig, run_burn_export};
 
 #[derive(Parser)]
 #[command(

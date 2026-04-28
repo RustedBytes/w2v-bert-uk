@@ -1,4 +1,4 @@
-import io.github.rustedbytes.w2vbertuk.W2vBertUk
+import io.github.rustedbytes.rustasr.RustAsr
 
 import java.nio.file.Paths
 
@@ -6,9 +6,9 @@ object Transcribe {
   def main(args: Array[String]): Unit = {
     val root = Paths.get("").toAbsolutePath
 
-    System.loadLibrary("w2v_bert_uk")
+    System.loadLibrary("rust_asr")
 
-    val options = W2vBertUk.Options.defaults()
+    val options = RustAsr.Options.defaults()
     options.model = root.resolve("model_optimized.onnx").toString
     options.tokenizer = root.resolve("tokenizer.model").toString
     options.lm = root.resolve("news-titles.arpa").toString
@@ -29,7 +29,7 @@ object Transcribe {
     options.lmBos = true
     options.lmEos = true
 
-    val transcriber = W2vBertUk.createTranscriber(options)
+    val transcriber = RustAsr.createTranscriber(options)
     try {
       println(transcriber.transcribeFile(root.resolve("example_1.wav")))
       println(transcriber.transcribeFile(root.resolve("example_2.wav")))

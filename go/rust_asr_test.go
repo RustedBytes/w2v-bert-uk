@@ -1,4 +1,4 @@
-package w2vbertuk
+package rustasr
 
 import "testing"
 

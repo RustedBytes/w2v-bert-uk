@@ -1,11 +1,11 @@
-package w2vbertuk
+package rustasr
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/../c
-#cgo linux LDFLAGS: -L${SRCDIR}/../native -lw2v_bert_uk -Wl,-rpath,${SRCDIR}/../native
-#cgo darwin LDFLAGS: -L${SRCDIR}/../native -lw2v_bert_uk -Wl,-rpath,${SRCDIR}/../native
-#cgo windows LDFLAGS: -L${SRCDIR}/../native -lw2v_bert_uk
-#include "w2v_bert_uk.h"
+#cgo linux LDFLAGS: -L${SRCDIR}/../native -lrust_asr -Wl,-rpath,${SRCDIR}/../native
+#cgo darwin LDFLAGS: -L${SRCDIR}/../native -lrust_asr -Wl,-rpath,${SRCDIR}/../native
+#cgo windows LDFLAGS: -L${SRCDIR}/../native -lrust_asr
+#include "rust_asr.h"
 #include <stdlib.h>
 */
 import "C"
@@ -56,7 +56,7 @@ type Options struct {
 
 type Transcriber struct {
 	mu     sync.Mutex
-	handle *C.W2vBertUkTranscriber
+	handle *C.RustAsrTranscriber
 }
 
 func InitializeOrt(ortDylibPath string) (bool, error) {
@@ -66,7 +66,7 @@ func InitializeOrt(ortDylibPath string) (bool, error) {
 	}
 
 	var initialized C.bool
-	if err := checkStatus(C.w2v_bert_uk_initialize_ort(path, &initialized)); err != nil {
+	if err := checkStatus(C.rust_asr_initialize_ort(path, &initialized)); err != nil {
 		return false, err
 	}
 	return bool(initialized), nil
@@ -82,7 +82,7 @@ func PreloadCudaDylibs(cudaLibDir, cudnnLibDir string) error {
 		defer C.free(unsafe.Pointer(cudnn))
 	}
 
-	return checkStatus(C.w2v_bert_uk_preload_cuda_dylibs(cuda, cudnn))
+	return checkStatus(C.rust_asr_preload_cuda_dylibs(cuda, cudnn))
 }
 
 func TranscribeFile(audioFile string, options Options) (string, error) {
@@ -90,13 +90,13 @@ func TranscribeFile(audioFile string, options Options) (string, error) {
 	defer C.free(unsafe.Pointer(audio))
 
 	var transcript *C.char
-	err := withCOptions(options, func(cOptions *C.W2vBertUkOptions) error {
-		return checkStatus(C.w2v_bert_uk_transcribe_file(audio, cOptions, &transcript))
+	err := withCOptions(options, func(cOptions *C.RustAsrOptions) error {
+		return checkStatus(C.rust_asr_transcribe_file(audio, cOptions, &transcript))
 	})
 	if err != nil {
 		return "", err
 	}
-	defer C.w2v_bert_uk_string_free(transcript)
+	defer C.rust_asr_string_free(transcript)
 	return C.GoString(transcript), nil
 }
 
@@ -113,8 +113,8 @@ func TranscribeBytes(audioBytes []byte, formatHint string, options Options) (str
 	}
 
 	var transcript *C.char
-	err := withCOptions(options, func(cOptions *C.W2vBertUkOptions) error {
-		return checkStatus(C.w2v_bert_uk_transcribe_bytes(
+	err := withCOptions(options, func(cOptions *C.RustAsrOptions) error {
+		return checkStatus(C.rust_asr_transcribe_bytes(
 			(*C.uchar)(data),
 			C.uintptr_t(len(audioBytes)),
 			hint,
@@ -125,14 +125,14 @@ func TranscribeBytes(audioBytes []byte, formatHint string, options Options) (str
 	if err != nil {
 		return "", err
 	}
-	defer C.w2v_bert_uk_string_free(transcript)
+	defer C.rust_asr_string_free(transcript)
 	return C.GoString(transcript), nil
 }
 
 func NewTranscriber(options Options) (*Transcriber, error) {
-	var handle *C.W2vBertUkTranscriber
-	err := withCOptions(options, func(cOptions *C.W2vBertUkOptions) error {
-		return checkStatus(C.w2v_bert_uk_transcriber_new(cOptions, &handle))
+	var handle *C.RustAsrTranscriber
+	err := withCOptions(options, func(cOptions *C.RustAsrOptions) error {
+		return checkStatus(C.rust_asr_transcriber_new(cOptions, &handle))
 	})
 	if err != nil {
 		return nil, err
@@ -151,7 +151,7 @@ func (t *Transcriber) Close() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.handle != nil {
-		C.w2v_bert_uk_transcriber_free(t.handle)
+		C.rust_asr_transcriber_free(t.handle)
 		t.handle = nil
 		runtime.SetFinalizer(t, nil)
 	}
@@ -159,7 +159,7 @@ func (t *Transcriber) Close() {
 
 func (t *Transcriber) TranscribeFile(audioFile string) (string, error) {
 	if t == nil {
-		return "", errors.New("w2v-bert-uk: transcriber is nil")
+		return "", errors.New("rust-asr: transcriber is nil")
 	}
 
 	audio := C.CString(audioFile)
@@ -168,20 +168,20 @@ func (t *Transcriber) TranscribeFile(audioFile string) (string, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.handle == nil {
-		return "", errors.New("w2v-bert-uk: transcriber is closed")
+		return "", errors.New("rust-asr: transcriber is closed")
 	}
 
 	var transcript *C.char
-	if err := checkStatus(C.w2v_bert_uk_transcriber_transcribe_file(t.handle, audio, &transcript)); err != nil {
+	if err := checkStatus(C.rust_asr_transcriber_transcribe_file(t.handle, audio, &transcript)); err != nil {
 		return "", err
 	}
-	defer C.w2v_bert_uk_string_free(transcript)
+	defer C.rust_asr_string_free(transcript)
 	return C.GoString(transcript), nil
 }
 
 func (t *Transcriber) TranscribeBytes(audioBytes []byte, formatHint string) (string, error) {
 	if t == nil {
-		return "", errors.New("w2v-bert-uk: transcriber is nil")
+		return "", errors.New("rust-asr: transcriber is nil")
 	}
 
 	var data unsafe.Pointer
@@ -198,11 +198,11 @@ func (t *Transcriber) TranscribeBytes(audioBytes []byte, formatHint string) (str
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.handle == nil {
-		return "", errors.New("w2v-bert-uk: transcriber is closed")
+		return "", errors.New("rust-asr: transcriber is closed")
 	}
 
 	var transcript *C.char
-	if err := checkStatus(C.w2v_bert_uk_transcriber_transcribe_bytes(
+	if err := checkStatus(C.rust_asr_transcriber_transcribe_bytes(
 		t.handle,
 		(*C.uchar)(data),
 		C.uintptr_t(len(audioBytes)),
@@ -211,12 +211,12 @@ func (t *Transcriber) TranscribeBytes(audioBytes []byte, formatHint string) (str
 	)); err != nil {
 		return "", err
 	}
-	defer C.w2v_bert_uk_string_free(transcript)
+	defer C.rust_asr_string_free(transcript)
 	return C.GoString(transcript), nil
 }
 
-func withCOptions(options Options, call func(*C.W2vBertUkOptions) error) error {
-	cOptions := C.w2v_bert_uk_options_default()
+func withCOptions(options Options, call func(*C.RustAsrOptions) error) error {
+	cOptions := C.rust_asr_options_default()
 	strings := []*C.char{}
 	hotWords := []*C.char{}
 	defer func() {
@@ -320,14 +320,14 @@ func cStringOrNil(value string) *C.char {
 }
 
 func checkStatus(status C.int32_t) error {
-	if status == C.W2V_BERT_UK_OK {
+	if status == C.RUST_ASR_OK {
 		return nil
 	}
 
-	message := C.w2v_bert_uk_last_error_message()
+	message := C.rust_asr_last_error_message()
 	if message == nil {
-		return errors.New("w2v-bert-uk: native call failed")
+		return errors.New("rust-asr: native call failed")
 	}
-	defer C.w2v_bert_uk_string_free(message)
+	defer C.rust_asr_string_free(message)
 	return errors.New(C.GoString(message))
 }

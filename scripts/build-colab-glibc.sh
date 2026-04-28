@@ -3,7 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-image_tag="${COLAB_GLIBC_IMAGE_TAG:-w2v-bert-uk-colab-glibc:ubuntu22.04-cuda12.4}"
+image_tag="${COLAB_GLIBC_IMAGE_TAG:-rust-asr-colab-glibc:ubuntu22.04-cuda12.4}"
 base_image="${COLAB_BASE_IMAGE:-nvidia/cuda:12.4.1-devel-ubuntu22.04}"
 rust_toolchain="${RUST_TOOLCHAIN:-stable}"
 target_dir="${COLAB_TARGET_DIR:-/workspace/target/colab-glibc}"
@@ -33,8 +33,8 @@ docker run --rm \
     -e "HOME=/tmp" \
     -e "CARGO_TARGET_DIR=${target_dir}" \
     -v "${repo_root}:/workspace" \
-    -v w2v-bert-uk-cargo-registry:/usr/local/cargo/registry \
-    -v w2v-bert-uk-cargo-git:/usr/local/cargo/git \
+    -v rust-asr-cargo-registry:/usr/local/cargo/registry \
+    -v rust-asr-cargo-git:/usr/local/cargo/git \
     "${image_tag}" \
     bash -lc '
         set -euo pipefail

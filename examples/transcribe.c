@@ -1,6 +1,6 @@
 #include <stdio.h>
 
-#include "w2v_bert_uk.h"
+#include "rust_asr.h"
 
 int main(int argc, char **argv) {
   if (argc < 4) {
@@ -8,7 +8,7 @@ int main(int argc, char **argv) {
     return 2;
   }
 
-  W2vBertUkOptions options = w2v_bert_uk_options_default();
+  RustAsrOptions options = rust_asr_options_default();
   options.model = argv[2];
   options.tokenizer = argv[3];
   options.lm = argc > 4 ? argv[4] : NULL;
@@ -19,15 +19,15 @@ int main(int argc, char **argv) {
   options.hot_word_bonus = 2.0f;
 
   char *transcript = NULL;
-  int status = w2v_bert_uk_transcribe_file(argv[1], &options, &transcript);
-  if (status != W2V_BERT_UK_OK) {
-    char *message = w2v_bert_uk_last_error_message();
+  int status = rust_asr_transcribe_file(argv[1], &options, &transcript);
+  if (status != RUST_ASR_OK) {
+    char *message = rust_asr_last_error_message();
     fprintf(stderr, "transcription failed: %s\n", message != NULL ? message : "unknown error");
-    w2v_bert_uk_string_free(message);
+    rust_asr_string_free(message);
     return 1;
   }
 
   puts(transcript);
-  w2v_bert_uk_string_free(transcript);
+  rust_asr_string_free(transcript);
   return 0;
 }

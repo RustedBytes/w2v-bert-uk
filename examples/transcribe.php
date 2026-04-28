@@ -2,7 +2,7 @@
 
 $audioFile = $argv[1] ?? null;
 if ($audioFile === null) {
-    fwrite(STDERR, "usage: php -d extension=./target/release/libw2v_bert_uk.so examples/transcribe.php <audio> [model] [tokenizer] [lm]\n");
+    fwrite(STDERR, "usage: php -d extension=./target/release/librust_asr.so examples/transcribe.php <audio> [model] [tokenizer] [lm]\n");
     exit(2);
 }
 
@@ -16,4 +16,4 @@ if (isset($argv[4])) {
     $options["lm"] = $argv[4];
 }
 
-echo w2v_bert_uk_transcribe_file($audioFile, $options), PHP_EOL;
+echo rust_asr_transcribe_file($audioFile, $options), PHP_EOL;

@@ -1,4 +1,4 @@
-import io.github.rustedbytes.w2vbertuk.W2vBertUk;
+import io.github.rustedbytes.rustasr.RustAsr;
 
 import java.nio.file.Path;
 
@@ -9,9 +9,9 @@ public final class Transcribe {
     public static void main(String[] args) {
         Path root = Path.of("").toAbsolutePath();
 
-        System.loadLibrary("w2v_bert_uk");
+        System.loadLibrary("rust_asr");
 
-        W2vBertUk.Options options = W2vBertUk.Options.defaults();
+        RustAsr.Options options = RustAsr.Options.defaults();
         options.model = root.resolve("model_optimized.onnx").toString();
         options.tokenizer = root.resolve("tokenizer.model").toString();
         options.lm = root.resolve("news-titles.arpa").toString();
@@ -32,7 +32,7 @@ public final class Transcribe {
         options.lmBos = true;
         options.lmEos = true;
 
-        try (W2vBertUk.Transcriber transcriber = W2vBertUk.createTranscriber(options)) {
+        try (RustAsr.Transcriber transcriber = RustAsr.createTranscriber(options)) {
             System.out.println(transcriber.transcribeFile(root.resolve("example_1.wav")));
             System.out.println(transcriber.transcribeFile(root.resolve("example_2.wav")));
         }

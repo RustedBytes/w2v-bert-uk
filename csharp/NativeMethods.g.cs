@@ -8,54 +8,54 @@ using System;
 using System.Runtime.InteropServices;
 
 
-namespace W2vBertUk.Native
+namespace RustAsr.Native
 {
     public static unsafe partial class NativeMethods
     {
-        const string __DllName = "w2v_bert_uk";
+        const string __DllName = "rust_asr";
 
 
 
 
 
-        [DllImport(__DllName, EntryPoint = "w2v_bert_uk_options_default", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern W2vBertUkOptions w2v_bert_uk_options_default();
+        [DllImport(__DllName, EntryPoint = "rust_asr_options_default", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern RustAsrOptions rust_asr_options_default();
 
-        [DllImport(__DllName, EntryPoint = "w2v_bert_uk_initialize_ort", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern int w2v_bert_uk_initialize_ort(byte* ort_dylib_path, bool* initialized);
+        [DllImport(__DllName, EntryPoint = "rust_asr_initialize_ort", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern int rust_asr_initialize_ort(byte* ort_dylib_path, bool* initialized);
 
-        [DllImport(__DllName, EntryPoint = "w2v_bert_uk_preload_cuda_dylibs", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern int w2v_bert_uk_preload_cuda_dylibs(byte* cuda_lib_dir, byte* cudnn_lib_dir);
+        [DllImport(__DllName, EntryPoint = "rust_asr_preload_cuda_dylibs", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern int rust_asr_preload_cuda_dylibs(byte* cuda_lib_dir, byte* cudnn_lib_dir);
 
-        [DllImport(__DllName, EntryPoint = "w2v_bert_uk_transcribe_file", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern int w2v_bert_uk_transcribe_file(byte* audio_file, W2vBertUkOptions* options, byte** transcript);
+        [DllImport(__DllName, EntryPoint = "rust_asr_transcribe_file", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern int rust_asr_transcribe_file(byte* audio_file, RustAsrOptions* options, byte** transcript);
 
-        [DllImport(__DllName, EntryPoint = "w2v_bert_uk_transcribe_bytes", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern int w2v_bert_uk_transcribe_bytes(byte* audio_bytes, nuint audio_bytes_len, byte* format_hint, W2vBertUkOptions* options, byte** transcript);
+        [DllImport(__DllName, EntryPoint = "rust_asr_transcribe_bytes", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern int rust_asr_transcribe_bytes(byte* audio_bytes, nuint audio_bytes_len, byte* format_hint, RustAsrOptions* options, byte** transcript);
 
-        [DllImport(__DllName, EntryPoint = "w2v_bert_uk_transcriber_new", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern int w2v_bert_uk_transcriber_new(W2vBertUkOptions* options, W2vBertUkTranscriber** transcriber);
+        [DllImport(__DllName, EntryPoint = "rust_asr_transcriber_new", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern int rust_asr_transcriber_new(RustAsrOptions* options, RustAsrTranscriber** transcriber);
 
-        [DllImport(__DllName, EntryPoint = "w2v_bert_uk_transcriber_free", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern void w2v_bert_uk_transcriber_free(W2vBertUkTranscriber* transcriber);
+        [DllImport(__DllName, EntryPoint = "rust_asr_transcriber_free", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern void rust_asr_transcriber_free(RustAsrTranscriber* transcriber);
 
-        [DllImport(__DllName, EntryPoint = "w2v_bert_uk_transcriber_transcribe_file", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern int w2v_bert_uk_transcriber_transcribe_file(W2vBertUkTranscriber* transcriber, byte* audio_file, byte** transcript);
+        [DllImport(__DllName, EntryPoint = "rust_asr_transcriber_transcribe_file", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern int rust_asr_transcriber_transcribe_file(RustAsrTranscriber* transcriber, byte* audio_file, byte** transcript);
 
-        [DllImport(__DllName, EntryPoint = "w2v_bert_uk_transcriber_transcribe_bytes", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern int w2v_bert_uk_transcriber_transcribe_bytes(W2vBertUkTranscriber* transcriber, byte* audio_bytes, nuint audio_bytes_len, byte* format_hint, byte** transcript);
+        [DllImport(__DllName, EntryPoint = "rust_asr_transcriber_transcribe_bytes", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern int rust_asr_transcriber_transcribe_bytes(RustAsrTranscriber* transcriber, byte* audio_bytes, nuint audio_bytes_len, byte* format_hint, byte** transcript);
 
-        [DllImport(__DllName, EntryPoint = "w2v_bert_uk_last_error_message", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern byte* w2v_bert_uk_last_error_message();
+        [DllImport(__DllName, EntryPoint = "rust_asr_last_error_message", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern byte* rust_asr_last_error_message();
 
-        [DllImport(__DllName, EntryPoint = "w2v_bert_uk_string_free", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern void w2v_bert_uk_string_free(byte* value);
+        [DllImport(__DllName, EntryPoint = "rust_asr_string_free", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern void rust_asr_string_free(byte* value);
 
 
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    public unsafe partial struct W2vBertUkOptions
+    public unsafe partial struct RustAsrOptions
     {
         public byte* model;
         public byte* tokenizer;
@@ -87,7 +87,7 @@ namespace W2vBertUk.Native
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    public unsafe partial struct W2vBertUkTranscriber
+    public unsafe partial struct RustAsrTranscriber
     {
         public fixed byte _private[1];
     }

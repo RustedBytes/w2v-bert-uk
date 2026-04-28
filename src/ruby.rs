@@ -16,7 +16,7 @@ use crate::{
     preload_cuda_dylibs as preload_cuda_dylibs_impl, transcribe_audio_bytes, transcribe_audio_file,
 };
 
-#[magnus::wrap(class = "W2vBertUk::Transcriber")]
+#[magnus::wrap(class = "RustAsr::Transcriber")]
 struct Transcriber(RefCell<RustTranscriber>);
 
 impl Transcriber {
@@ -197,7 +197,7 @@ fn build_config(options: Option<RHash>) -> Result<TranscriptionConfig, Error> {
 
 #[magnus::init]
 fn init(ruby: &Ruby) -> Result<(), Error> {
-    let module = ruby.define_module("W2vBertUk")?;
+    let module = ruby.define_module("RustAsr")?;
     module.define_module_function("initialize_ort", function!(initialize_ort, -1))?;
     module.define_module_function("preload_cuda_dylibs", function!(preload_cuda_dylibs, -1))?;
     module.define_module_function("transcribe_file", function!(transcribe_file, -1))?;

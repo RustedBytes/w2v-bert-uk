@@ -2,7 +2,7 @@ using System;
 using System.IO;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using W2vBertUk.Native;
+using RustAsr.Native;
 
 unsafe class Transcribe
 {
@@ -20,7 +20,7 @@ unsafe class Transcribe
             byte** hotWords = stackalloc byte*[1];
             hotWords[0] = hotWord.Pointer;
 
-            var options = NativeMethods.w2v_bert_uk_options_default();
+            var options = NativeMethods.rust_asr_options_default();
             options.model = model.Pointer;
             options.tokenizer = tokenizer.Pointer;
             options.beam_width = 32;
@@ -49,8 +49,8 @@ unsafe class Transcribe
             options.lm_bos = 1;
             options.lm_eos = 1;
 
-            W2vBertUkTranscriber* transcriber = null;
-            Check(NativeMethods.w2v_bert_uk_transcriber_new(&options, &transcriber));
+            RustAsrTranscriber* transcriber = null;
+            Check(NativeMethods.rust_asr_transcriber_new(&options, &transcriber));
 
             try
             {
@@ -59,7 +59,7 @@ unsafe class Transcribe
             }
             finally
             {
-                NativeMethods.w2v_bert_uk_transcriber_free(transcriber);
+                NativeMethods.rust_asr_transcriber_free(transcriber);
             }
 
             return 0;
@@ -85,12 +85,12 @@ unsafe class Transcribe
         return root.FullName;
     }
 
-    static string TranscribeFile(W2vBertUkTranscriber* transcriber, string audioFile)
+    static string TranscribeFile(RustAsrTranscriber* transcriber, string audioFile)
     {
         using var audio = new Utf8String(audioFile);
         byte* transcript = null;
 
-        Check(NativeMethods.w2v_bert_uk_transcriber_transcribe_file(
+        Check(NativeMethods.rust_asr_transcriber_transcribe_file(
             transcriber,
             audio.Pointer,
             &transcript));
@@ -101,7 +101,7 @@ unsafe class Transcribe
         }
         finally
         {
-            NativeMethods.w2v_bert_uk_string_free(transcript);
+            NativeMethods.rust_asr_string_free(transcript);
         }
     }
 
@@ -112,17 +112,17 @@ unsafe class Transcribe
             return;
         }
 
-        byte* message = NativeMethods.w2v_bert_uk_last_error_message();
+        byte* message = NativeMethods.rust_asr_last_error_message();
         try
         {
             string text = message == null
-                ? "w2v-bert-uk native call failed"
-                : Marshal.PtrToStringUTF8((IntPtr)message) ?? "w2v-bert-uk native call failed";
+                ? "rust-asr native call failed"
+                : Marshal.PtrToStringUTF8((IntPtr)message) ?? "rust-asr native call failed";
             throw new InvalidOperationException(text);
         }
         finally
         {
-            NativeMethods.w2v_bert_uk_string_free(message);
+            NativeMethods.rust_asr_string_free(message);
         }
     }
 

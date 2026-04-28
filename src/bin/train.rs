@@ -17,10 +17,10 @@ use polars::prelude::{
     ParquetWriter, SerReader, Series,
 };
 use serde_json::{Value, json};
-use w2v_bert_uk::audio::{FeatureExtractorConfig, WaveformAugmentConfig};
-use w2v_bert_uk::paraformer::ParaformerAlignmentMode;
-use w2v_bert_uk::tokenizer::sentencepiece_vocab_size;
-use w2v_bert_uk::train::{
+use rust_asr::audio::{FeatureExtractorConfig, WaveformAugmentConfig};
+use rust_asr::paraformer::ParaformerAlignmentMode;
+use rust_asr::tokenizer::sentencepiece_vocab_size;
+use rust_asr::train::{
     AdaptiveBatchConfig, AdaptiveBatchUnit, BurnTrainConfig, FeatureExtractionProgress,
     SpecAugmentConfig, TrainArchitecture, TrainBackendKind, TrainPrecision,
     extract_feature_records, extract_feature_records_with_progress,
@@ -1211,7 +1211,7 @@ fn run_tokenizer_training(args: TokenizerArgs) -> Result<()> {
 
     let model_path = model_prefix.with_extension("model");
     let vocab_path = model_prefix.with_extension("vocab");
-    w2v_bert_uk::tokenizer::load_sentencepiece_transcript_tokenizer(&model_path).with_context(
+    rust_asr::tokenizer::load_sentencepiece_transcript_tokenizer(&model_path).with_context(
         || {
             format!(
                 "SentencePiece model was created but could not be loaded by the Rust tokenizer: {}",
@@ -1489,7 +1489,7 @@ impl ExtractionTui {
             Clear(ClearType::All),
             SetForegroundColor(Color::Cyan),
             SetAttribute(Attribute::Bold),
-            Print("w2v-bert-uk feature extraction monitor\n"),
+            Print("rust-asr feature extraction monitor\n"),
             ResetColor,
             SetAttribute(Attribute::Reset),
             Print(format!("output: {}\n", self.output.display())),
@@ -1542,7 +1542,7 @@ fn fmt_optional_usize(value: Option<usize>) -> String {
 }
 
 fn write_feature_records_parquet(
-    records: &[w2v_bert_uk::train::FeatureRecord],
+    records: &[rust_asr::train::FeatureRecord],
     output: &Path,
 ) -> Result<()> {
     if let Some(parent) = output.parent().filter(|path| !path.as_os_str().is_empty()) {

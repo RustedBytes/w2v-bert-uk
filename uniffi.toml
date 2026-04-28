@@ -1,4 +1,4 @@
 [bindings.kotlin]
-package_name = "io.github.rustedbytes.w2vbertuk"
-cdylib_name = "w2v_bert_uk"
+package_name = "io.github.rustedbytes.rustasr"
+cdylib_name = "rust_asr"
 kotlin_target_version = "1.9.0"

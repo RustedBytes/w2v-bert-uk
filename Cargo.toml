@@ -1,16 +1,16 @@
 [package]
-name = "w2v-bert-uk"
+name = "rust-asr"
 version = "0.1.4"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Rust and Python transcription pipeline for Ukrainian W2V-BERT ONNX CTC models"
-repository = "https://github.com/RustedBytes/w2v-bert-uk"
+repository = "https://github.com/RustedBytes/rust-asr"
 readme = "README.md"
 keywords = ["speech-recognition", "transcription", "ukrainian", "onnx", "ctc"]
 categories = ["command-line-utilities", "multimedia::audio"]
 
 [lib]
-name = "w2v_bert_uk"
+name = "rust_asr"
 crate-type = ["rlib", "cdylib"]
 
 [features]

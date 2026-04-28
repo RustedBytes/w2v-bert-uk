@@ -1,6 +1,6 @@
-# w2v-bert-uk
+# rust-asr
 
-[![Crates.io Version](https://img.shields.io/crates/v/w2v-bert-uk)](https://crates.io/crates/w2v-bert-uk)
+[![Crates.io Version](https://img.shields.io/crates/v/rust-asr)](https://crates.io/crates/rust-asr)
 
 Rust CLI for transcribing audio with a W2V-BERT frontend, an ONNX CTC acoustic model, SentencePiece decoding, and optional KenLM reranking.
 
@@ -116,7 +116,7 @@ aligner uses the reference moving-window table fill to keep memory bounded by
 For Rust callers, `TranscriptionConfig` is split by processing stage:
 
 ```rust
-use w2v_bert_uk::{
+use rust_asr::{
     AcousticModelConfig, CtcDecoderConfig, DecoderConfig, EncoderConfig,
     RuntimeConfig, TextDecoderConfig, TranscriptionConfig, W2vBertEncoderConfig,
     audio::AudioDecodeConfig,
@@ -178,8 +178,8 @@ uvx maturin develop --release --features "python cuda"
 CoreML is for macOS. CUDA requires a compatible NVIDIA CUDA runtime. If you use `uv run`, rebuild the environment after changing Rust/PyO3 signatures:
 
 ```bash
-uv cache clean w2v-bert-uk
-uv sync --reinstall-package w2v-bert-uk
+uv cache clean rust-asr
+uv sync --reinstall-package rust-asr
 ```
 
 Python API:
@@ -187,13 +187,13 @@ Python API:
 ```python
 from pathlib import Path
 
-import w2v_bert_uk
+import rust_asr
 
 # fp16 and fp32 ONNX acoustic models are both supported. The extension detects
 # the model tensor precision when it loads the ONNX session.
 
 # Convenience one-shot call. This initializes the model for this call.
-text = w2v_bert_uk.transcribe_file(
+text = rust_asr.transcribe_file(
     "example_1.wav",
     model="model_optimized.onnx",
     tokenizer="tokenizer.model",
@@ -221,7 +221,7 @@ text = w2v_bert_uk.transcribe_file(
     lm_eos=True,
 )
 
-report = w2v_bert_uk.transcribe_file_with_report(
+report = rust_asr.transcribe_file_with_report(
     "example_1.wav",
     model="model_optimized.onnx",
     tokenizer="tokenizer.model",
@@ -232,7 +232,7 @@ print(report["candidates"][0]["total_score"])
 print(report["timings"]["model_inference_seconds"])
 
 audio_bytes = Path("example_1.wav").read_bytes()
-text_from_bytes = w2v_bert_uk.transcribe_bytes(
+text_from_bytes = rust_asr.transcribe_bytes(
     audio_bytes,
     format_hint="wav",
     model="model_optimized.onnx",
@@ -242,7 +242,7 @@ text_from_bytes = w2v_bert_uk.transcribe_bytes(
 
 # Reusable transcriber. The ONNX model session and tokenizer are initialized
 # once and reused for each audio file.
-transcriber = w2v_bert_uk.Transcriber(
+transcriber = rust_asr.Transcriber(
     model="model_optimized.onnx",
     tokenizer="tokenizer.model",
     beam_width=32,
@@ -270,16 +270,16 @@ Kotlin/JVM bindings are generated with UniFFI:
 ```bash
 CARGO_PROFILE_RELEASE_STRIP=false cargo build --release --no-default-features --features kotlin,ort-dynamic --lib
 cargo install uniffi --version 0.31.1 --locked --features cli --root target/uniffi-tools
-target/uniffi-tools/bin/uniffi-bindgen generate target/release/libw2v_bert_uk.so --language kotlin --out-dir kotlin/generated --no-format
+target/uniffi-tools/bin/uniffi-bindgen generate target/release/librust_asr.so --language kotlin --out-dir kotlin/generated --no-format
 ```
 
-The generated Kotlin uses JNA to load `w2v_bert_uk`, so make the native library and ONNX Runtime discoverable at runtime.
+The generated Kotlin uses JNA to load `rust_asr`, so make the native library and ONNX Runtime discoverable at runtime.
 
 Kotlin API:
 
 ```kotlin
-import io.github.rustedbytes.w2vbertuk.KotlinTranscriber
-import io.github.rustedbytes.w2vbertuk.defaultOptions
+import io.github.rustedbytes.rustasr.KotlinTranscriber
+import io.github.rustedbytes.rustasr.defaultOptions
 
 val options = defaultOptions().copy(
     model = "model_optimized.onnx",
@@ -297,12 +297,12 @@ KotlinTranscriber(options).use { transcriber ->
 
 The crate can be built as a Go cgo package by enabling the `go` feature. The
 Go package uses the generated C ABI from `cbindgen`, so the native library,
-`c/w2v_bert_uk.h`, and the `go/` package must be kept together:
+`c/rust_asr.h`, and the `go/` package must be kept together:
 
 ```bash
 cargo build --release --no-default-features --features go,ort-dynamic --lib
 mkdir -p native
-cp target/release/libw2v_bert_uk.so native/
+cp target/release/librust_asr.so native/
 go test ./go
 go run ./examples/transcribe.go example_1.wav
 ```
@@ -316,11 +316,11 @@ import (
 	"fmt"
 	"log"
 
-	w2vbertuk "github.com/RustedBytes/w2v-bert-uk/go"
+	rustasr "github.com/RustedBytes/rust-asr/go"
 )
 
 func main() {
-	transcriber, err := w2vbertuk.NewTranscriber(w2vbertuk.Options{
+	transcriber, err := rustasr.NewTranscriber(rustasr.Options{
 		Model:     "model_optimized.onnx",
 		Tokenizer: "tokenizer.model",
 		LM:        "news-titles.arpa",
@@ -407,7 +407,7 @@ Kotlin:
 
 ```bash
 CARGO_PROFILE_RELEASE_STRIP=false cargo build --release --no-default-features --features kotlin,ort-dynamic --lib
-target/uniffi-tools/bin/uniffi-bindgen generate target/release/libw2v_bert_uk.so --language kotlin --out-dir kotlin/generated --no-format
+target/uniffi-tools/bin/uniffi-bindgen generate target/release/librust_asr.so --language kotlin --out-dir kotlin/generated --no-format
 # Compile examples/Transcribe.kt together with kotlin/generated/**/*.kt and
 # include JNA on the Kotlin/JVM classpath.
 ```
@@ -417,7 +417,7 @@ Swift:
 ```bash
 cargo build --release --no-default-features --features swift,ort-dynamic --lib
 # Compile examples/transcribe.swift together with swift/generated/*.swift and
-# swift/generated/w2v-bert-uk/*.swift, and link it against the native library.
+# swift/generated/rust-asr/*.swift, and link it against the native library.
 ```
 
 C#:

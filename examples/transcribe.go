@@ -5,7 +5,7 @@ import (
 	"log"
 	"os"
 
-	w2vbertuk "github.com/RustedBytes/w2v-bert-uk/go"
+	rustasr "github.com/RustedBytes/rust-asr/go"
 )
 
 func main() {
@@ -13,7 +13,7 @@ func main() {
 		log.Fatalf("usage: %s <audio-file>", os.Args[0])
 	}
 
-	transcriber, err := w2vbertuk.NewTranscriber(w2vbertuk.Options{
+	transcriber, err := rustasr.NewTranscriber(rustasr.Options{
 		Model:              "model_optimized.onnx",
 		Tokenizer:          "tokenizer.model",
 		LM:                 "news-titles.arpa",
@@ -22,10 +22,10 @@ func main() {
 		WordBonus:          0.2,
 		HotWords:           []string{"Kyiv"},
 		HotWordBonus:       2.0,
-		LogLanguageModel:   w2vbertuk.BoolFalse,
-		LogAccelerator:     w2vbertuk.BoolTrue,
+		LogLanguageModel:   rustasr.BoolFalse,
+		LogAccelerator:     rustasr.BoolTrue,
 		FallbackSampleRate: 16000,
-		SkipDecodeErrors:   w2vbertuk.BoolTrue,
+		SkipDecodeErrors:   rustasr.BoolTrue,
 	})
 	if err != nil {
 		log.Fatal(err)

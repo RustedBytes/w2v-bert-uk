@@ -8,7 +8,7 @@ use ext_php_rs::boxed::ZBox;
 use ext_php_rs::prelude::*;
 use ext_php_rs::types::{ZendHashTable, Zval};
 
-use w2v_bert_uk::{
+use rust_asr::{
     AcousticModelConfig, CandidateProcessingConfig, CtcDecoderConfig, DecoderConfig, EncoderConfig,
     LmConfig, RuntimeConfig, ScoredCandidate, TextDecoderConfig, TimingReport,
     Transcriber as RustTranscriber, TranscriptionConfig, TranscriptionResult, W2vBertEncoderConfig,
@@ -19,7 +19,7 @@ use w2v_bert_uk::{
 };
 
 #[php_class]
-#[php(name = "W2vBertUk\\Transcriber")]
+#[php(name = "RustAsr\\Transcriber")]
 pub struct Transcriber {
     inner: RustTranscriber,
 }
@@ -77,13 +77,13 @@ impl Transcriber {
 }
 
 #[php_function]
-#[php(name = "w2v_bert_uk_initialize_ort")]
+#[php(name = "rust_asr_initialize_ort")]
 pub fn initialize_ort(ort_dylib_path: Option<String>) -> PhpResult<bool> {
     Ok(init_ort(ort_dylib_path.map(PathBuf::from).as_deref())?)
 }
 
 #[php_function]
-#[php(name = "w2v_bert_uk_preload_cuda_dylibs")]
+#[php(name = "rust_asr_preload_cuda_dylibs")]
 pub fn preload_cuda_dylibs(
     cuda_lib_dir: Option<String>,
     cudnn_lib_dir: Option<String>,
@@ -95,14 +95,14 @@ pub fn preload_cuda_dylibs(
 }
 
 #[php_function]
-#[php(name = "w2v_bert_uk_transcribe_file")]
+#[php(name = "rust_asr_transcribe_file")]
 pub fn transcribe_file(audio_file: String, options: Option<&ZendHashTable>) -> PhpResult<String> {
     let config = build_config(options)?;
     Ok(transcribe_audio_file(PathBuf::from(audio_file), &config)?.transcript)
 }
 
 #[php_function]
-#[php(name = "w2v_bert_uk_transcribe_file_with_report")]
+#[php(name = "rust_asr_transcribe_file_with_report")]
 pub fn transcribe_file_with_report(
     audio_file: String,
     options: Option<&ZendHashTable>,
@@ -113,7 +113,7 @@ pub fn transcribe_file_with_report(
 }
 
 #[php_function]
-#[php(name = "w2v_bert_uk_transcribe_bytes")]
+#[php(name = "rust_asr_transcribe_bytes")]
 pub fn transcribe_bytes(
     audio_bytes: BinarySlice<u8>,
     format_hint: Option<String>,
@@ -129,7 +129,7 @@ pub fn transcribe_bytes(
 }
 
 #[php_function]
-#[php(name = "w2v_bert_uk_transcribe_bytes_with_report")]
+#[php(name = "rust_asr_transcribe_bytes_with_report")]
 pub fn transcribe_bytes_with_report(
     audio_bytes: BinarySlice<u8>,
     format_hint: Option<String>,

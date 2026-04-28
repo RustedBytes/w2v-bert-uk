@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use w2v_bert_uk::{
+use rust_asr::{
     AcousticModelConfig, CtcDecoderConfig, DecoderConfig, LmConfig, TextDecoderConfig, Transcriber,
     TranscriptionConfig,
 };

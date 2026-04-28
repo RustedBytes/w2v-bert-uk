@@ -866,7 +866,7 @@ pub fn run_burn_export(config: BurnExportConfig) -> Result<BurnExportSummary> {
 
 fn export_readme(config: &BurnTrainConfig, model_path: &Path, use_ema: bool) -> String {
     format!(
-        "---\nlibrary_name: burn\ntags:\n- automatic-speech-recognition\n- burn\n- ukrainian\n---\n\n# {} Burn ASR Export\n\nThis package contains a Burn full-precision checkpoint exported from `w2v-bert-uk`.\n\n- Architecture: `{}`\n- Model file: `{}`\n- Source weights: `{}`\n- Input feature dimension: `{}`\n- Vocabulary size: `{}`\n- Blank token id: `{}`\n\nUse `burn-infer --checkpoint <checkpoint-or-export-dir> --manifest <features.jsonl>` with a compatible feature manifest.\n",
+        "---\nlibrary_name: burn\ntags:\n- automatic-speech-recognition\n- burn\n- ukrainian\n---\n\n# {} Burn ASR Export\n\nThis package contains a Burn full-precision checkpoint exported from `rust-asr`.\n\n- Architecture: `{}`\n- Model file: `{}`\n- Source weights: `{}`\n- Input feature dimension: `{}`\n- Vocabulary size: `{}`\n- Blank token id: `{}`\n\nUse `burn-infer --checkpoint <checkpoint-or-export-dir> --manifest <features.jsonl>` with a compatible feature manifest.\n",
         architecture_name(&config.architecture),
         architecture_name(&config.architecture),
         model_path
@@ -6027,7 +6027,7 @@ impl TrainingTui {
             Clear(ClearType::All),
             SetForegroundColor(Color::Cyan),
             SetAttribute(Attribute::Bold),
-            Print("w2v-bert-uk training monitor\n"),
+            Print("rust-asr training monitor\n"),
             ResetColor,
             SetAttribute(Attribute::Reset),
             Print(format!("architecture: {}\n", self.architecture)),
@@ -7631,7 +7631,7 @@ mod tests {
     #[test]
     fn manifest_loads_inline_jsonl_records() {
         let dir =
-            std::env::temp_dir().join(format!("w2v_bert_uk_train_test_{}", std::process::id()));
+            std::env::temp_dir().join(format!("rust_asr_train_test_{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let manifest = dir.join("train.jsonl");
         fs::write(
@@ -7652,7 +7652,7 @@ mod tests {
     #[test]
     fn manifest_loads_optional_reference_text() {
         let dir = std::env::temp_dir().join(format!(
-            "w2v_bert_uk_train_text_test_{}",
+            "rust_asr_train_text_test_{}",
             std::process::id()
         ));
         fs::create_dir_all(&dir).unwrap();
@@ -7692,7 +7692,7 @@ mod tests {
     #[test]
     fn manifest_extracts_features_from_audio_path() {
         let dir =
-            std::env::temp_dir().join(format!("w2v_bert_uk_audio_manifest_{}", std::process::id()));
+            std::env::temp_dir().join(format!("rust_asr_audio_manifest_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let audio_path = dir.join("sample.wav");
@@ -7767,7 +7767,7 @@ mod tests {
     #[test]
     fn raw_audio_directory_loads_with_token_sidecars() {
         let dir = std::env::temp_dir().join(format!(
-            "w2v_bert_uk_raw_audio_dataset_{}",
+            "rust_asr_raw_audio_dataset_{}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&dir);
@@ -8092,7 +8092,7 @@ mod tests {
     #[test]
     fn manifest_directory_loads_jsonl_shards_in_order() {
         let dir = std::env::temp_dir().join(format!(
-            "w2v_bert_uk_manifest_dir_test_{}",
+            "rust_asr_manifest_dir_test_{}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&dir);
@@ -8117,7 +8117,7 @@ mod tests {
     #[test]
     fn streaming_loader_respects_adaptive_padded_frame_budget() {
         let dir = std::env::temp_dir().join(format!(
-            "w2v_bert_uk_adaptive_batch_test_{}",
+            "rust_asr_adaptive_batch_test_{}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&dir);
@@ -8165,7 +8165,7 @@ mod tests {
     #[test]
     fn streaming_loader_respects_adaptive_padded_duration_budget() {
         let dir = std::env::temp_dir().join(format!(
-            "w2v_bert_uk_adaptive_duration_batch_test_{}",
+            "rust_asr_adaptive_duration_batch_test_{}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&dir);
@@ -8213,7 +8213,7 @@ mod tests {
     #[test]
     fn streaming_loader_filters_long_audio_duration() {
         let dir = std::env::temp_dir().join(format!(
-            "w2v_bert_uk_duration_filter_test_{}",
+            "rust_asr_duration_filter_test_{}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&dir);
@@ -8252,7 +8252,7 @@ mod tests {
     #[test]
     fn streaming_loader_sorts_by_length_desc_within_buffer() {
         let dir = std::env::temp_dir().join(format!(
-            "w2v_bert_uk_sort_batch_test_{}",
+            "rust_asr_sort_batch_test_{}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&dir);
@@ -8292,7 +8292,7 @@ mod tests {
     #[test]
     fn streaming_loader_writes_and_reads_dataset_index_cache() {
         let dir = std::env::temp_dir().join(format!(
-            "w2v_bert_uk_dataset_index_test_{}",
+            "rust_asr_dataset_index_test_{}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&dir);

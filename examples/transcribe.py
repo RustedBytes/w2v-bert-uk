@@ -1,13 +1,13 @@
 from pathlib import Path
 
-import w2v_bert_uk
+import rust_asr
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def main() -> None:
-    transcriber = w2v_bert_uk.Transcriber(
+    transcriber = rust_asr.Transcriber(
         model=ROOT / "model_optimized.onnx",
         tokenizer=ROOT / "tokenizer.model",
         beam_width=32,

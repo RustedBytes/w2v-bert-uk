@@ -1,4 +1,4 @@
-require "w2v_bert_uk"
+require "rust_asr"
 
 audio_file = ARGV.fetch(0)
 options = {
@@ -8,4 +8,4 @@ options = {
   beam_width: 32
 }
 
-puts W2vBertUk.transcribe_file(audio_file, options)
+puts RustAsr.transcribe_file(audio_file, options)

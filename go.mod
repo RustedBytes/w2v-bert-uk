@@ -1,3 +1,3 @@
-module github.com/RustedBytes/w2v-bert-uk
+module github.com/RustedBytes/rust-asr
 
 go 1.22

@@ -16,15 +16,15 @@ use crate::{
     preload_cuda_dylibs as preload_cuda_dylibs_impl, transcribe_audio_bytes, transcribe_audio_file,
 };
 
-pub const W2V_BERT_UK_OK: i32 = 0;
-pub const W2V_BERT_UK_ERROR: i32 = -1;
+pub const RUST_ASR_OK: i32 = 0;
+pub const RUST_ASR_ERROR: i32 = -1;
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
 }
 
 #[repr(C)]
-pub struct W2vBertUkOptions {
+pub struct RustAsrOptions {
     pub model: *const c_char,
     pub tokenizer: *const c_char,
     pub lm: *const c_char,
@@ -55,13 +55,13 @@ pub struct W2vBertUkOptions {
 }
 
 #[repr(C)]
-pub struct W2vBertUkTranscriber {
+pub struct RustAsrTranscriber {
     _private: [u8; 0],
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn w2v_bert_uk_options_default() -> W2vBertUkOptions {
-    W2vBertUkOptions {
+pub unsafe extern "C" fn rust_asr_options_default() -> RustAsrOptions {
+    RustAsrOptions {
         model: ptr::null(),
         tokenizer: ptr::null(),
         lm: ptr::null(),
@@ -93,7 +93,7 @@ pub unsafe extern "C" fn w2v_bert_uk_options_default() -> W2vBertUkOptions {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn w2v_bert_uk_initialize_ort(
+pub unsafe extern "C" fn rust_asr_initialize_ort(
     ort_dylib_path: *const c_char,
     initialized: *mut bool,
 ) -> i32 {
@@ -106,7 +106,7 @@ pub unsafe extern "C" fn w2v_bert_uk_initialize_ort(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn w2v_bert_uk_preload_cuda_dylibs(
+pub unsafe extern "C" fn rust_asr_preload_cuda_dylibs(
     cuda_lib_dir: *const c_char,
     cudnn_lib_dir: *const c_char,
 ) -> i32 {
@@ -119,9 +119,9 @@ pub unsafe extern "C" fn w2v_bert_uk_preload_cuda_dylibs(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn w2v_bert_uk_transcribe_file(
+pub unsafe extern "C" fn rust_asr_transcribe_file(
     audio_file: *const c_char,
-    options: *const W2vBertUkOptions,
+    options: *const RustAsrOptions,
     transcript: *mut *mut c_char,
 ) -> i32 {
     ffi_status(|| {
@@ -133,11 +133,11 @@ pub unsafe extern "C" fn w2v_bert_uk_transcribe_file(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn w2v_bert_uk_transcribe_bytes(
+pub unsafe extern "C" fn rust_asr_transcribe_bytes(
     audio_bytes: *const c_uchar,
     audio_bytes_len: usize,
     format_hint: *const c_char,
-    options: *const W2vBertUkOptions,
+    options: *const RustAsrOptions,
     transcript: *mut *mut c_char,
 ) -> i32 {
     ffi_status(|| {
@@ -158,29 +158,29 @@ pub unsafe extern "C" fn w2v_bert_uk_transcribe_bytes(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn w2v_bert_uk_transcriber_new(
-    options: *const W2vBertUkOptions,
-    transcriber: *mut *mut W2vBertUkTranscriber,
+pub unsafe extern "C" fn rust_asr_transcriber_new(
+    options: *const RustAsrOptions,
+    transcriber: *mut *mut RustAsrTranscriber,
 ) -> i32 {
     ffi_status(|| {
         let config = config_from_options(options)?;
         let inner = RustTranscriber::new(config)?;
-        let handle = Box::into_raw(Box::new(inner)).cast::<W2vBertUkTranscriber>();
+        let handle = Box::into_raw(Box::new(inner)).cast::<RustAsrTranscriber>();
         write_out(transcriber, handle)?;
         Ok(())
     })
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn w2v_bert_uk_transcriber_free(transcriber: *mut W2vBertUkTranscriber) {
+pub unsafe extern "C" fn rust_asr_transcriber_free(transcriber: *mut RustAsrTranscriber) {
     if !transcriber.is_null() {
         drop(unsafe { Box::from_raw(transcriber.cast::<RustTranscriber>()) });
     }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn w2v_bert_uk_transcriber_transcribe_file(
-    transcriber: *mut W2vBertUkTranscriber,
+pub unsafe extern "C" fn rust_asr_transcriber_transcribe_file(
+    transcriber: *mut RustAsrTranscriber,
     audio_file: *const c_char,
     transcript: *mut *mut c_char,
 ) -> i32 {
@@ -194,8 +194,8 @@ pub unsafe extern "C" fn w2v_bert_uk_transcriber_transcribe_file(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn w2v_bert_uk_transcriber_transcribe_bytes(
-    transcriber: *mut W2vBertUkTranscriber,
+pub unsafe extern "C" fn rust_asr_transcriber_transcribe_bytes(
+    transcriber: *mut RustAsrTranscriber,
     audio_bytes: *const c_uchar,
     audio_bytes_len: usize,
     format_hint: *const c_char,
@@ -220,7 +220,7 @@ pub unsafe extern "C" fn w2v_bert_uk_transcriber_transcribe_bytes(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn w2v_bert_uk_last_error_message() -> *mut c_char {
+pub unsafe extern "C" fn rust_asr_last_error_message() -> *mut c_char {
     LAST_ERROR.with(|slot| match slot.borrow().as_ref() {
         Some(message) => message.as_c_str().to_owned().into_raw(),
         None => ptr::null_mut(),
@@ -228,7 +228,7 @@ pub unsafe extern "C" fn w2v_bert_uk_last_error_message() -> *mut c_char {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn w2v_bert_uk_string_free(value: *mut c_char) {
+pub unsafe extern "C" fn rust_asr_string_free(value: *mut c_char) {
     if !value.is_null() {
         drop(unsafe { CString::from_raw(value) });
     }
@@ -237,20 +237,20 @@ pub unsafe extern "C" fn w2v_bert_uk_string_free(value: *mut c_char) {
 fn ffi_status(operation: impl FnOnce() -> anyhow::Result<()>) -> i32 {
     clear_last_error();
     match catch_unwind(AssertUnwindSafe(operation)) {
-        Ok(Ok(())) => W2V_BERT_UK_OK,
+        Ok(Ok(())) => RUST_ASR_OK,
         Ok(Err(error)) => {
             set_last_error(error.to_string());
-            W2V_BERT_UK_ERROR
+            RUST_ASR_ERROR
         }
         Err(_) => {
-            set_last_error("native panic while executing w2v-bert-uk FFI call");
-            W2V_BERT_UK_ERROR
+            set_last_error("native panic while executing rust-asr FFI call");
+            RUST_ASR_ERROR
         }
     }
 }
 
-fn config_from_options(options: *const W2vBertUkOptions) -> anyhow::Result<TranscriptionConfig> {
-    let defaults = unsafe { w2v_bert_uk_options_default() };
+fn config_from_options(options: *const RustAsrOptions) -> anyhow::Result<TranscriptionConfig> {
+    let defaults = unsafe { rust_asr_options_default() };
     let options = if options.is_null() {
         &defaults
     } else {

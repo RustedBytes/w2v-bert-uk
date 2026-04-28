@@ -5,7 +5,7 @@ use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use env_logger::Env;
 use log::{info, warn};
-use w2v_bert_uk::{
+use rust_asr::{
     AcousticModelConfig, CandidateProcessingConfig, CtcDecoderConfig, DecoderConfig, EncoderConfig,
     LmConfig, RuntimeConfig, TextDecoderConfig, TimingReport, TranscriptionConfig,
     TranscriptionResult, W2vBertEncoderConfig,

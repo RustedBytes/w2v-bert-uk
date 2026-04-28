@@ -1,22 +1,22 @@
 [package]
-name = "w2v-bert-uk-php"
+name = "rust-asr-php"
 version = "0.1.4"
 edition = "2024"
 license = "GPL-3.0-only"
-description = "PHP extension bindings for w2v-bert-uk"
-repository = "https://github.com/RustedBytes/w2v-bert-uk"
+description = "PHP extension bindings for rust-asr"
+repository = "https://github.com/RustedBytes/rust-asr"
 
 [lib]
-name = "w2v_bert_uk"
+name = "rust_asr"
 crate-type = ["cdylib"]
 
 [features]
 default = ["ort-dynamic"]
-coreml = ["w2v-bert-uk/coreml"]
-cuda = ["w2v-bert-uk/cuda"]
-ort-bundled = ["w2v-bert-uk/ort-bundled"]
-ort-dynamic = ["w2v-bert-uk/ort-dynamic"]
+coreml = ["rust-asr/coreml"]
+cuda = ["rust-asr/cuda"]
+ort-bundled = ["rust-asr/ort-bundled"]
+ort-dynamic = ["rust-asr/ort-dynamic"]
 
 [dependencies]
 ext-php-rs = { version = "=0.15.10", features = ["anyhow"] }
-w2v-bert-uk = { path = "..", default-features = false }
+rust-asr = { path = "..", default-features = false }

@@ -44,7 +44,7 @@ impl From<jni::errors::Error> for JavaBindingError {
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_rustedbytes_w2vbertuk_W2vBertUk_nativeInitializeOrt<
+pub extern "system" fn Java_io_github_rustedbytes_rustasr_RustAsr_nativeInitializeOrt<
     'local,
 >(
     mut env: EnvUnowned<'local>,
@@ -60,7 +60,7 @@ pub extern "system" fn Java_io_github_rustedbytes_w2vbertuk_W2vBertUk_nativeInit
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_rustedbytes_w2vbertuk_W2vBertUk_nativePreloadCudaDylibs<
+pub extern "system" fn Java_io_github_rustedbytes_rustasr_RustAsr_nativePreloadCudaDylibs<
     'local,
 >(
     mut env: EnvUnowned<'local>,
@@ -78,7 +78,7 @@ pub extern "system" fn Java_io_github_rustedbytes_w2vbertuk_W2vBertUk_nativePrel
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_rustedbytes_w2vbertuk_W2vBertUk_nativeTranscribeFile<
+pub extern "system" fn Java_io_github_rustedbytes_rustasr_RustAsr_nativeTranscribeFile<
     'local,
 >(
     mut env: EnvUnowned<'local>,
@@ -149,7 +149,7 @@ pub extern "system" fn Java_io_github_rustedbytes_w2vbertuk_W2vBertUk_nativeTran
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_rustedbytes_w2vbertuk_W2vBertUk_nativeCreateTranscriber<
+pub extern "system" fn Java_io_github_rustedbytes_rustasr_RustAsr_nativeCreateTranscriber<
     'local,
 >(
     mut env: EnvUnowned<'local>,
@@ -218,7 +218,7 @@ pub extern "system" fn Java_io_github_rustedbytes_w2vbertuk_W2vBertUk_nativeCrea
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_rustedbytes_w2vbertuk_W2vBertUk_nativeFreeTranscriber<
+pub extern "system" fn Java_io_github_rustedbytes_rustasr_RustAsr_nativeFreeTranscriber<
     'local,
 >(
     mut env: EnvUnowned<'local>,
@@ -235,7 +235,7 @@ pub extern "system" fn Java_io_github_rustedbytes_w2vbertuk_W2vBertUk_nativeFree
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_rustedbytes_w2vbertuk_W2vBertUk_nativeTranscriberTranscribeFile<
+pub extern "system" fn Java_io_github_rustedbytes_rustasr_RustAsr_nativeTranscriberTranscribeFile<
     'local,
 >(
     mut env: EnvUnowned<'local>,
@@ -253,7 +253,7 @@ pub extern "system" fn Java_io_github_rustedbytes_w2vbertuk_W2vBertUk_nativeTran
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_rustedbytes_w2vbertuk_W2vBertUk_nativeTranscriberTranscribeBytes<
+pub extern "system" fn Java_io_github_rustedbytes_rustasr_RustAsr_nativeTranscriberTranscribeBytes<
     'local,
 >(
     mut env: EnvUnowned<'local>,

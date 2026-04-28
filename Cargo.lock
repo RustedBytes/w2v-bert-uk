@@ -5174,6 +5174,51 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-asr"
+version = "0.1.4"
+dependencies = [
+ "anyhow",
+ "asr-features",
+ "burn-autodiff",
+ "burn-core",
+ "burn-cubecl",
+ "burn-cuda",
+ "burn-ndarray",
+ "burn-nn",
+ "burn-optim",
+ "burn-wgpu",
+ "cbindgen",
+ "clap",
+ "crossterm",
+ "csbindgen",
+ "cubecl",
+ "env_logger",
+ "half",
+ "jni",
+ "kenlm-rs",
+ "log",
+ "magnus",
+ "napi",
+ "napi-build",
+ "napi-derive",
+ "ort",
+ "polars",
+ "prost",
+ "pyo3",
+ "pyo3-build-config",
+ "rand 0.9.4",
+ "rayon",
+ "rb-sys-build",
+ "safetensors",
+ "serde_json",
+ "splintr",
+ "swift-bridge",
+ "swift-bridge-build",
+ "symphonia",
+ "uniffi",
+]
+
+[[package]]
 name = "rustc-demangle"
 version = "0.1.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6748,51 +6793,6 @@ name = "void"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a02e4885ed3bc0f2de90ea6dd45ebcbb66dacffe03547fadbb0eeae2770887d"
-
-[[package]]
-name = "w2v-bert-uk"
-version = "0.1.4"
-dependencies = [
- "anyhow",
- "asr-features",
- "burn-autodiff",
- "burn-core",
- "burn-cubecl",
- "burn-cuda",
- "burn-ndarray",
- "burn-nn",
- "burn-optim",
- "burn-wgpu",
- "cbindgen",
- "clap",
- "crossterm",
- "csbindgen",
- "cubecl",
- "env_logger",
- "half",
- "jni",
- "kenlm-rs",
- "log",
- "magnus",
- "napi",
- "napi-build",
- "napi-derive",
- "ort",
- "polars",
- "prost",
- "pyo3",
- "pyo3-build-config",
- "rand 0.9.4",
- "rayon",
- "rb-sys-build",
- "safetensors",
- "serde_json",
- "splintr",
- "swift-bridge",
- "swift-bridge-build",
- "symphonia",
- "uniffi",
-]
 
 [[package]]
 name = "walkdir"
